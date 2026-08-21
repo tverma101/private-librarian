@@ -1,0 +1,8 @@
+.build/
+dist/
+*.o
+*.d
+.DS_Store
+.swiftpm
+netns-test/
+/tmp/
