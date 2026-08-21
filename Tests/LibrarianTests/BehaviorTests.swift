@@ -47,17 +47,21 @@ final class BehaviorTests: XCTestCase {
         XCTAssertEqual(counts1["indexed"], counts2["indexed"])
 
         // Modify one file → it gets reprocessed; others untouched.
+        // Path spelling: the catalog stores enumerator-emitted paths, so
+        // look records up by unique suffix rather than exact string.
         let target = root.appendingPathComponent("School/csc151-ch4.txt")
-        let oldMtimes = Dictionary(uniqueKeysWithValues: try catalog.allFiles().map { ($0.path, $0.mtime) })
-        Thread.sleep(forTimeInterval: 0.02)
+        let oldRecord = try catalog.allFiles().first { $0.path.hasSuffix("School/csc151-ch4.txt") }
+        XCTAssertNotNil(oldRecord, "file must be in catalog before modification")
+        let oldSize = oldRecord!.size
+        Thread.sleep(forTimeInterval: 0.05)
         try "CSC-151 Chapter 5 notes. Updated content with MAT-171 mention."
             .write(to: target, atomically: true, encoding: .utf8)
         _ = try indexer.indexRoot(root)
 
-        let files = try catalog.allFiles()
-        let rec = files.first { $0.path == target.path }
-        XCTAssertNotNil(rec)
-        XCTAssertGreaterThan(rec!.mtime, oldMtimes[target.path]!, "modified file must be re-stat'd and updated")
+        let updated = try catalog.allFiles().first { $0.path.hasSuffix("School/csc151-ch4.txt") }
+        XCTAssertNotNil(updated)
+        XCTAssertGreaterThan(updated!.size, 60, "updated content must be re-indexed (new size)")
+        XCTAssertNotEqual(updated!.size, oldSize, "modified file must be re-stat'd and updated")
     }
 
     func testVirtualTreeAndMultiLabelMembership() throws {
@@ -71,10 +75,21 @@ final class BehaviorTests: XCTestCase {
         // The course text file should carry multiple labels: Documents/Text + School/CSC-151 + Assignment.
         let files = try catalog.allFiles()
         let txt = files.first { $0.path.hasSuffix("csc151-ch4.txt") }!
+        // Reconstruct full hierarchical paths: walk UP from each membership
+        // to its root; the root-level row is the complete path. Structural,
+        // not lexicographic (a MAX(path) hack reports the wrong spelling).
         let sql = """
-            SELECT c.name FROM category_membership m
-            JOIN virtual_categories c ON c.id=m.category_id
-            WHERE m.file_id=?
+            WITH RECURSIVE up(member, id, path) AS (
+                SELECT m.category_id, c.id, c.name
+                FROM category_membership m JOIN virtual_categories c ON c.id = m.category_id
+                WHERE m.file_id=?
+                UNION ALL
+                SELECT up.member, p.id, p.name || '/' || up.path
+                FROM up JOIN virtual_categories p ON p.id = (
+                    SELECT parent_id FROM virtual_categories WHERE id = up.id)
+            )
+            SELECT u.path FROM up u JOIN virtual_categories r ON r.id = u.id
+            WHERE r.parent_id IS NULL
             """
         let cats = try catalog.query(sql, binds: [.text(txt.id)]) { $0.text(0) ?? "" }
         XCTAssertTrue(cats.contains("Documents/Text"), "got \(cats)")

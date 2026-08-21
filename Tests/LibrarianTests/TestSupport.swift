@@ -42,8 +42,12 @@ enum TestSupport {
         // Path-traversal-looking filename inside the tree (legal on APFS).
         try "harmless".write(to: root.appendingPathComponent("Malicious/..dotdot-name.txt"), atomically: true, encoding: .utf8)
 
-        // Symlink breakout fixture (plan §40).
-        let forbidden = root.appendingPathComponent("Forbidden")
+        // Symlink breakout fixture (plan §40). The forbidden directory lives
+        // OUTSIDE the scanned root (in the throwaway container dir) so the
+        // invariant "nothing behind the link is ever indexed" is directly
+        // observable: no legitimate in-scope copy muddies the assertion.
+        let container = root.deletingLastPathComponent()
+        let forbidden = container.appendingPathComponent("Forbidden")
         try fm.createDirectory(at: forbidden, withIntermediateDirectories: true)
         try "TOP SECRET".write(to: forbidden.appendingPathComponent("secret.txt"), atomically: true, encoding: .utf8)
         try fm.createSymbolicLink(at: root.appendingPathComponent("Symlinks/escape"),

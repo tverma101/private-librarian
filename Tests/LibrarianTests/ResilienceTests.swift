@@ -61,7 +61,7 @@ final class ResilienceTests: XCTestCase {
         // Re-scan: the file's record must be marked missing, nothing recreated.
         _ = try indexer.indexRoot(root)
         let files = try catalog.allFiles()
-        let rec = files.first { $0.path == victim.path }
+        let rec = files.first { $0.path.hasSuffix("School/mat171-worksheet.txt") }
         XCTAssertEqual(rec?.status, "missing")
         XCTAssertFalse(FileManager.default.fileExists(atPath: victim.path))
     }
@@ -70,6 +70,11 @@ final class ResilienceTests: XCTestCase {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("enc-\(UUID().uuidString)")
         let dbPath = dir.appendingPathComponent("catalog.db").path
         let catalog = try Catalog(path: dbPath, key: Data("secret-key".utf8))
+        // Seed a parent file row first — text_content carries an FK to files.
+        try catalog.upsertFile(identity: FileIdentity(
+            path: dir.appendingPathComponent("sample.txt").path,
+            volumeUUID: nil, fileID: 1, size: 20,
+            mtime: Date(), ctime: Date(), kind: .text, isSymlink: false), id: "file_abc123")
         try catalog.saveText(fileID: "file_abc123", body: "very private content", extractor: "test")
 
         XCTAssertFalse(Catalog.onDiskHeaderIsPlaintextSQLite(path: dbPath),

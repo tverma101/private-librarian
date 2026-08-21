@@ -341,18 +341,21 @@ public final class Catalog: @unchecked Sendable {
     @discardableResult
     public func ensureCategory(named path: String) throws -> Int64 {
         var parent: Int64 = -1
-        var current = ""
         for component in path.split(separator: "/").map(String.init) {
-            current = current.isEmpty ? component : current + "/" + component
-            let displayName = component
             let rows = try query(
-                "SELECT id FROM virtual_categories WHERE name=? LIMIT 1", binds: [.text(displayName)]) { $0.int(0) }
+                """
+                SELECT c.id FROM virtual_categories c
+                WHERE c.name=? AND (
+                    (? < 0 AND c.parent_id IS NULL)
+                 OR (? >= 0 AND c.parent_id = ?)
+                ) LIMIT 1
+                """, binds: [.text(component), .int(parent), .int(parent), .int(parent)]) { $0.int(0) }
             if let existing = rows.first, existing > 0 {
                 parent = existing
                 continue
             }
             try run("INSERT INTO virtual_categories(name, parent_id) VALUES(?,?)",
-                    binds: [.text(displayName), parent < 0 ? .null : .int(parent)])
+                    binds: [.text(component), parent < 0 ? .null : .int(parent)])
             let newRows = try query("SELECT last_insert_rowid()") { $0.int(0) }
             parent = newRows[0]
         }
@@ -409,22 +412,22 @@ public final class Catalog: @unchecked Sendable {
     }
 
     public func fingerprint(forFile id: String) throws -> (size: Int64, mtime: Double)? {
-        let rows = try query("SELECT size, mtime FROM files WHERE id=?") { r in (r.int(0), r.real(1)) }
+        let rows = try query("SELECT size, mtime FROM files WHERE id=?", binds: [.text(id)]) { r in (r.int(0), r.real(1)) }
         return rows.first.map { ($0.0, $0.1) }
     }
 
     public func fileRow(id: String) throws -> (path: String, size: Int64)? {
-        let rows = try query("SELECT path, size FROM files WHERE id=?") { r in (r.text(0) ?? "", r.int(1)) }
+        let rows = try query("SELECT path, size FROM files WHERE id=?", binds: [.text(id)]) { r in (r.text(0) ?? "", r.int(1)) }
         return rows.first
     }
 
     public func confidence(forFile id: String) throws -> Double? {
-        let rows = try query("SELECT confidence FROM classifications WHERE file_id=?") { $0.real(0) }
+        let rows = try query("SELECT confidence FROM classifications WHERE file_id=?", binds: [.text(id)]) { $0.real(0) }
         return rows.first
     }
 
     public func fileKind(id: String) throws -> String? {
-        let rows = try query("SELECT kind FROM files WHERE id=?") { $0.text(0) }
+        let rows = try query("SELECT kind FROM files WHERE id=?", binds: [.text(id)]) { $0.text(0) }
         return rows.first ?? nil
     }
 

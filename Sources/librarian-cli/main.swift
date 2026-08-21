@@ -33,14 +33,33 @@ func argValue(_ name: String) -> String? {
 }
 
 func positional(_ index: Int) -> String? {
-    let args = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("--") }
+    // Drop program name AND the subcommand (args[1]); flags filtered out.
+    let args = CommandLine.arguments.dropFirst(2).filter { !$0.hasPrefix("--") }
     return args.count > index ? args[index] : nil
 }
 
 func openCatalog(_ catalogPath: String) throws -> Catalog {
+    // Headless / CI path: an explicit hex key (LIBRARIAN_CATALOG_KEY, 64 hex
+    // chars = 32 bytes) bypasses the Keychain entirely so automated runs are
+    // deterministic and prompt-free.
+    if let hex = ProcessInfo.processInfo.environment["LIBRARIAN_CATALOG_KEY"] {
+        let chars = Array(hex.lowercased())
+        guard chars.count == 64, chars.allSatisfy({ $0.isHexDigit }) else {
+            throw KeyError.badEnvKey
+        }
+        var bytes = [UInt8](); bytes.reserveCapacity(32)
+        var i = 0
+        while i < chars.count {
+            bytes.append(UInt8(String(chars[i..<i + 2]), radix: 16)!)
+            i += 2
+        }
+        return try Catalog(path: catalogPath, key: Data(bytes))
+    }
     let key = try CatalogKeychain.loadOrCreate()
     return try Catalog(path: catalogPath, key: key)
 }
+
+enum KeyError: Error { case badEnvKey }
 
 let args = CommandLine.arguments
 guard args.count >= 2 else { printUsage(); exit(2) }
@@ -54,8 +73,10 @@ do {
         let url = URL(fileURLWithPath: folder)
         // Security-scoped bookmark flow belongs to the GUI app; the CLI takes
         // an explicit path argument from the operator.
-        if url.startAccessingSecurityScopedResource() {
-            defer { url.stopAccessingSecurityScopedResource() }
+        do {
+            if url.startAccessingSecurityScopedResource() {
+                url.stopAccessingSecurityScopedResource()
+            }
         }
         let catalog = try openCatalog(catalogPath)
         let broker = SourceBroker()

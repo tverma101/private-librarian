@@ -58,6 +58,22 @@ public final class Indexer: @unchecked Sendable {
                                     lastPath: (item.path as NSString).lastPathComponent))
             }
         }
+
+        // Plan §34/§44: files that vanished since the last scan are marked
+        // missing in the catalog — never reconstructed, never deleted twice.
+        // The enumerator emits root.path-joined paths, so seen-set, this
+        // prefix, and every catalog row share one spelling by construction.
+        let seen = Set(items.map(\.path))
+        let rootPrefix = root.path.hasSuffix("/") ? String(root.path.dropLast()) : root.path
+        for stored in try catalog.allFiles() where stored.status != "missing" {
+            guard stored.path.hasPrefix(rootPrefix + "/") else { continue }
+            if seen.contains(stored.path) { continue }
+            // Depth-truncation guard: a file beyond maxDepth wasn't *seen*,
+            // but it didn't vanish. Absence = lstat fails (no-follow, same
+            // discipline as every other source-path touch).
+            guard (try? broker.identity(at: stored.path)) == nil else { continue }
+            try catalog.markMissing(path: stored.path)
+        }
         return processed
     }
 

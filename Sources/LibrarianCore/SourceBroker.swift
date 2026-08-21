@@ -29,6 +29,9 @@ public struct SourceBroker: Sendable {
     // MARK: - Identity
 
     /// Stat a path WITHOUT following symlinks (lstat semantics).
+    /// NOTE: deliberately NO extra canonicalization here — the enumerator is
+    /// the single source of path spelling (mixing standardized and raw forms
+    /// made the missing-file sweep see phantom deletions).
     public func identity(at path: String) throws -> FileIdentity {
         return try Self.identityNoFollow(path: path)
     }
@@ -220,37 +223,53 @@ public struct SourceBroker: Sendable {
     }
 
     /// Enumerate a security-scoped root WITHOUT following symlinks and WITHOUT
-    /// descending into packages/bundles. Returns relative paths of regular
-    /// files plus link records. Deterministic order (sorted per directory).
+    /// descending into packages/bundles. Returns paths of regular files plus
+    /// link records, each built by joining component names onto the CALLER's
+    /// root spelling (`root.path`) — FileManager canonicalizes `/var` →
+    /// `/private/var` in the child URLs it hands back, and emitting those raw
+    /// would put two spellings of the same tree into one index run.
+    /// Deterministic order (sorted per directory).
     public static func enumerate(root: URL, maxDepth: Int = 16) throws -> [DiscoveredItem] {
         var out: [DiscoveredItem] = []
         let fm = FileManager.default
-        var enqueued: [(URL, Int)] = [(root, 0)]
-        while let (dir, depth) = enqueued.popLast() {
+        var baseDisplay = root.path
+        if baseDisplay.hasSuffix("/") && baseDisplay.count > 1 { baseDisplay = String(baseDisplay.dropLast()) }
+        var enqueued: [(dir: URL, display: String, depth: Int)] = [(root, baseDisplay, 0)]
+        while let (dir, display, depth) = enqueued.popLast() {
             let contents = try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [
                 .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey, .totalFileAllocatedSizeKey,
             ], options: [])
             // Deterministic ordering regardless of filesystem order.
             let sorted = contents.sorted { $0.lastPathComponent < $1.lastPathComponent }
             for child in sorted {
+                // Reported path: caller-dialect join. Disk checks below use
+                // the REAL child.url — only the spelling we emit differs.
+                let childDisplay = display + "/" + child.lastPathComponent
+                // lstat-level link check FIRST: a symlinked directory must be
+                // recorded as a link and never descended into (plan §40).
+                var lst = stat()
+                if lstat(child.path, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFLNK {
+                    out.append(DiscoveredItem(path: childDisplay, depth: depth))
+                    continue
+                }
                 let vals = try? child.resourceValues(forKeys: [.isSymbolicLinkKey, .isPackageKey, .isRegularFileKey])
                 if vals?.isSymbolicLink == true {
-                    out.append(DiscoveredItem(path: child.path, depth: depth))
+                    out.append(DiscoveredItem(path: childDisplay, depth: depth))
                     continue
                 }
                 if vals?.isPackage == true {
                     // Opaque package: record it, never descend.
-                    out.append(DiscoveredItem(path: child.path, depth: depth))
+                    out.append(DiscoveredItem(path: childDisplay, depth: depth))
                     continue
                 }
                 var isDir: ObjCBool = false
                 if fm.fileExists(atPath: child.path, isDirectory: &isDir), isDir.boolValue {
                     if depth < maxDepth {
-                        enqueued.append((child, depth + 1))
+                        enqueued.append((child, childDisplay, depth + 1))
                     }
                     continue
                 }
-                out.append(DiscoveredItem(path: child.path, depth: depth))
+                out.append(DiscoveredItem(path: childDisplay, depth: depth))
             }
         }
         return out.sorted { $0.path < $1.path }
