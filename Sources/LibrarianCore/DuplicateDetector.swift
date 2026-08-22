@@ -46,7 +46,9 @@ public struct DuplicateDetector: Sendable {
     }
 
     /// Full SHA-256 streamed in bounded chunks via the read-only fd.
-    /// Reads EVERY byte of the file (no total-size cap — see streamHash).
+    /// Reads EVERY byte of the file by default (no total-size cap — see
+    /// SourceBroker.streamHash). Callers needing a time bound should do the
+    /// bounded read explicitly and document it as a partial hash.
     public static func sha256(path: String, broker: SourceBroker) throws -> Data {
         var hasher = SHA256()
         try broker.streamHash(path) { chunk, _ in

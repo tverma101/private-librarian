@@ -178,10 +178,11 @@ public struct SourceBroker: Sendable {
     }
 
     /// Stream the ENTIRE file in fixed-size chunks without holding it in
-    /// memory. Unlike the analysis reads above there is NO byte cap: hashing
-    /// a 500 GB file uses ~256 KB of RAM. Bounding MEMORY and bounding TOTAL
-    /// BYTES are different guarantees — extraction needs the second, hashing
-    /// must never have it (a "SHA-256" of only the head is not a SHA-256).
+    /// memory. Unlike the analysis reads above there is NO byte cap by
+    /// default: a SHA-256 must read every byte. Bounding MEMORY and bounding
+    /// TOTAL BYTES are different guarantees — extraction needs the latter,
+    /// hashing must not have it. Callers that need a time/IO bound should use
+    /// streamHash(cappedAt:) or run the hash on the background Scheduler slot.
     /// Still strictly read-only through the no-follow fd.
     public func streamHash(_ path: String,
                            _ body: (Data, Bool) throws -> Void) throws {
@@ -200,6 +201,12 @@ public struct SourceBroker: Sendable {
             }
             try body(Data(), true)
         }
+    }
+
+    /// Capped streaming variant — shims time/IO bounded callers.
+    public func streamHash(cappedAt cap: Int64, path: String,
+                           _ body: (Data, Bool) throws -> Void) throws {
+        try streamBounded(path, limit: cap, body)
     }
 
     /// Stream the whole file in chunks without holding it in memory.

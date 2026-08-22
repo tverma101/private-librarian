@@ -122,4 +122,24 @@ final class ResilienceTests: XCTestCase {
             }
         }
     }
+
+    func testCatalogTransactionCommitsAndRollsBack() throws {
+        let catalog = try TestSupport.makeCatalog()
+        // Commit path
+        try catalog.transaction {
+            try catalog.upsertFile(identity: FileIdentity(path: "/tmp/a.txt", volumeUUID: nil, fileID: 1, size: 10, mtime: Date(), ctime: Date(), kind: .text, isSymlink: false), id: "file_tx_a")
+            try catalog.setStatus(fileID: "file_tx_a", status: "indexed")
+        }
+        XCTAssertTrue(try catalog.allFiles().contains { $0.id == "file_tx_a" })
+
+        // Rollback path — error in body must not persist partial writes
+        do {
+            try catalog.transaction {
+                try catalog.upsertFile(identity: FileIdentity(path: "/tmp/b.txt", volumeUUID: nil, fileID: 2, size: 20, mtime: Date(), ctime: Date(), kind: .text, isSymlink: false), id: "file_tx_b")
+                throw NSError(domain: "test", code: 1)
+            }
+            XCTFail("should have thrown")
+        } catch { /* expected */ }
+        XCTAssertFalse(try catalog.allFiles().contains { $0.id == "file_tx_b" }, "rolled-back file must not exist")
+    }
 }

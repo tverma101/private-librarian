@@ -9,6 +9,7 @@ public final class Catalog: @unchecked Sendable {
 
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "librarian.catalog.serial")
+    private let queueKey = DispatchSpecificKey<Void>()
     public private(set) var path: String
 
     // MARK: - Errors
@@ -32,6 +33,7 @@ public final class Catalog: @unchecked Sendable {
     /// Open (creating if needed) an encrypted catalog at `path`.
     /// - Parameter key: raw key material from the Keychain.
     public init(path: String, key: Data) throws {
+        queue.setSpecific(key: queueKey, value: ())
         self.path = path
         try FileManager.default.createDirectory(
             atPath: (path as NSString).deletingLastPathComponent,
@@ -200,34 +202,83 @@ public final class Catalog: @unchecked Sendable {
         INSERT OR IGNORE INTO meta(k,v) VALUES ('schema_version','1');
         """)
         // v1→v2: per-file extractor version for incremental skip decisions.
+        // Crash-safe: inspect table_info first so a partial migration (ALTER
+        // succeeded but UPDATE crashed) does not re-ALTER and fail to open.
+        let hasLastExtractor = (try? query("SELECT 1 FROM pragma_table_info('files') WHERE name='last_extractor'") { _ in 1 }.first) != nil
+        if !hasLastExtractor {
+            // ALTER may still race on a very old file; treat "duplicate column"
+            // as success so we converge to v2 regardless.
+            do {
+                try run("ALTER TABLE files ADD COLUMN last_extractor TEXT")
+            } catch let e as CatalogError {
+                if case .execFailed(let m) = e, m.contains("duplicate column") { /* already there */ } else { throw e }
+            }
+        }
         let versionRows = try query("SELECT v FROM meta WHERE k='schema_version'") { $0.text(0) ?? "1" }
         if (versionRows.first ?? "1") == "1" {
-            try run("ALTER TABLE files ADD COLUMN last_extractor TEXT")
             try run("UPDATE meta SET v='2' WHERE k='schema_version'")
         }
     }
 
     // MARK: - Low-level helpers
 
+    // Raw sqlite execution without queue re-entry — used only inside
+    // transaction's already-held queue.sync.
+    private func rawExec(_ sql: String) throws {
+        var err: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(db, sql, nil, nil, &err) == SQLITE_OK else {
+            let msg = err.map { String(cString: $0) } ?? "unknown"
+            sqlite3_free(err)
+            throw CatalogError.execFailed(msg)
+        }
+    }
+
+    private func rawRun(_ sql: String, binds: [SQLValue] = []) throws {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.execFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        try bind(binds, to: stmt)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw CatalogError.execFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    private func rawQuery<T>(_ sql: String, binds: [SQLValue] = [], _ row: (Row) throws -> T) throws -> [T] {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.execFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        try bind(binds, to: stmt)
+        var out: [T] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append(try row(Row(stmt: stmt!)))
+        }
+        return out
+    }
+
     /// Run a block of catalog writes atomically: all of it lands, or none.
     /// Used by the indexer so a file's text/classification/hash are committed
     /// together, only AFTER the final identity recheck passes.
+    /// IMPORTANT: body must use rawRun/rawQuery/execSQL helpers that do NOT
+    /// re-enter queue.sync — this method already holds the serial queue.
     public func transaction<T>(_ body: () throws -> T) throws -> T {
         var result: Result<T, Error>?
         try queue.sync {
             do {
-                try run("BEGIN IMMEDIATE TRANSACTION")
+                try rawExec("BEGIN IMMEDIATE")
                 do {
                     let value = try body()
-                    try run("COMMIT")
+                    try rawExec("COMMIT")
                     result = .success(value)
                 } catch {
-                    try? run("ROLLBACK")
+                    try? rawExec("ROLLBACK")
                     result = .failure(error)
                 }
             } catch {
-                // BEGIN/COMMIT itself failed; ensure no half-open txn remains.
-                try? run("ROLLBACK")
+                try? rawExec("ROLLBACK")
                 result = .failure(error)
             }
         }
@@ -238,33 +289,19 @@ public final class Catalog: @unchecked Sendable {
     }
 
     public func run(_ sql: String, binds: [SQLValue] = []) throws {
-        try queue.sync {
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                throw CatalogError.execFailed(String(cString: sqlite3_errmsg(db)))
-            }
-            try bind(binds, to: stmt)
-            guard sqlite3_step(stmt) == SQLITE_DONE else {
-                throw CatalogError.execFailed(String(cString: sqlite3_errmsg(db)))
-            }
-        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil { try rawRun(sql, binds: binds); return }
+        try queue.sync { try rawRun(sql, binds: binds) }
     }
 
     public func query<T>(_ sql: String, binds: [SQLValue] = [], _ row: (Row) throws -> T) throws -> [T] {
-        return try queue.sync {
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                throw CatalogError.execFailed(String(cString: sqlite3_errmsg(db)))
-            }
-            try bind(binds, to: stmt)
-            var out: [T] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                out.append(try row(Row(stmt: stmt!)))
-            }
-            return out
-        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil { return try rawQuery(sql, binds: binds, row) }
+        return try queue.sync { try rawQuery(sql, binds: binds, row) }
+    }
+
+    // Transaction-body helpers — public for indexer use inside transaction.
+    public func txRun(_ sql: String, binds: [SQLValue] = []) throws { try rawRun(sql, binds: binds) }
+    public func txQuery<T>(_ sql: String, binds: [SQLValue] = [], _ row: (Row) throws -> T) throws -> [T] {
+        try rawQuery(sql, binds: binds, row)
     }
 
     private func bind(_ binds: [SQLValue], to stmt: OpaquePointer?) throws {
