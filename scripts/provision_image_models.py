@@ -59,14 +59,6 @@ MODELS = {
         "license": "Apache-2.0",
         "note": "Meta DINOv2 small — visual feature embedding, no text",
     },
-    # Fallback HF IDs that are known to exist
-    "clip-vit-base-patch32-alt": {
-        "hf_id": "openai/clip-vit-base-patch32",
-        "revision": "main",
-        "size": "~350 MB",
-        "license": "MIT",
-        "note": "alt entry — same as clip-vit-base-patch32",
-    },
 }
 
 def sha256_file(path: Path) -> str:

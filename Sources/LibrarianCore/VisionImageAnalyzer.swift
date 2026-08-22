@@ -41,24 +41,50 @@ public struct VisionImageAnalyzer: Sendable {
     }
 
     /// Analyze raw image data (for tests / in-memory callers).
+    /// Batched: single VNImageRequestHandler decode for both classify + feature-print (halves ANE work).
     public func analyze(data: Data) -> Result? {
         guard !data.isEmpty else { return nil }
-        let classifications = Self.classify(data: data)
-        let fp = Self.featurePrint(data: data)
+        let handler = VNImageRequestHandler(data: data, options: [:])
+        let classifyReq = VNClassifyImageRequest()
+        let fpReq = VNGenerateImageFeaturePrintRequest()
+        do {
+            try handler.perform([classifyReq, fpReq])
+        } catch {
+            return nil
+        }
+        let classifications: [(String, Float)] = {
+            guard let results = classifyReq.results else { return [] }
+            return results.filter { $0.confidence >= 0.08 }.prefix(8).map { ($0.identifier, $0.confidence) }
+        }()
+        let fp: FPBox? = {
+            guard let obs = fpReq.results?.first as? VNFeaturePrintObservation else { return nil }
+            let rev = "\(VNGenerateImageFeaturePrintRequestRevision1)"
+            // Primary: stable archived form (always decodable by Vision's computeDistance).
+            // KVC `data` is best-effort legacy — stored blobs are normalized to archived form
+            // so distance() never has to compare mixed formats (raw vs archived would silently fail).
+            if let archived = try? NSKeyedArchiver.archivedData(withRootObject: obs, requiringSecureCoding: true), !archived.isEmpty {
+                return FPBox(data: archived, revision: rev)
+            }
+            if let d = (obs as AnyObject).value(forKey: "data") as? Data, !d.isEmpty {
+                // Fallback only — still wrap via archiver failed above (should not happen).
+                return FPBox(data: d, revision: rev)
+            }
+            return nil
+        }()
         if classifications.isEmpty && fp == nil { return nil }
         return Result(classifications: classifications,
                       featurePrint: fp?.data,
                       featureRevision: fp?.revision ?? Self.revision)
     }
 
-    // MARK: - Vision requests
+    // MARK: - Vision requests (single-request helpers for SearchService.visualSearch + tests)
 
     static func classify(data: Data, topK: Int = 8, threshold: Float = 0.08) -> [(String, Float)] {
         let handler = VNImageRequestHandler(data: data, options: [:])
         let req = VNClassifyImageRequest()
         do {
             try handler.perform([req])
-            guard let results = req.results as? [VNClassificationObservation] else { return [] }
+            guard let results = req.results else { return [] }
             return results
                 .filter { $0.confidence >= threshold }
                 .prefix(topK)
@@ -73,19 +99,15 @@ public struct VisionImageAnalyzer: Sendable {
     static func featurePrint(data: Data) -> FPBox? {
         let handler = VNImageRequestHandler(data: data, options: [:])
         let req = VNGenerateImageFeaturePrintRequest()
-        // Use default revision; pin if needed for stable invalidation.
         do {
             try handler.perform([req])
             guard let obs = req.results?.first as? VNFeaturePrintObservation else { return nil }
-            // VNFeaturePrintObservation.data is the compact embedding.
-            // Compute revision from the request's revision if available.
             let rev = "\(VNGenerateImageFeaturePrintRequestRevision1)"
-            if let d = (obs as AnyObject).value(forKey: "data") as? Data, !d.isEmpty {
-                return FPBox(data: d, revision: rev)
-            }
-            // Fallback: encode via NSKeyedArchiver for persistence & distance via Vision API.
             if let archived = try? NSKeyedArchiver.archivedData(withRootObject: obs, requiringSecureCoding: true), !archived.isEmpty {
                 return FPBox(data: archived, revision: rev)
+            }
+            if let d = (obs as AnyObject).value(forKey: "data") as? Data, !d.isEmpty {
+                return FPBox(data: d, revision: rev)
             }
             return nil
         } catch {

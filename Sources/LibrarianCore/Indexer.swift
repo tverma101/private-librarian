@@ -128,10 +128,11 @@ public final class Indexer: @unchecked Sendable {
             break
         }
 
-        // 3a. Vision image analysis for image kinds (on-device, no download).
-        // Runs under MEDIUM slot alongside classification; failures are non-fatal.
+        // 3a. Vision image analysis — images only (on-device, no download).
+        // Video frame extraction is Stage E; raw video bytes cannot be classified.
+        // Runs under MEDIUM slot; failures are non-fatal.
         var visionLabels: [(String, Float)] = []
-        if ident.kind == .image || ident.kind == .video {
+        if ident.kind == .image {
             let vRes: VisionImageAnalyzer.Result? = scheduler.perform(as: .medium) { [self] () -> VisionImageAnalyzer.Result? in
                 visionAnalyzer.analyze(path: ident.path, broker: broker)
             }
