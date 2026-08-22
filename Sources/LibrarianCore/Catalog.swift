@@ -196,6 +196,20 @@ public final class Catalog: @unchecked Sendable {
             created REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS transcripts (
+            file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            start REAL NOT NULL,
+            end REAL NOT NULL,
+            text TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            created REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_transcripts_file ON transcripts(file_id);
+        -- Optional FTS for transcript search (plain table search also works)
+        CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
+            file_id UNINDEXED, text, tokenize='unicode61'
+        );
+
         CREATE TABLE IF NOT EXISTS model_provenance (
             model TEXT PRIMARY KEY,
             version TEXT NOT NULL,
@@ -626,6 +640,47 @@ public final class Catalog: @unchecked Sendable {
         let total = try query("SELECT count(*) FROM files") { $0.int(0) }
         out["total"] = Int(total.first ?? 0)
         return out
+    }
+
+    // MARK: - Transcripts (encrypted at rest — same SQLCipher DB)
+
+    public func saveTranscript(fileID: String, provider: String, segments: [TranscriptSegment]) throws {
+        try run("DELETE FROM transcripts WHERE file_id=?", binds: [.text(fileID)])
+        try run("DELETE FROM transcripts_fts WHERE file_id=?", binds: [.text(fileID)])
+        let now = Date().timeIntervalSince1970
+        for seg in segments {
+            try run("INSERT INTO transcripts(file_id, start, end, text, provider, created) VALUES(?,?,?,?,?,?)",
+                    binds: [.text(fileID), .real(seg.start), .real(seg.end), .text(seg.text), .text(provider), .real(now)])
+            if !seg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try run("INSERT INTO transcripts_fts(file_id, text) VALUES(?,?)", binds: [.text(fileID), .text(seg.text)])
+            }
+        }
+    }
+
+    public func transcripts(forFile id: String) throws -> [(start: Double, end: Double, text: String, provider: String)] {
+        try query("SELECT start, end, text, provider FROM transcripts WHERE file_id=? ORDER BY start", binds: [.text(id)]) { r in
+            (r.real(0), r.real(1), r.text(2) ?? "", r.text(3) ?? "")
+        }
+    }
+
+    public func transcriptText(forFile id: String) throws -> String? {
+        let rows = try transcripts(forFile: id)
+        guard !rows.isEmpty else { return nil }
+        return rows.map(\.text).joined(separator: " ")
+    }
+
+    // Transaction-local variants for use inside Indexer commit
+    public func txSaveTranscript(fileID: String, provider: String, segments: [TranscriptSegment]) throws {
+        try txRun("DELETE FROM transcripts WHERE file_id=?", binds: [.text(fileID)])
+        try txRun("DELETE FROM transcripts_fts WHERE file_id=?", binds: [.text(fileID)])
+        let now = Date().timeIntervalSince1970
+        for seg in segments {
+            try txRun("INSERT INTO transcripts(file_id, start, end, text, provider, created) VALUES(?,?,?,?,?,?)",
+                      binds: [.text(fileID), .real(seg.start), .real(seg.end), .text(seg.text), .text(provider), .real(now)])
+            if !seg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try txRun("INSERT INTO transcripts_fts(file_id, text) VALUES(?,?)", binds: [.text(fileID), .text(seg.text)])
+            }
+        }
     }
 
     /// Verify the catalog is actually encrypted by checking the on-disk header.

@@ -35,14 +35,17 @@ public final class Indexer: @unchecked Sendable {
     private let visionAnalyzer = VisionImageAnalyzer()
     private let options: Options
     private let processingVersion: String
+    /// Swappable ASR provider — defaults to Disabled (no transcription until benchmarked).
+    private let transcriptionProvider: any SpeechTranscriptionProvider
 
-    public init(broker: SourceBroker, catalog: Catalog, scheduler: Scheduler, options: Options = .init()) {
+    public init(broker: SourceBroker, catalog: Catalog, scheduler: Scheduler, options: Options = .init(), transcriptionProvider: any SpeechTranscriptionProvider = DisabledSpeechTranscriptionProvider()) {
         self.broker = broker
         self.catalog = catalog
         self.scheduler = scheduler
         self.options = options
         self.evidence = EvidenceExtractor(broker: broker)
         self.processingVersion = Self.makeProcessingVersion(options: options)
+        self.transcriptionProvider = transcriptionProvider
     }
 
     /// Embedding-space version — derived from pinned HF SHAs + pipeline
@@ -210,6 +213,41 @@ public final class Indexer: @unchecked Sendable {
             }
         }
 
+        // MARK: Media lane — audio/video probe + gating + sparse video frames
+
+        // Sparse video sampling (self-contained, no audio decode). Runs under MEDIUM slot.
+        var videoFrameCount: Int = 0
+        if ident.kind == .video {
+            // Bounded read for sampling — do not reopen original path
+            if let vBytes = try? broker.boundedRead(ident.path, limit: 32 * 1024 * 1024), !vBytes.isEmpty {
+                let ext = (ident.path as NSString).pathExtension
+                videoFrameCount = scheduler.perform(as: .medium) {
+                    VideoSampler.sampleFrames(bytes: vBytes, fileExtension: ext.isEmpty ? nil : ext)
+                }
+                _ = videoFrameCount // no-op: frame count confirms pipeline self-containment
+            }
+        }
+
+        // Audio/speech gating: probe -> gate -> transcribe (provider returns nil when disabled)
+        var stagedTranscript: (provider: String, segments: [TranscriptSegment])? = nil
+        if ident.kind == .audio || ident.kind == .video {
+            let ext = (ident.path as NSString).pathExtension
+            // Bounded bytes for probe — never reopens path inside AudioProbe
+            if let mBytes = try? broker.boundedRead(ident.path, limit: 16 * 1024 * 1024), !mBytes.isEmpty {
+                let decision = AudioProbe.probe(bytes: mBytes, fileExtension: ext.isEmpty ? nil : ext, tagHint: nil)
+                if decision.shouldTranscribe {
+                    // Only run when not Disabled — cheap check before any PCM work
+                    if !(transcriptionProvider is DisabledSpeechTranscriptionProvider) {
+                        // For now: empty PCM chunks — provider returns nil for disabled/inert
+                        // Real PCM decode via AVFoundation will populate chunks when provider is enabled
+                        if let segs = scheduler.perform(as: .medium, { transcriptionProvider.transcribe([]) }), !segs.isEmpty {
+                            stagedTranscript = (transcriptionProvider.providerID, segs)
+                        }
+                    }
+                }
+            }
+        }
+
         // Stage Tier-2 embeddings without touching the catalog yet.
         // Prefer the session worker (warm models) when available; fall back to
         // per-file cold start for single-file callers.
@@ -322,6 +360,9 @@ public final class Indexer: @unchecked Sendable {
                         INSERT INTO embeddings(file_id, model, dim, vector) VALUES(?,?,?,?)
                         ON CONFLICT(file_id, model) DO UPDATE SET dim=excluded.dim, vector=excluded.vector
                         """, binds: [.text(id), .text(LocalModelBridge.Model.clipImage.rawValue), .int(Int64(emb.dim)), .blob(emb.data)])
+                }
+                if let tr = stagedTranscript, !tr.segments.isEmpty {
+                    try catalog.txSaveTranscript(fileID: id, provider: tr.provider, segments: tr.segments)
                 }
                 if let emb = stagedMiniLM {
                     if !stagedChunks.isEmpty {
