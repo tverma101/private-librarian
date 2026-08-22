@@ -226,6 +226,7 @@ public final class Indexer: @unchecked Sendable {
             if stagedClip?.data.isEmpty == true { stagedClip = nil }
         }
         var stagedMiniLM: (dim: Int, data: Data)? = nil
+        var stagedChunks: [(index: Int, data: Data, dim: Int)] = []
         if options.enableLocalEmbeddings,
            let t = textContent, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            LocalModelBridge.isProvisioned(.miniLMText) {
@@ -235,6 +236,20 @@ public final class Indexer: @unchecked Sendable {
                 stagedMiniLM = scheduler.perform(as: .medium) { LocalModelBridge.embedText(t) }
             }
             if stagedMiniLM?.data.isEmpty == true { stagedMiniLM = nil }
+            // Pre-compute chunk embeddings *outside* the transaction so no
+            // Python/model call holds the DB commit open.
+            let chunks = LocalModelBridge.textChunks(t)
+            if chunks.count > 1 {
+                for (idx, chunk) in chunks.enumerated() {
+                    if let w = worker, let ce = w.embedText(chunk, timeout: 8), !ce.data.isEmpty {
+                        stagedChunks.append((idx, ce.data, ce.dim))
+                    } else if worker == nil,
+                              let ce = scheduler.perform(as: .medium, { LocalModelBridge.embedText(chunk) }),
+                              !ce.data.isEmpty {
+                        stagedChunks.append((idx, ce.data, ce.dim))
+                    }
+                }
+            }
         }
 
         // 3b. Classify (deterministic v1 + vision labels) under MEDIUM slot.
@@ -309,25 +324,13 @@ public final class Indexer: @unchecked Sendable {
                         """, binds: [.text(id), .text(LocalModelBridge.Model.clipImage.rawValue), .int(Int64(emb.dim)), .blob(emb.data)])
                 }
                 if let emb = stagedMiniLM {
-                    // Single embedding is always written. For long docs we also
-                    // persist chunk embeddings *once* using the already-computed
-                    // in-memory chunks — no extra Python call inside the tx.
-                    // To avoid double-calling embedText inside the transaction,
-                    // chunks are precomputed outside indexOne; for now keep the
-                    // in-tx path but guard it: only proceed if not already done.
-                    let chunks = LocalModelBridge.textChunks(textContent ?? "")
-                    if chunks.count > 1 {
+                    if !stagedChunks.isEmpty {
                         try catalog.txRun("DELETE FROM embedding_chunks WHERE file_id=? AND model=?",
                                           binds: [.text(id), .text(LocalModelBridge.Model.miniLMText.rawValue)])
-                        // Re-use the single-embedding path for short-circuit: only
-                        // embed-then-write chunks when stagedMiniLM came from a
-                        // fast path that already proved models are warm. If this
-                        // fires inside the tx, it is still bounded by chunk count.
-                        for (idx, chunk) in chunks.enumerated() {
-                            guard let ce = LocalModelBridge.embedText(chunk), !ce.data.isEmpty else { continue }
+                        for ch in stagedChunks {
                             try catalog.txRun("INSERT INTO embedding_chunks(file_id, model, chunk_index, dim, vector) VALUES(?,?,?,?,?)",
                                               binds: [.text(id), .text(LocalModelBridge.Model.miniLMText.rawValue),
-                                                      .int(Int64(idx)), .int(Int64(ce.dim)), .blob(ce.data)])
+                                                      .int(Int64(ch.index)), .int(Int64(ch.dim)), .blob(ch.data)])
                         }
                     }
                     try catalog.txRun("""

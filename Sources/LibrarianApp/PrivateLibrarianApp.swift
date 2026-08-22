@@ -143,7 +143,7 @@ final class LibrarianModel: ObservableObject {
 
     func runSearch() {
         guard let catalog, !query.isEmpty else { return }
-        let svc = SearchService(catalog: catalog)
+        let svc = SearchService(catalog: catalog, enableLocalEmbeddings: localEmbeddingsEnabled)
         let mode = searchMode
         var lines: [String] = []
         switch mode {

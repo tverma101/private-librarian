@@ -37,6 +37,7 @@ public struct LocalModelBridge: Sendable {
         private let proc: Process
         private let stdin: Pipe
         private let stdout: Pipe
+        private let stderr: Pipe
         private let lock = NSLock()
         private var closed = false
         private var buffer = Data()
@@ -58,11 +59,20 @@ public struct LocalModelBridge: Sendable {
             proc.environment = env
             let stdin = Pipe(); let stdout = Pipe(); let stderr = Pipe()
             proc.standardInput = stdin; proc.standardOutput = stdout; proc.standardError = stderr
+            // Drain stderr asynchronously so a noisy worker cannot fill the pipe
+            // and block. Async read never touches `self` before init completes.
+            let errFH = stderr.fileHandleForReading
+            DispatchQueue.global(qos: .utility).async {
+                errFH.readToEndOfFileInBackgroundAndNotify()
+            }
             do { try proc.run() } catch { return nil }
-            // Give worker a moment to warm imports before first request (non-blocking; first JSON response carries warmup)
             usleep(150_000)
             if !proc.isRunning { return nil }
-            self.proc = proc; self.stdin = stdin; self.stdout = stdout
+            self.proc = proc; self.stdin = stdin; self.stdout = stdout; self.stderr = stderr
+            // Ensure stdout is non-blocking so availableData cannot block the caller.
+            let fd = stdout.fileHandleForReading.fileDescriptor
+            let flags = fcntl(fd, F_GETFL)
+            if flags != -1 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
         }
 
         deinit { close() }
@@ -75,28 +85,39 @@ public struct LocalModelBridge: Sendable {
             if proc.isRunning { proc.terminate(); usleep(200_000); if proc.isRunning { proc.interrupt() } }
         }
 
-        /// Send one JSON request line and read one JSON response line.
-        /// `payload` is base64 for raw bytes or plain string for text depending on worker op.
+        /// Send one JSON request line and read one JSON response line with a trustworthy timeout.
         private func call(_ req: [String: Any], timeout: TimeInterval) -> [String: Any]? {
             lock.lock(); defer { lock.unlock() }
             guard !closed, proc.isRunning else { return nil }
             guard let line = try? JSONSerialization.data(withJSONObject: req),
                   let _ = try? stdin.fileHandleForWriting.write(contentsOf: line + Data([10])) else { return nil }
             let deadline = Date().addingTimeInterval(timeout)
+            let fd = stdout.fileHandleForReading.fileDescriptor
             while Date() < deadline {
-                let avail = stdout.fileHandleForReading.availableData
-                if !avail.isEmpty {
-                    buffer.append(avail)
-                    if let nl = buffer.firstIndex(of: 10) {
-                        let lineData = buffer.prefix(upTo: nl)
-                        buffer.removeSubrange(...nl)
-                        if let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] { return obj }
+                var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let ms = max(0, Int32(deadline.timeIntervalSinceNow * 1000))
+                let pr = poll(&pfd, 1, ms)
+                if pr > 0, (pfd.revents & Int16(POLLIN)) != 0 {
+                    let chunk = stdout.fileHandleForReading.readData(ofLength: 8192)
+                    if !chunk.isEmpty {
+                        buffer.append(chunk)
+                        if let nl = buffer.firstIndex(of: 10) {
+                            let lineData = buffer.prefix(upTo: nl)
+                            buffer.removeSubrange(...nl)
+                            if let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] { return obj }
+                            continue
+                        }
+                    } else if !proc.isRunning {
+                        return nil
                     }
+                } else if pr == 0 {
+                    return nil // timeout
                 } else {
-                    // No data yet — check if worker died
                     if !proc.isRunning { return nil }
+                    if errno == EINTR { continue }
                     usleep(5_000)
                 }
+                if !proc.isRunning, buffer.isEmpty { return nil }
             }
             return nil
         }
@@ -404,13 +425,22 @@ public struct LocalModelBridge: Sendable {
         return nil
     }
 
-    /// Resolve Application Support + repo Models roots; bundled .app uses AS, dev overrides with LIBRARIAN_MODELS_DIR.
+    /// Resolve Application Support + repo + bundled Resources Models roots; bundled .app uses Resources/Models.
     static func modelsRoots() -> [URL] {
         var roots: [URL] = []
         if let env = ProcessInfo.processInfo.environment["LIBRARIAN_MODELS_DIR"] {
             roots.append(URL(fileURLWithPath: env))
         }
         if let repo = repoRoot() { roots.append(repo.appendingPathComponent("Models")) }
+        if let res = Bundle.main.resourceURL?.appendingPathComponent("Models"),
+           FileManager.default.fileExists(atPath: res.path) {
+            roots.append(res)
+        }
+        // Fallback: explicit Resources/Models inside bundle (same as above but via bundleURL)
+        if let bundleModels = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Models").path as String?,
+           FileManager.default.fileExists(atPath: bundleModels) {
+            roots.append(URL(fileURLWithPath: bundleModels))
+        }
         let asURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent("PrivateLibrarian/Models")
         if let asURL { roots.append(asURL) }

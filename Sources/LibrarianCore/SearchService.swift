@@ -7,8 +7,13 @@ import Vision
 public struct SearchService: Sendable {
 
     let catalog: Catalog
+    private let enableLocalEmbeddings: Bool
 
-    public init(catalog: Catalog) { self.catalog = catalog }
+    public init(catalog: Catalog, enableLocalEmbeddings: Bool? = nil) {
+        self.catalog = catalog
+        if let v = enableLocalEmbeddings { self.enableLocalEmbeddings = v }
+        else { self.enableLocalEmbeddings = UserDefaults.standard.bool(forKey: "tier2-enabled-v1") }
+    }
 
     public enum Filter: Sendable {
         case kind(String)
@@ -60,6 +65,7 @@ public struct SearchService: Sendable {
     /// Semantic text search over local MiniLM embeddings (384-d, cosine).
     /// Chunk-aware: text can span chunks (score = max over chunks). Requires provisioned model; otherwise [].
     public func semanticSearch(query text: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
+        guard enableLocalEmbeddings else { return [] }
         guard let q = LocalModelBridge.embedText(text), !q.data.isEmpty else { return [] }
         let embedRows = try catalog.query(
             "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE e.model=?",
@@ -93,6 +99,7 @@ public struct SearchService: Sendable {
     /// Visual similarity via local CLIP embeddings (512-d, cosine) — higher quality than Vision feature-print.
     /// Requires Models/clip-vit-base-patch32 provisioned; otherwise returns [].
     public func clipVisualSearch(nearImagePath path: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
+        guard enableLocalEmbeddings else { return [] }
         guard let q = LocalModelBridge.embedImage(at: path), !q.data.isEmpty else { return [] }
         let rows = try catalog.query(
             "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE e.model=?",
@@ -111,6 +118,7 @@ public struct SearchService: Sendable {
     /// (same 512-d joint space as image CLIP) and rank indexed CLIP image embeddings by cosine.
     /// Requires Models/clip-vit-base-patch32 provisioned; otherwise returns [].
     public func clipTextToImageSearch(query text: String, limit: Int = 20, threshold: Float = 0.22) throws -> [(fileID: String, path: String, score: Float)] {
+        guard enableLocalEmbeddings else { return [] }
         guard let q = LocalModelBridge.embedClipText(text), !q.data.isEmpty else { return [] }
         let rows = try catalog.query(
             "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE e.model=?",
@@ -127,7 +135,7 @@ public struct SearchService: Sendable {
 
     /// Unified visual search: prefers CLIP when provisioned, falls back to Vision feature-print.
     public func bestVisualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20) throws -> [(fileID: String, path: String, score: Float, source: String)] {
-        if LocalModelBridge.isProvisioned(.clipImage) {
+        if enableLocalEmbeddings, LocalModelBridge.isProvisioned(.clipImage) {
             let clip = try clipVisualSearch(nearImagePath: path, limit: limit)
             if !clip.isEmpty { return clip.map { ($0.0, $0.1, $0.2, "clip") } }
         }
