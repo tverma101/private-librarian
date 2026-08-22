@@ -5,7 +5,7 @@ import Foundation
 /// No autonomous agent, no watchers that write, no LLM in the loop for v1.
 ///
 /// Race safety (plan §21): identity is captured before processing and re-stat'd
-/// immediately before commit; a changed file has its result discarded.
+/// immediately before final success; a changed file is marked for retry.
 public final class Indexer: @unchecked Sendable {
 
     public struct Options: Sendable {
@@ -21,6 +21,7 @@ public final class Indexer: @unchecked Sendable {
     }
 
     public struct Progress: Sendable {
+        /// Number of discovered entries scanned, including unchanged skips.
         public let processed: Int
         public let total: Int
         public let lastPath: String
@@ -33,6 +34,7 @@ public final class Indexer: @unchecked Sendable {
     private let classifier = RuleBasedClassifier()
     private let visionAnalyzer = VisionImageAnalyzer()
     private let options: Options
+    private let processingVersion: String
 
     public init(broker: SourceBroker, catalog: Catalog, scheduler: Scheduler, options: Options = .init()) {
         self.broker = broker
@@ -40,27 +42,54 @@ public final class Indexer: @unchecked Sendable {
         self.scheduler = scheduler
         self.options = options
         self.evidence = EvidenceExtractor(broker: broker)
+        self.processingVersion = Self.makeProcessingVersion(options: options)
     }
 
-    /// Index a security-scoped root folder. Returns number of files processed.
+    /// Full identity of the processing pipeline used for incremental invalidation.
+    /// Enabling Tier 2 or provisioning a previously absent Tier-2 model forces a
+    /// one-time re-index. Exact checkpoint/hash provenance is tracked separately
+    /// in issue #4 and will replace these coarse provisioned-state bits.
+    private static func makeProcessingVersion(options: Options) -> String {
+        var parts = [
+            ChangeDetection.extractorVersion,
+            "classifier:\(ChangeDetection.classifierVersion)",
+            "vision:\(VisionImageAnalyzer.revision)",
+        ]
+        if options.enableLocalEmbeddings {
+            let clip = LocalModelBridge.isProvisioned(.clipImage) ? "clip:on" : "clip:off"
+            let mini = LocalModelBridge.isProvisioned(.miniLMText) ? "minilm:on" : "minilm:off"
+            parts.append("tier2:\(clip),\(mini)")
+        } else {
+            parts.append("tier2:off")
+        }
+        return parts.joined(separator: "|")
+    }
+
+    /// Index a security-scoped root folder.
+    /// Returns the number of entries that actually required processing; entries
+    /// skipped by incremental detection are not counted. Progress still reports
+    /// all discovered entries scanned so the UI can reach total/total.
     @discardableResult
     public func indexRoot(_ root: URL, onProgress: ((Progress) -> Void)? = nil) throws -> Int {
         let items = try SourceBroker.enumerate(root: root)
-        var processed = 0
+        var scanned = 0
+        var actuallyProcessed = 0
         let total = min(items.count, options.maxFiles ?? Int.max)
 
         for item in items.prefix(options.maxFiles ?? Int.max) {
             do {
-                try indexOne(path: item.path)
+                if try indexOne(path: item.path) {
+                    actuallyProcessed += 1
+                }
             } catch {
                 // A per-file failure must never stop the run; record with an
                 // opaque ref only — never the path or content.
-                try? catalog.recordError(opaqueRef: FileID.workerError(processed + 1),
+                try? catalog.recordError(opaqueRef: FileID.workerError(scanned + 1),
                                          stage: "index", message: String(describing: error).prefix(200).description)
             }
-            processed += 1
+            scanned += 1
             if let onProgress {
-                onProgress(Progress(processed: processed, total: total,
+                onProgress(Progress(processed: scanned, total: total,
                                     lastPath: (item.path as NSString).lastPathComponent))
             }
         }
@@ -88,32 +117,52 @@ public final class Indexer: @unchecked Sendable {
                 continue
             }
         }
-        return processed
+        return actuallyProcessed
     }
 
     /// Index a single file end-to-end with race detection.
-    public func indexOne(path: String) throws {
+    /// Returns false when the stored identity + processing version prove the
+    /// entry is unchanged, before any extraction/Vision/Tier-2 work occurs.
+    @discardableResult
+    public func indexOne(path: String) throws -> Bool {
         // 1. Identity BEFORE processing.
-        guard let ident = try? broker.identity(at: path) else { return }
+        guard let ident = try? broker.identity(at: path) else { return false }
+
+        // Critical efficiency gate: this must happen before upsert, extraction,
+        // Vision, hashing, or Tier-2 subprocesses. The old implementation had
+        // ChangeDetection code but never called it.
+        if let stored = try catalog.storedState(forPath: path),
+           !ChangeDetection.needsProcessing(stored: stored,
+                                            current: ident,
+                                            requiredExtractorVersion: processingVersion) {
+            return false
+        }
+
+        let id = FileID.make(identity: ident)
 
         if ident.isSymlink {
             // Plan §22: index the link itself as metadata. Never open it.
-            let id = FileID.make(identity: ident)
             try catalog.upsertFile(identity: ident, id: id)
+            try catalog.setStatus(fileID: id, status: "pending")
+            try catalog.setExtractorVersion(fileID: id, version: processingVersion)
             try catalog.setStatus(fileID: id, status: "indexed")
-            return
+            return true
         }
 
         // Cloud placeholders are recorded but never hydrated (plan §24).
         if EvidenceExtractor.isCloudPlaceholder(at: path) {
-            let id = FileID.make(identity: ident)
             try catalog.upsertFile(identity: ident, id: id)
+            try catalog.setStatus(fileID: id, status: "pending")
+            try catalog.setExtractorVersion(fileID: id, version: processingVersion)
             try catalog.setStatus(fileID: id, status: "cloud-placeholder")
-            return
+            return true
         }
 
-        let id = FileID.make(identity: ident)
+        // Upsert updates the current size/mtime. Immediately mark pending so a
+        // crash cannot leave the new fingerprint carrying an old 'indexed'
+        // status and cause the next run to skip stale derived data.
         try catalog.upsertFile(identity: ident, id: id)
+        try catalog.setStatus(fileID: id, status: "pending")
 
         // 2. Extract bounded evidence + content.
         let ev = evidence.extract(identity: ident)
@@ -182,12 +231,16 @@ public final class Indexer: @unchecked Sendable {
         // 4. Duplicate detection: size-bucketed candidates only (plan §18).
         try maybeHash(fileID: id, identity: ident)
 
-        // 5. Re-stat IMMEDIATELY before commit; discard on mismatch (plan §21).
+        // 5. Re-stat immediately before declaring this processing generation
+        // successful. Atomic staging/commit of all derived rows remains tracked
+        // in #4; until then a mismatch is explicitly non-indexed and retried.
         guard let now = try? broker.identity(at: path), ident.stillMatches(now) else {
             try catalog.setStatus(fileID: id, status: "changed-during-index")
-            return
+            return true
         }
+        try catalog.setExtractorVersion(fileID: id, version: processingVersion)
         try catalog.setStatus(fileID: id, status: "indexed")
+        return true
     }
 
     /// Size-bucket candidate groups across the whole catalog, then confirm
