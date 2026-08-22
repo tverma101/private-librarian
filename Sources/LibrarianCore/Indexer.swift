@@ -45,10 +45,13 @@ public final class Indexer: @unchecked Sendable {
         self.processingVersion = Self.makeProcessingVersion(options: options)
     }
 
+    /// Embedding-space version — bump when switching the text embedding model family
+    /// or its pooling/normalization contract (MiniLM -> CLIP text, dim change, etc.)
+    /// so stale embedding spaces don't poison incremental skips.
+    public static let embeddingSpaceVersion = "emb-v1:minilm-384"
     /// Full identity of the processing pipeline used for incremental invalidation.
-    /// Enabling Tier 2 or provisioning a previously absent Tier-2 model forces a
-    /// one-time re-index. Exact checkpoint/hash provenance is tracked separately
-    /// in issue #4 and will replace these coarse provisioned-state bits.
+    /// Includes embedding-space identity when Tier 2 is enabled so a model change
+    /// forces at least one re-index of every file that carries an embedding.
     private static func makeProcessingVersion(options: Options) -> String {
         var parts = [
             ChangeDetection.extractorVersion,
@@ -58,7 +61,7 @@ public final class Indexer: @unchecked Sendable {
         if options.enableLocalEmbeddings {
             let clip = LocalModelBridge.isProvisioned(.clipImage) ? "clip:on" : "clip:off"
             let mini = LocalModelBridge.isProvisioned(.miniLMText) ? "minilm:on" : "minilm:off"
-            parts.append("tier2:\(clip),\(mini)")
+            parts.append("tier2:\(clip),\(mini),\(embeddingSpaceVersion)")
         } else {
             parts.append("tier2:off")
         }
@@ -164,7 +167,7 @@ public final class Indexer: @unchecked Sendable {
         try catalog.upsertFile(identity: ident, id: id)
         try catalog.setStatus(fileID: id, status: "pending")
 
-        // 2. Extract bounded evidence + content.
+        // 2. Extract bounded evidence + content (pure derives; not durably committed yet).
         let ev = evidence.extract(identity: ident)
         var textContent: String? = ev.textSample
 
@@ -172,20 +175,24 @@ public final class Indexer: @unchecked Sendable {
         case .pdf:
             if let pdfText = PDFText.extract(path: path, broker: broker) {
                 textContent = String(pdfText.prefix(200_000))
-                try? catalog.saveText(fileID: id, body: textContent!, extractor: "pdfkit")
             }
         case .text:
-            if let t = textContent {
-                try? catalog.saveText(fileID: id, body: t, extractor: "utf8")
-            }
+            break
         default:
             break
+        }
+        // 2a. Broker bytes for image embedding are held here so the helper path
+        // never sees the raw filesystem path.
+        var imageBytes: Data? = nil
+        if ident.kind == .image {
+            imageBytes = try? broker.boundedRead(ident.path, limit: Int64(VisionImageAnalyzer.maxVisionBytes))
         }
 
         // 3a. Vision image analysis — images only (on-device, no download).
         // Video frame extraction is Stage E; raw video bytes cannot be classified.
         // Runs under MEDIUM slot; failures are non-fatal.
         var visionLabels: [(String, Float)] = []
+        var stagedFeaturePrint: (Data, String)? = nil
         if ident.kind == .image {
             let vRes: VisionImageAnalyzer.Result? = scheduler.perform(as: .medium) { [self] () -> VisionImageAnalyzer.Result? in
                 visionAnalyzer.analyze(path: ident.path, broker: broker)
@@ -193,53 +200,130 @@ public final class Indexer: @unchecked Sendable {
             if let vr = vRes {
                 visionLabels = vr.classifications
                 if let fp = vr.featurePrint, !fp.isEmpty {
-                    try? catalog.saveVisualFeatures(fileID: id, featurePrint: fp, revision: vr.featureRevision)
-                }
-            }
-            // 3a2. Tier-2 local image embedding (CLIP) — opt-in, still offline, no network.
-            // Gated by Indexer.Options.enableLocalEmbeddings + provisioned checkpoint.
-            // Failure is silent; Vision is always the baseline.
-            if options.enableLocalEmbeddings, LocalModelBridge.isProvisioned(.clipImage) {
-                if let emb = scheduler.perform(as: .medium) { [self] () -> (dim: Int, data: Data)? in
-                    LocalModelBridge.embedImage(at: ident.path, model: .clipImage, timeout: 15)
-                }, !emb.data.isEmpty {
-                    _ = LocalModelBridge.saveEmbedding(fileID: id, catalog: catalog, vector: emb.data, dim: emb.dim, model: .clipImage)
+                    stagedFeaturePrint = (fp, vr.featureRevision)
                 }
             }
         }
-        // Tier-2 text semantic embedding (MiniLM) — opt-in, offline.
+
+        // Stage Tier-2 embeddings without touching the catalog yet.
+        var stagedClip: (dim: Int, data: Data)? = nil
+        if ident.kind == .image, let bytes = imageBytes, !bytes.isEmpty,
+           options.enableLocalEmbeddings, LocalModelBridge.isProvisioned(.clipImage) {
+            stagedClip = scheduler.perform(as: .medium) { () -> (dim: Int, data: Data)? in
+                LocalModelBridge.embedImageBytes(bytes, timeout: 15)
+            }
+            if stagedClip?.data.isEmpty == true { stagedClip = nil }
+        }
+        var stagedMiniLM: (dim: Int, data: Data)? = nil
         if options.enableLocalEmbeddings,
            let t = textContent, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            LocalModelBridge.isProvisioned(.miniLMText) {
-            if let emb = scheduler.perform(as: .medium) { LocalModelBridge.embedText(t) }, !emb.data.isEmpty {
-                _ = LocalModelBridge.saveEmbedding(fileID: id, catalog: catalog, vector: emb.data, dim: emb.dim, model: .miniLMText)
-            }
+            stagedMiniLM = scheduler.perform(as: .medium) { LocalModelBridge.embedText(t) }
+            if stagedMiniLM?.data.isEmpty == true { stagedMiniLM = nil }
         }
 
         // 3b. Classify (deterministic v1 + vision labels) under MEDIUM slot.
         let classification = scheduler.perform(as: .medium) { [self] () -> Classification in
             classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent, visionLabels: visionLabels)
         }
-        // Contract wall: validate our own output through the same gate an LLM
-        // would face. If it fails validation, it is discarded entirely.
-        if let validated = ClassifierContract.validate(try classification.jsonData()) {
-            try catalog.saveClassification(validated, classifier: "rule-based-v1")
-        } else {
-            try? catalog.recordError(opaqueRef: id, stage: "classifier", message: "output failed schema validation; discarded")
-        }
+        let validatedClass: Classification? = {
+            guard let data = try? classification.jsonData() else { return nil }
+            return ClassifierContract.validate(data)
+        }()
+        let hashToRecord: Data? = {
+            guard (try? Self.shouldHashCandidate(fileID: id, identity: ident, catalog: catalog)) == true else { return nil }
+            return try? DuplicateDetector.sha256(path: ident.path, broker: broker)
+        }()
 
-        // 4. Duplicate detection: size-bucketed candidates only (plan §18).
-        try maybeHash(fileID: id, identity: ident)
-
-        // 5. Re-stat immediately before declaring this processing generation
-        // successful. Atomic staging/commit of all derived rows remains tracked
-        // in #4; until then a mismatch is explicitly non-indexed and retried.
+        // 4. Re-stat BEFORE touching any derived table. If the file mutated during
+        // the (potentially expensive) Vision/Tier2 work, we must not commit derived
+        // data belonging to the now-stale generation.
         guard let now = try? broker.identity(at: path), ident.stillMatches(now) else {
             try catalog.setStatus(fileID: id, status: "changed-during-index")
             return true
         }
-        try catalog.setExtractorVersion(fileID: id, version: processingVersion)
-        try catalog.setStatus(fileID: id, status: "indexed")
+
+        // 5. Atomically commit the entire derived set for this generation so a
+        // crash or torn write cannot leave FTS, classifications, features, and
+        // embeddings inconsistent about the file generation they describe.
+        do {
+            try catalog.transaction {
+                if let t = textContent, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let extractor = (ident.kind == .pdf) ? "pdfkit" : "utf8"
+                    try catalog.txRun("DELETE FROM text_fts WHERE file_id=?", binds: [.text(id)])
+                    try catalog.txRun("""
+                        INSERT INTO text_content(file_id, body, extractor, created) VALUES(?,?,?,?)
+                        ON CONFLICT(file_id) DO UPDATE SET body=excluded.body, extractor=excluded.extractor, created=excluded.created
+                        """, binds: [.text(id), .text(t), .text(extractor), .real(Date().timeIntervalSince1970)])
+                    try catalog.txRun("INSERT INTO text_fts(file_id, body) VALUES(?,?)", binds: [.text(id), .text(t)])
+                }
+                if let validated = validatedClass {
+                    let cats = String(data: try JSONEncoder().encode(validated.categories), encoding: .utf8)!
+                    let reasons = String(data: try JSONEncoder().encode(validated.reasonCodes), encoding: .utf8)!
+                    try catalog.txRun("""
+                        INSERT INTO classifications(file_id, categories_json, description, confidence, reason_codes_json, classifier, created)
+                        VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(file_id) DO UPDATE SET
+                            categories_json=excluded.categories_json, description=excluded.description,
+                            confidence=excluded.confidence, reason_codes_json=excluded.reason_codes_json,
+                            classifier=excluded.classifier, created=excluded.created
+                        """, binds: [.text(validated.fileID), .text(cats), .text(validated.description),
+                                      .real(validated.confidence), .text(reasons),
+                                      .text("rule-based-v1"), .real(Date().timeIntervalSince1970)])
+                    try catalog.txRun("DELETE FROM category_membership WHERE file_id=? AND source='classifier'", binds: [.text(validated.fileID)])
+                    for cat in validated.categories {
+                        let catID = try catalog.txEnsureCategory(named: cat)
+                        try catalog.txRun("INSERT OR IGNORE INTO category_membership(category_id, file_id, source) VALUES(?,?,'classifier')",
+                                          binds: [.int(catID), .text(validated.fileID)])
+                    }
+                } else {
+                    try catalog.txRun("INSERT INTO errors(opaque_ref, stage, message, created) VALUES(?,?,?,?)",
+                                      binds: [.text(id), .text("classifier"), .text("output failed schema validation; discarded"),
+                                              .real(Date().timeIntervalSince1970)])
+                }
+                if let (fp, rev) = stagedFeaturePrint {
+                    try catalog.txRun("""
+                        INSERT INTO visual_features(file_id, featureprint, revision) VALUES(?,?,?)
+                        ON CONFLICT(file_id) DO UPDATE SET featureprint=excluded.featureprint, revision=excluded.revision
+                        """, binds: [.text(id), .blob(fp), .text(rev)])
+                }
+                if let emb = stagedClip {
+                    try catalog.txRun("""
+                        INSERT INTO embeddings(file_id, model, dim, vector) VALUES(?,?,?,?)
+                        ON CONFLICT(file_id, model) DO UPDATE SET dim=excluded.dim, vector=excluded.vector
+                        """, binds: [.text(id), .text(LocalModelBridge.Model.clipImage.rawValue), .int(Int64(emb.dim)), .blob(emb.data)])
+                }
+                if let emb = stagedMiniLM {
+                    // Single embedding for short docs; chunked path fills embedding_chunks for long docs.
+                    let chunks = LocalModelBridge.textChunks(textContent ?? "")
+                    if chunks.count > 1 {
+                        try catalog.txRun("DELETE FROM embedding_chunks WHERE file_id=? AND model=?",
+                                          binds: [.text(id), .text(LocalModelBridge.Model.miniLMText.rawValue)])
+                        for (idx, chunk) in chunks.enumerated() {
+                            guard let ce = LocalModelBridge.embedText(chunk), !ce.data.isEmpty else { continue }
+                            try catalog.txRun("INSERT INTO embedding_chunks(file_id, model, chunk_index, dim, vector) VALUES(?,?,?,?,?)",
+                                              binds: [.text(id), .text(LocalModelBridge.Model.miniLMText.rawValue),
+                                                      .int(Int64(idx)), .int(Int64(ce.dim)), .blob(ce.data)])
+                        }
+                    }
+                    try catalog.txRun("""
+                        INSERT INTO embeddings(file_id, model, dim, vector) VALUES(?,?,?,?)
+                        ON CONFLICT(file_id, model) DO UPDATE SET dim=excluded.dim, vector=excluded.vector
+                        """, binds: [.text(id), .text(LocalModelBridge.Model.miniLMText.rawValue), .int(Int64(emb.dim)), .blob(emb.data)])
+                }
+                if let digest = hashToRecord {
+                    try catalog.txRun("""
+                        INSERT INTO exact_hashes(file_id, size, sha256, computed) VALUES(?,?,?,?)
+                        ON CONFLICT(file_id) DO UPDATE SET sha256=excluded.sha256, computed=excluded.computed
+                        """, binds: [.text(id), .int(ident.size), .blob(digest), .real(Date().timeIntervalSince1970)])
+                }
+                try catalog.txRun("UPDATE files SET last_extractor=? WHERE id=?", binds: [.text(processingVersion), .text(id)])
+                try catalog.txRun("UPDATE files SET status='indexed' WHERE id=?", binds: [.text(id)])
+            }
+        } catch {
+            try? catalog.recordError(opaqueRef: id, stage: "index-commit", message: String(describing: error).prefix(200).description)
+            throw error
+        }
         return true
     }
 
@@ -288,13 +372,10 @@ public final class Indexer: @unchecked Sendable {
     }
 
     /// Opportunistic hashing when this file already shares its size with another known file.
-    private func maybeHash(fileID: String, identity: FileIdentity) throws {
-        guard options.hashCandidatesOnly else { return }
+    /// Used only for the staged-commit path — caller supplies a precomputed digest.
+    private static func shouldHashCandidate(fileID: String, identity: FileIdentity, catalog: Catalog) throws -> Bool {
         let sameSize = try catalog.query(
             "SELECT count(*) FROM files WHERE size=? AND id!=?", binds: [.int(identity.size), .text(fileID)]) { $0.int(0) }
-        guard (sameSize.first ?? 0) > 0 else { return }
-        if let digest = try? DuplicateDetector.sha256(path: identity.path, broker: broker) {
-            try? catalog.recordHash(fileID: fileID, size: identity.size, sha256: digest)
-        }
+        return (sameSize.first ?? 0) > 0
     }
 }

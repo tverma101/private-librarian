@@ -169,6 +169,15 @@ public final class Catalog: @unchecked Sendable {
             vector BLOB NOT NULL,
             PRIMARY KEY (file_id, model)
         );
+        -- Chunked semantic embeddings: one row per text chunk (embedding space chunks/*. same DB contract: key in keychain, never merged across files).
+        CREATE TABLE IF NOT EXISTS embedding_chunks (
+            file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            model TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            dim INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            PRIMARY KEY (file_id, model, chunk_index)
+        );
 
         CREATE TABLE IF NOT EXISTS processing_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -426,6 +435,28 @@ public final class Catalog: @unchecked Sendable {
         }
     }
 
+    /// Transaction-local category ensure — call only inside `transaction {}`.
+    @discardableResult
+    public func txEnsureCategory(named path: String) throws -> Int64 {
+        var parent: Int64 = -1
+        for component in path.split(separator: "/").map(String.init) {
+            let rows = try txQuery(
+                """
+                SELECT c.id FROM virtual_categories c
+                WHERE c.name=? AND (
+                    (? < 0 AND c.parent_id IS NULL)
+                 OR (? >= 0 AND c.parent_id = ?)
+                ) LIMIT 1
+                """, binds: [.text(component), .int(parent), .int(parent), .int(parent)]) { $0.int(0) }
+            if let existing = rows.first, existing > 0 { parent = existing; continue }
+            try txRun("INSERT INTO virtual_categories(name, parent_id) VALUES(?,?)",
+                      binds: [.text(component), parent < 0 ? .null : .int(parent)])
+            let newRows = try txQuery("SELECT last_insert_rowid()") { $0.int(0) }
+            parent = newRows[0]
+        }
+        return parent
+    }
+
     /// Ensure a (possibly nested "A/B/C") category exists; returns its id.
     @discardableResult
     public func ensureCategory(named path: String) throws -> Int64 {
@@ -483,6 +514,14 @@ public final class Catalog: @unchecked Sendable {
         INSERT INTO embeddings(file_id, model, dim, vector) VALUES(?,?,?,?)
         ON CONFLICT(file_id, model) DO UPDATE SET dim=excluded.dim, vector=excluded.vector
         """, binds: [.text(fileID), .text(model), .int(Int64(dim)), .blob(vector)])
+    }
+
+    public func replaceEmbeddingChunks(fileID: String, model: String, chunks: [(dim: Int, vector: Data)]) throws {
+        try run("DELETE FROM embedding_chunks WHERE file_id=? AND model=?", binds: [.text(fileID), .text(model)])
+        for (idx, c) in chunks.enumerated() {
+            try run("INSERT INTO embedding_chunks(file_id, model, chunk_index, dim, vector) VALUES(?,?,?,?,?)",
+                    binds: [.text(fileID), .text(model), .int(Int64(idx)), .int(Int64(c.dim)), .blob(c.vector)])
+        }
     }
 
     public func embedding(forFile id: String, model: String) throws -> (dim: Int, vector: Data)? {

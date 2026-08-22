@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import Vision
 
@@ -57,19 +58,34 @@ public struct SearchService: Sendable {
     // MARK: - Tier-2 local embeddings (CLIP / MiniLM, still offline — no network)
 
     /// Semantic text search over local MiniLM embeddings (384-d, cosine).
-    /// Requires Models/all-MiniLM-L6-v2 provisioned; otherwise returns [].
+    /// Chunk-aware: text can span chunks (score = max over chunks). Requires provisioned model; otherwise [].
     public func semanticSearch(query text: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
         guard let q = LocalModelBridge.embedText(text), !q.data.isEmpty else { return [] }
-        // Linear scan over embeddings table — fine for local library (<100k docs); ANN is future.
-        let rows = try catalog.query("SELECT file_id, vector FROM embeddings WHERE model=?", binds: [.text(LocalModelBridge.Model.miniLMText.rawValue)]) { r in
-            (r.text(0) ?? "", r.blob(1) ?? Data())
-        }
-        var scored: [(String, String, Float)] = []
-        for (fid, blob) in rows {
-            guard let row = try catalog.fileRow(id: fid) else { continue }
+        let embedRows = try catalog.query(
+            "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE e.model=?",
+            binds: [.text(LocalModelBridge.Model.miniLMText.rawValue)]
+        ) { r in (r.text(0) ?? "", r.blob(1) ?? Data(), r.text(2) ?? "") }
+        let chunkRows = (try? catalog.query(
+            "SELECT file_id, vector FROM embedding_chunks WHERE model=?",
+            binds: [.text(LocalModelBridge.Model.miniLMText.rawValue)]
+        ) { r in (r.text(0) ?? "", r.blob(1) ?? Data()) }) ?? []
+        // Join path for chunks via lookup so we still pay one files join for embedRows.
+        let pathByID: [String: String] = Dictionary(uniqueKeysWithValues: embedRows.map { ($0.0, $0.2) })
+        var best: [String: (score: Float, path: String)] = [:]
+        for (fid, blob, path) in embedRows {
             guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
-            if sim >= threshold { scored.append((fid, row.path, sim)) }
+            if sim < threshold { continue }
+            if let cur = best[fid], cur.score >= sim { continue }
+            best[fid] = (sim, path)
         }
+        for (fid, blob) in chunkRows {
+            guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
+            if sim < threshold { continue }
+            let path = pathByID[fid] ?? (try? catalog.fileRow(id: fid)?.path) ?? fid
+            if let cur = best[fid], cur.score >= sim { continue }
+            best[fid] = (sim, path)
+        }
+        var scored: [(String, String, Float)] = best.map { ($0.key, $0.value.path, $0.value.score) }
         scored.sort { $0.2 > $1.2 }
         return Array(scored.prefix(limit))
     }
@@ -78,14 +94,14 @@ public struct SearchService: Sendable {
     /// Requires Models/clip-vit-base-patch32 provisioned; otherwise returns [].
     public func clipVisualSearch(nearImagePath path: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
         guard let q = LocalModelBridge.embedImage(at: path), !q.data.isEmpty else { return [] }
-        let rows = try catalog.query("SELECT file_id, vector FROM embeddings WHERE model=?", binds: [.text(LocalModelBridge.Model.clipImage.rawValue)]) { r in
-            (r.text(0) ?? "", r.blob(1) ?? Data())
-        }
+        let rows = try catalog.query(
+            "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE e.model=?",
+            binds: [.text(LocalModelBridge.Model.clipImage.rawValue)]
+        ) { r in (r.text(0) ?? "", r.blob(1) ?? Data(), r.text(2) ?? "") }
         var scored: [(String, String, Float)] = []
-        for (fid, blob) in rows {
-            guard let row = try catalog.fileRow(id: fid) else { continue }
+        for (fid, blob, path) in rows {
             guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
-            if sim >= threshold { scored.append((fid, row.path, sim)) }
+            if sim >= threshold { scored.append((fid, path, sim)) }
         }
         scored.sort { $0.2 > $1.2 }
         return Array(scored.prefix(limit))

@@ -59,6 +59,13 @@ MODELS = {
         "license": "Apache-2.0",
         "note": "Meta DINOv2 small — visual feature embedding, no text",
     },
+    "all-MiniLM-L6-v2": {
+        "hf_id": "sentence-transformers/all-MiniLM-L6-v2",
+        "revision": "main",
+        "size": "~80 MB",
+        "license": "Apache-2.0",
+        "note": "MiniLM — 384-d text embedding for semantic search (wired)",
+    },
 }
 
 def sha256_file(path: Path) -> str:

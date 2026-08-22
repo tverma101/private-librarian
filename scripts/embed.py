@@ -133,12 +133,69 @@ def embed_text(text: str, model: str = "all-MiniLM-L6-v2"):
         return {"error": f"minilm inference failed: {e}"}
 
 
+def _embed_image_bytes(data: bytes, model: str = "clip-vit-base-patch32"):
+    """Embed raw image bytes from stdin (broker-only; path never exposed to helper)."""
+    if model != "clip-vit-base-patch32":
+        return {"error": f"unknown image model {model!r}"}
+    if not data:
+        return {"error": "empty stdin for image"}
+    dest = MODELS_DIR / model
+    if not (dest / "config.json").exists():
+        return {"error": f"model not provisioned: {model} — run provision_image_models.py --model {model}"}
+    try:
+        import io
+        import torch
+        from PIL import Image
+
+        clip_model, clip_proc = _load_clip()
+        try:
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception as e:
+            return {"error": f"cannot decode image bytes: {e}"}
+        with torch.no_grad():
+            inputs = clip_proc(images=img, return_tensors="pt")
+            out = clip_model.get_image_features(pixel_values=inputs["pixel_values"])
+            if hasattr(out, "pooler_output"):
+                vec = out.pooler_output[0]
+            elif hasattr(out, "image_embeds"):
+                vec = out.image_embeds[0]
+            else:
+                vec = out[0] if len(out.shape) == 2 else out
+            vec = vec / vec.norm(p=2).clamp(min=1e-9)
+            arr = vec.cpu().tolist()
+            return {"dim": len(arr), "vector": arr, "model": model}
+    except Exception as e:
+        return {"error": f"clip inference failed: {e}"}
+
+
+def _embed_text_bytes(data: bytes, model: str = "all-MiniLM-L6-v2"):
+    """Embed text supplied on stdin (argv-safe)."""
+    if model != "all-MiniLM-L6-v2":
+        return {"error": f"unknown text model {model!r}"}
+    dest = MODELS_DIR / model
+    if not (dest / "config.json").exists():
+        return {"error": f"model not provisioned: {model} — run provision_image_models.py --model {model}"}
+    text = data.decode("utf-8", errors="replace").strip()
+    if not text:
+        return {"error": "empty text on stdin"}
+    try:
+        mdl = _load_minilm()
+        vec = mdl.encode(text[:4000], convert_to_tensor=False, normalize_embeddings=True)
+        arr = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+        return {"dim": len(arr), "vector": arr, "model": model}
+    except Exception as e:
+        return {"error": f"minilm inference failed: {e}"}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Offline embedding helper (no network)")
-    ap.add_argument("--image", type=str, help="Image path to embed")
-    ap.add_argument("--text", type=str, help="Text to embed")
+    ap.add_argument("--image", type=str, help="Image path to embed (legacy)")
+    ap.add_argument("--text", type=str, help="Text to embed (legacy)")
+    ap.add_argument("--stdin-image", action="store_true", help="Read raw image bytes from stdin (broker-only)")
+    ap.add_argument("--stdin-text", action="store_true", help="Read UTF-8 text from stdin (argv-safe)")
     ap.add_argument("--model", type=str, default=None, help="Model name (default: clip for --image, minilm for --text)")
-    ap.add_argument("--batch-images", type=str, help="File with one image path per line; outputs JSONL")
+    ap.add_argument("--batch-images", type=str, help="File with one image path per line; outputs JSONL (legacy)")
+    ap.add_argument("--batch-images-manifest", type=str, help="Manifest file with lines <id>\\t<path>; outputs JSONL with id field")
     ap.add_argument("--check", action="store_true", help="Check runtime deps and exit 0/1")
     args = ap.parse_args()
 
@@ -150,6 +207,29 @@ def main():
             print(json.dumps({"error": "no models provisioned under Models/"}), file=sys.stderr)
             sys.exit(2)
         sys.exit(0 if ok else 1)
+
+    if args.batch_images_manifest:
+        model = args.model or "clip-vit-base-patch32"
+        try:
+            lines = Path(args.batch_images_manifest).read_text().splitlines()
+        except Exception as e:
+            print(json.dumps({"error": str(e)}))
+            sys.exit(1)
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            parts = raw.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            opaque_id, p = parts[0].strip(), parts[1].strip()
+            res = embed_image(p, model=model)
+            if "vector" in res:
+                res["id"] = opaque_id
+            else:
+                res = {"id": opaque_id, **res}
+            print(json.dumps(res))
+        return
 
     if args.batch_images:
         model = args.model or "clip-vit-base-patch32"
@@ -165,6 +245,20 @@ def main():
             res = embed_image(p, model=model)
             print(json.dumps(res))
         return
+
+    if args.stdin_image:
+        model = args.model or "clip-vit-base-patch32"
+        data = sys.stdin.buffer.read()
+        res = _embed_image_bytes(data, model=model)
+        print(json.dumps(res))
+        sys.exit(0 if "vector" in res else 1)
+
+    if args.stdin_text:
+        model = args.model or "all-MiniLM-L6-v2"
+        data = sys.stdin.buffer.read()
+        res = _embed_text_bytes(data, model=model)
+        print(json.dumps(res))
+        sys.exit(0 if "vector" in res else 1)
 
     if args.image:
         model = args.model or "clip-vit-base-patch32"

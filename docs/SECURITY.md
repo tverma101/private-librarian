@@ -23,7 +23,11 @@ rewrites a source file.
 | Over-broad entitlements in packaged app | App Sandbox ON, `user-selected.read-only`, bookmarks app-scope; auditor fails on any write/network/audio/photos entitlement | scripts/audit_entitlements.py in CI |
 | Network exfiltration from the app | No network entitlements; network-negative probe expects all four connection classes DENIED | scripts/network_negative_probe.py |
 | Image inference leaks to cloud | All AI image sorting runs 100% on-device: Apple Vision (`VNClassifyImageRequest`/`VNGenerateImageFeaturePrintRequest`) + optional local models from `Models/`; no network entitlement, no download in CI, no telemetry | VisionImageAnalyzer + LocalModelBridge + scripts/embed.py |
-| Local embedding helper phones home | `scripts/embed.py` runs with `local_files_only=True` on checkpoints under `Models/`; Swift side is a timeout-bounded subprocess with no shell; index path is never added to catalog tree | Network-negative probe + LocalModelBridge.isProvisioned guard |
+| Local embedding helper phones home | `scripts/embed.py` runs with `local_files_only=True` on checkpoints under `Models/`; Swift side is pinned python + `HF_HUB_OFFLINE=1`, timeout-bounded, piped stdin (argv-safe), no shell; indexed path is never passed to the helper as a path | Network-negative probe + LocalModelBridge stdin path |
+| Raw file path leaks in helper argv | Image bytes and query text cross the process boundary on stdin; the helper never receives a filesystem path or text payload in argv | LocalModelBridge.embedImageBytes / embedText |
+| Pipe-buffer deadlock from large embedding JSON | Helper stdout/stderr are drained after the wait rather than read eagerly so a 512-float vector never wedges a fixed pipe buffer | LocalModelBridge.runPython |
+| Long docs lose recall past a single embedding window | Documents are chunked (900-char window, 120 overlap) into `embedding_chunks` alongside the whole-document row; search keeps the max chunk score per file | embedding_chunks + SearchService.semanticSearch |
+| Stale embedding space after a model family change | `processingVersion` carries `Index.embeddingSpaceVersion` when Tier 2 is enabled so a MiniLM→CLIP-text switch forces a one-time re-index | ChangeDetection.needsProcessing |
 
 ## AI image sorting — privacy note
 

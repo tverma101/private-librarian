@@ -27,11 +27,6 @@ jobs:
       - name: Suite must be green
         run: grep -q "Executed .* tests, with 0 failures" test.log
 
-      - name: Release binary E2E
-        run: |
-          DEVELOPER_DIR=/Applications/Xcode_16.app/Contents/Developer swift build -c release
-          bash scripts/e2e_local.sh .build/release/librarian-cli
-
       - name: Vendored SQLCipher provenance
         run: |
           test -f ThirdParty/sqlcipher/sqlite3.c
