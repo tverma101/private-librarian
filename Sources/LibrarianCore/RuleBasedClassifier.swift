@@ -9,9 +9,9 @@ public struct RuleBasedClassifier: Sendable {
     public init() {}
 
     /// Multi-label classification (plan §26): kind / domain / course / purpose
-    /// style labels derived only from evidence and bounded text content.
+    /// style labels derived only from evidence, bounded text, and optional Vision labels.
     public func classify(fileID: String, identity: FileIdentity, evidence: EvidenceExtractor.Evidence,
-                         textContent: String?) -> Classification {
+                         textContent: String?, visionLabels: [(String, Float)] = []) -> Classification {
         var cats: [String] = []
         var reasons: [String] = []
 
@@ -63,6 +63,18 @@ public struct RuleBasedClassifier: Sendable {
             }
         }
 
+        // Vision labels for images (on-device VNClassifyImageRequest).
+        for (label, conf) in visionLabels.prefix(6) where conf >= 0.15 {
+            let normalized = label.split(separator: ",").first.map(String.init) ?? label
+            let trimmed = normalized.trimmingCharacters(in: .whitespaces).prefix(32)
+            guard !trimmed.isEmpty else { continue }
+            // Map common Vision labels to readable categories; keep raw label too for search.
+            let cat = Self.visionCategory(for: String(trimmed))
+            cats.append(cat)
+            reasons.append("vision:\(trimmed.lowercased().replacingOccurrences(of: " ", with: "-"))")
+            if conf >= 0.5 { confidence += 0.05 }
+        }
+
         // Filename tokens as weak signals.
         let tokens = Set(evidence.filenameTokens)
         if tokens.contains("screenshot") {
@@ -109,5 +121,16 @@ public struct RuleBasedClassifier: Sendable {
     static func describe(identity: FileIdentity, evidence: EvidenceExtractor.Evidence) -> String {
         let name = (identity.path as NSString).lastPathComponent
         return "\(identity.kind.rawValue) · \(evidence.sizeClass) · \(name)"
+    }
+
+    static func visionCategory(for label: String) -> String {
+        let l = label.lowercased()
+        if ["cat", "dog", "bird", "horse", "elephant", "bear"].contains(where: { l.contains($0) }) { return "Image/Animals/\(label)" }
+        if ["car", "truck", "bus", "bicycle", "airplane", "boat"].contains(where: { l.contains($0) }) { return "Image/Vehicles/\(label)" }
+        if ["beach", "mountain", "forest", "desert", "sky", "sunset"].contains(where: { l.contains($0) }) { return "Image/Scenery/\(label)" }
+        if ["food", "pizza", "cake", "fruit", "vegetable"].contains(where: { l.contains($0) }) { return "Image/Food/\(label)" }
+        if l.contains("screenshot") || l.contains("screen") { return "Image/Screenshots" }
+        if l.contains("text") || l.contains("document") || l.contains("paper") { return "Image/Documents/\(label)" }
+        return "Image/\(label)"
     }
 }

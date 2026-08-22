@@ -26,6 +26,7 @@ public final class Indexer: @unchecked Sendable {
     private let scheduler: Scheduler
     private let evidence: EvidenceExtractor
     private let classifier = RuleBasedClassifier()
+    private let visionAnalyzer = VisionImageAnalyzer()
     private let options: Options
 
     public init(broker: SourceBroker, catalog: Catalog, scheduler: Scheduler, options: Options = .init()) {
@@ -127,9 +128,24 @@ public final class Indexer: @unchecked Sendable {
             break
         }
 
-        // 3. Classify (deterministic v1) under MEDIUM slot.
-        let classification = try scheduler.perform(as: .medium) { [self] () -> Classification in
-            classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent)
+        // 3a. Vision image analysis for image kinds (on-device, no download).
+        // Runs under MEDIUM slot alongside classification; failures are non-fatal.
+        var visionLabels: [(String, Float)] = []
+        if ident.kind == .image || ident.kind == .video {
+            let vRes: VisionImageAnalyzer.Result? = scheduler.perform(as: .medium) { [self] () -> VisionImageAnalyzer.Result? in
+                visionAnalyzer.analyze(path: ident.path, broker: broker)
+            }
+            if let vr = vRes {
+                visionLabels = vr.classifications
+                if let fp = vr.featurePrint, !fp.isEmpty {
+                    try? catalog.saveVisualFeatures(fileID: id, featurePrint: fp, revision: vr.featureRevision)
+                }
+            }
+        }
+
+        // 3b. Classify (deterministic v1 + vision labels) under MEDIUM slot.
+        let classification = scheduler.perform(as: .medium) { [self] () -> Classification in
+            classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent, visionLabels: visionLabels)
         }
         // Contract wall: validate our own output through the same gate an LLM
         // would face. If it fails validation, it is discarded entirely.
