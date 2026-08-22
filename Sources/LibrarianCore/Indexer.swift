@@ -78,15 +78,20 @@ public final class Indexer: @unchecked Sendable {
         var scanned = 0
         var actuallyProcessed = 0
         let total = min(items.count, options.maxFiles ?? Int.max)
+        // Session-scoped persistent worker — keeps models warm across many files.
+        let worker: LocalModelBridge.PersistentWorker? = {
+            guard options.enableLocalEmbeddings else { return nil }
+            guard LocalModelBridge.isProvisioned(.clipImage) || LocalModelBridge.isProvisioned(.miniLMText) else { return nil }
+            return LocalModelBridge.PersistentWorker()
+        }()
+        defer { worker?.close() }
 
         for item in items.prefix(options.maxFiles ?? Int.max) {
             do {
-                if try indexOne(path: item.path) {
+                if try indexOne(path: item.path, worker: worker) {
                     actuallyProcessed += 1
                 }
             } catch {
-                // A per-file failure must never stop the run; record with an
-                // opaque ref only — never the path or content.
                 try? catalog.recordError(opaqueRef: FileID.workerError(scanned + 1),
                                          stage: "index", message: String(describing: error).prefix(200).description)
             }
@@ -127,7 +132,7 @@ public final class Indexer: @unchecked Sendable {
     /// Returns false when the stored identity + processing version prove the
     /// entry is unchanged, before any extraction/Vision/Tier-2 work occurs.
     @discardableResult
-    public func indexOne(path: String) throws -> Bool {
+    public func indexOne(path: String, worker: LocalModelBridge.PersistentWorker? = nil) throws -> Bool {
         // 1. Identity BEFORE processing.
         guard let ident = try? broker.identity(at: path) else { return false }
 
@@ -206,13 +211,17 @@ public final class Indexer: @unchecked Sendable {
         }
 
         // Stage Tier-2 embeddings without touching the catalog yet.
-        // NOTE: per-file cold Python start stays the default for single-file
-        // indexOne; indexRoot uses the session worker below for throughput.
+        // Prefer the session worker (warm models) when available; fall back to
+        // per-file cold start for single-file callers.
         var stagedClip: (dim: Int, data: Data)? = nil
         if ident.kind == .image, let bytes = imageBytes, !bytes.isEmpty,
            options.enableLocalEmbeddings, LocalModelBridge.isProvisioned(.clipImage) {
-            stagedClip = scheduler.perform(as: .medium) { () -> (dim: Int, data: Data)? in
-                LocalModelBridge.embedImageBytes(bytes, timeout: 15)
+            if let w = worker {
+                stagedClip = w.embedImageBytes(bytes, timeout: 15)
+            } else {
+                stagedClip = scheduler.perform(as: .medium) { () -> (dim: Int, data: Data)? in
+                    LocalModelBridge.embedImageBytes(bytes, timeout: 15)
+                }
             }
             if stagedClip?.data.isEmpty == true { stagedClip = nil }
         }
@@ -220,7 +229,11 @@ public final class Indexer: @unchecked Sendable {
         if options.enableLocalEmbeddings,
            let t = textContent, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            LocalModelBridge.isProvisioned(.miniLMText) {
-            stagedMiniLM = scheduler.perform(as: .medium) { LocalModelBridge.embedText(t) }
+            if let w = worker {
+                stagedMiniLM = w.embedText(t, timeout: 10)
+            } else {
+                stagedMiniLM = scheduler.perform(as: .medium) { LocalModelBridge.embedText(t) }
+            }
             if stagedMiniLM?.data.isEmpty == true { stagedMiniLM = nil }
         }
 
