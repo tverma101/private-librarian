@@ -18,6 +18,9 @@ import tempfile
 import time
 
 
+BENCHMARK_KEY_HEX = "11" * 32
+
+
 def generate_library(root: Path, files: int) -> None:
     courses = ("CSC-151", "MAT-171", "ENG-112")
     for i in range(files):
@@ -31,7 +34,6 @@ def generate_library(root: Path, files: int) -> None:
         )
         (bucket / f"doc-{i:06d}.txt").write_text(body, encoding="utf-8")
 
-    # Exact duplicate candidates without making the whole corpus duplicate-heavy.
     if files >= 20:
         payload = b"private-librarian-benchmark-duplicate\n" * 128
         dup = root / "duplicates"
@@ -40,13 +42,13 @@ def generate_library(root: Path, files: int) -> None:
         (dup / "copy-b.bin").write_bytes(payload)
 
 
-def run_cli(binary: Path, catalog: Path, source: Path, command: list[str]) -> dict:
+def run_cli(binary: Path, catalog: Path, command: list[str]) -> dict:
     env = dict(os.environ)
-    env["LIBRARIAN_CATALOG_KEY"] = "benchmark-only-fixed-key-do-not-use-for-real-data"
-    env["LIBRARIAN_CATALOG_PATH"] = str(catalog)
+    env["LIBRARIAN_CATALOG_KEY"] = BENCHMARK_KEY_HEX
+    full_command = [str(binary), *command, "--catalog", str(catalog)]
     started = time.perf_counter()
     proc = subprocess.run(
-        [str(binary), *command],
+        full_command,
         cwd=str(binary.parent),
         env=env,
         text=True,
@@ -55,7 +57,7 @@ def run_cli(binary: Path, catalog: Path, source: Path, command: list[str]) -> di
     )
     elapsed = time.perf_counter() - started
     return {
-        "command": command,
+        "command": full_command[1:],
         "seconds": elapsed,
         "returncode": proc.returncode,
         "stdout_tail": proc.stdout[-2000:],
@@ -84,13 +86,12 @@ def main() -> int:
     generate_library(source, args.files)
     generation_seconds = time.perf_counter() - generated_at
 
-    cold = run_cli(binary, catalog, source, ["index", str(source)])
-    warm = run_cli(binary, catalog, source, ["index", str(source)])
+    cold = run_cli(binary, catalog, ["index", str(source)])
+    warm = run_cli(binary, catalog, ["index", str(source)])
 
-    # Modify exactly one deterministic source and measure incremental work.
     target = source / "CSC-151" / "unit-00" / "doc-000000.txt"
-    target.write_text(target.read_text() + "changed-generation\n", encoding="utf-8")
-    one_change = run_cli(binary, catalog, source, ["index", str(source)])
+    target.write_text(target.read_text(encoding="utf-8") + "changed-generation\n", encoding="utf-8")
+    one_change = run_cli(binary, catalog, ["index", str(source)])
 
     result = {
         "schema": 1,
