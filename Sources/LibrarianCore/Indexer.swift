@@ -17,6 +17,7 @@ public final class Indexer: @unchecked Sendable {
         /// requires `Models/` provisioned and `scripts/embed.py` deps. When off,
         /// no subprocess is ever spawned. Set true for opt-in higher recall.
         public var enableLocalEmbeddings = false
+        public var enableOCR = true
         public init() {}
     }
 
@@ -33,6 +34,7 @@ public final class Indexer: @unchecked Sendable {
     private let evidence: EvidenceExtractor
     private let classifier = RuleBasedClassifier()
     private let visionAnalyzer = VisionImageAnalyzer()
+    private let visionOCR = VisionOCR()
     private let options: Options
     private let processingVersion: String
 
@@ -58,6 +60,9 @@ public final class Indexer: @unchecked Sendable {
             "classifier:\(ChangeDetection.classifierVersion)",
             "vision:\(VisionImageAnalyzer.revision)",
         ]
+        if options.enableOCR {
+            parts.append("ocr:\(VisionOCR.revision)")
+        }
         if options.enableLocalEmbeddings {
             let clip = LocalModelBridge.isProvisioned(.clipImage) ? "clip:on" : "clip:off"
             let mini = LocalModelBridge.isProvisioned(.miniLMText) ? "minilm:on" : "minilm:off"
@@ -193,6 +198,31 @@ public final class Indexer: @unchecked Sendable {
             imageBytes = try? broker.boundedRead(ident.path, limit: Int64(VisionImageAnalyzer.maxVisionBytes))
         }
 
+        // 2b. OCR injection after PDF/Office extraction — broker-bytes only, MEDIUM scheduler.
+        var ocrResult: VisionOCR.Result? = nil
+        var ocrExtractor: String? = nil
+        if options.enableOCR {
+            if ident.kind == .image, let bytes = imageBytes, !bytes.isEmpty {
+                ocrResult = scheduler.perform(as: .medium) { [self] () -> VisionOCR.Result? in
+                    visionOCR.recognize(imageData: bytes)
+                }
+                if ocrResult != nil { ocrExtractor = "vision-ocr" }
+            } else if ident.kind == .pdf, VisionOCR.needsOCR(pdfText: textContent) {
+                ocrResult = scheduler.perform(as: .medium) { [self] () -> VisionOCR.Result? in
+                    visionOCR.recognizeScannedPDF(at: ident.path, broker: broker, pdfText: textContent)
+                }
+                if ocrResult != nil { ocrExtractor = "pdfkit+vision-ocr" }
+            }
+            if let ocr = ocrResult, !ocr.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let trimmed = ocr.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let existing = textContent, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    textContent = existing + "\n" + trimmed
+                } else {
+                    textContent = trimmed
+                }
+            }
+        }
+
         // 3a. Vision image analysis — images only (on-device, no download).
         // Video frame extraction is Stage E; raw video bytes cannot be classified.
         // Runs under MEDIUM slot; failures are non-fatal.
@@ -279,7 +309,7 @@ public final class Indexer: @unchecked Sendable {
         do {
             try catalog.transaction {
                 if let t = textContent, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let extractor = (ident.kind == .pdf) ? "pdfkit" : "utf8"
+                    let extractor = ocrExtractor ?? ((ident.kind == .pdf) ? "pdfkit" : "utf8")
                     try catalog.txRun("DELETE FROM text_fts WHERE file_id=?", binds: [.text(id)])
                     try catalog.txRun("""
                         INSERT INTO text_content(file_id, body, extractor, created) VALUES(?,?,?,?)
