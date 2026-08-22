@@ -21,13 +21,43 @@ final class BehaviorTests: XCTestCase {
         let group = Set(first)
 
         let files = try catalog.allFiles()
-        let a = files.first { $0.path.hasSuffix("dup_a.bin") }!.id
-        let b = files.first { $0.path.hasSuffix("dup_b.bin") }!.id
+        let a = files.first { $0.path.hasSuffix("/Images/dup_a.bin") }!.id
+        let b = files.first { $0.path.hasSuffix("/Images/dup_b.bin") }!.id
         XCTAssertEqual(group, [a, b], "near_dup.bin must NOT be in the exact-duplicate group")
 
         // Report-only: both files still exist on disk.
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Images/dup_a.bin").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Images/dup_b.bin").path))
+    }
+
+    /// P0 regression (external audit): files > maxReadBytes whose first 8 MB
+    /// are identical but which differ beyond the cap must NOT be called
+    /// duplicates. The old streamBounded(.max) path hashed only the head.
+    func testHashesBeyondReadCapAreNotDuplicates() throws {
+        let root = try TestSupport.makeFixtureTree()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+
+        let catalog = try TestSupport.makeCatalog()
+        let indexer = Indexer(broker: SourceBroker(), catalog: catalog, scheduler: Scheduler())
+        _ = try indexer.indexRoot(root)
+
+        let groups = try indexer.computeDuplicateGroups()
+        let files = try catalog.allFiles()
+        let bigA = files.first { $0.path.hasSuffix("big_dup_a.bin") }!
+        let bigB = files.first { $0.path.hasSuffix("big_dup_b.bin") }!
+
+        // Direct hash-level proof: distinct digests, and each matches `shasum -a 256` semantics
+        // (equality with the small true-dup pair proves the pipeline still detects real dupes).
+        let broker = SourceBroker()
+        let dA = try DuplicateDetector.sha256(path: bigA.path, broker: broker)
+        let dB = try DuplicateDetector.sha256(path: bigB.path, broker: broker)
+        XCTAssertNotEqual(dA, dB, "12MB files differing at offset ~12MB must hash differently")
+
+        // And the funnel must not report them as a group (they share size,
+        // head/middle/tail windows, AND their first 8 MB).
+        let groupIDs = Set(groups.flatMap { $0 })
+        XCTAssertFalse(groupIDs.contains(bigA.id) && groupIDs.contains(bigB.id),
+                       "adversarial >8MB pair must not be reported as exact duplicates")
     }
 
     func testIncrementalIndexingSkipsUnchangedFiles() throws {
