@@ -70,4 +70,35 @@ final class VisionImageTests: XCTestCase {
         // Mismatched sizes → nil (visualSearch must drop, not crash)
         XCTAssertNil(VisionImageAnalyzer.cosineDistance(Data(repeating: 0x01, count: 32), Data(repeating: 0x01, count: 64)))
     }
+
+    // 5. LocalModelBridge — offline helpers, no network, no provisioned-model required to pass.
+    func testLocalModelBridgeGracefulWithoutModels() {
+        // Cosine on normalized synthetic vectors: self == 1, different < 1
+        var a = Data(); var b = Data(); var c = Data()
+        for v in [Float(1), 0, 0, 0] { withUnsafeBytes(of: v) { a.append(contentsOf: $0) } }
+        for v in [Float(1), 0, 0, 0] { withUnsafeBytes(of: v) { b.append(contentsOf: $0) } }
+        for v in [Float(0), 1, 0, 0] { withUnsafeBytes(of: v) { c.append(contentsOf: $0) } }
+        XCTAssertEqual(LocalModelBridge.cosineSimilarity(a, b) ?? -2, 1, accuracy: 1e-5)
+        XCTAssertEqual(LocalModelBridge.cosineSimilarity(a, c) ?? -2, 0, accuracy: 1e-5)
+        XCTAssertNil(LocalModelBridge.cosineSimilarity(a, Data(repeating: 0, count: 8)))
+        // parseEmbedding handles JSON correctly
+        let js = #"{"dim":3,"vector":[0.1,0.2,0.3]}"#
+        let p = LocalModelBridge.parseEmbedding(from: js)
+        XCTAssertEqual(p?.dim, 3)
+        XCTAssertEqual(p?.data.count, 12)
+        XCTAssertNil(LocalModelBridge.parseEmbedding(from: #"{"bad":1}"#))
+    }
+
+    func testSemanticAndClipSearchReturnEmptyWithoutProvisionedModels() throws {
+        let catalog = try TestSupport.makeCatalog()
+        let svc = SearchService(catalog: catalog)
+        // Without provisioned models, semantic/clip search must return [] not throw.
+        // (If models ARE provisioned locally, this test still passes vacuously on empty catalog.)
+        let sem = try svc.semanticSearch(query: "hello")
+        XCTAssertEqual(sem.count, 0)
+        let clip = try svc.clipVisualSearch(nearImagePath: "/no/such/path.jpg")
+        XCTAssertEqual(clip.count, 0)
+        let best = try svc.bestVisualSearch(nearImagePath: "/no/such/path.jpg", broker: SourceBroker())
+        XCTAssertEqual(best.count, 0)
+    }
 }

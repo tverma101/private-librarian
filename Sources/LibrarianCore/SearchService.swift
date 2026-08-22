@@ -53,4 +53,52 @@ public struct SearchService: Sendable {
         scored.sort { $0.2 < $1.2 }
         return Array(scored.prefix(limit))
     }
+
+    // MARK: - Tier-2 local embeddings (CLIP / MiniLM, still offline — no network)
+
+    /// Semantic text search over local MiniLM embeddings (384-d, cosine).
+    /// Requires Models/all-MiniLM-L6-v2 provisioned; otherwise returns [].
+    public func semanticSearch(query text: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
+        guard let q = LocalModelBridge.embedText(text), !q.data.isEmpty else { return [] }
+        // Linear scan over embeddings table — fine for local library (<100k docs); ANN is future.
+        let rows = try catalog.query("SELECT file_id, vector FROM embeddings WHERE model=?", binds: [.text(LocalModelBridge.Model.miniLMText.rawValue)]) { r in
+            (r.text(0) ?? "", r.blob(1) ?? Data())
+        }
+        var scored: [(String, String, Float)] = []
+        for (fid, blob) in rows {
+            guard let row = try catalog.fileRow(id: fid) else { continue }
+            guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
+            if sim >= threshold { scored.append((fid, row.path, sim)) }
+        }
+        scored.sort { $0.2 > $1.2 }
+        return Array(scored.prefix(limit))
+    }
+
+    /// Visual similarity via local CLIP embeddings (512-d, cosine) — higher quality than Vision feature-print.
+    /// Requires Models/clip-vit-base-patch32 provisioned; otherwise returns [].
+    public func clipVisualSearch(nearImagePath path: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
+        guard let q = LocalModelBridge.embedImage(at: path), !q.data.isEmpty else { return [] }
+        let rows = try catalog.query("SELECT file_id, vector FROM embeddings WHERE model=?", binds: [.text(LocalModelBridge.Model.clipImage.rawValue)]) { r in
+            (r.text(0) ?? "", r.blob(1) ?? Data())
+        }
+        var scored: [(String, String, Float)] = []
+        for (fid, blob) in rows {
+            guard let row = try catalog.fileRow(id: fid) else { continue }
+            guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
+            if sim >= threshold { scored.append((fid, row.path, sim)) }
+        }
+        scored.sort { $0.2 > $1.2 }
+        return Array(scored.prefix(limit))
+    }
+
+    /// Unified visual search: prefers CLIP when provisioned, falls back to Vision feature-print.
+    public func bestVisualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20) throws -> [(fileID: String, path: String, score: Float, source: String)] {
+        if LocalModelBridge.isProvisioned(.clipImage) {
+            let clip = try clipVisualSearch(nearImagePath: path, limit: limit)
+            if !clip.isEmpty { return clip.map { ($0.0, $0.1, $0.2, "clip") } }
+        }
+        // Fallback to Vision (distance -> score for uniform API: score = 1 - distance)
+        let vision = try visualSearch(nearImagePath: path, broker: broker, limit: limit, threshold: 0.5)
+        return vision.map { ($0.fileID, $0.path, 1 - $0.distance, "vision") }
+    }
 }
