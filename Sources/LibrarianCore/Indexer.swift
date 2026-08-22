@@ -12,6 +12,11 @@ public final class Indexer: @unchecked Sendable {
         public var maxReadBytes: Int64 = 8 * 1024 * 1024
         public var hashCandidatesOnly = true
         public var maxFiles: Int? = nil
+        /// Tier-2 local embeddings (CLIP image + MiniLM text) — still 100% offline.
+        /// Default OFF so Vision (zero-download) remains the baseline; enabling
+        /// requires `Models/` provisioned and `scripts/embed.py` deps. When off,
+        /// no subprocess is ever spawned. Set true for opt-in higher recall.
+        public var enableLocalEmbeddings = false
         public init() {}
     }
 
@@ -141,6 +146,24 @@ public final class Indexer: @unchecked Sendable {
                 if let fp = vr.featurePrint, !fp.isEmpty {
                     try? catalog.saveVisualFeatures(fileID: id, featurePrint: fp, revision: vr.featureRevision)
                 }
+            }
+            // 3a2. Tier-2 local image embedding (CLIP) — opt-in, still offline, no network.
+            // Gated by Indexer.Options.enableLocalEmbeddings + provisioned checkpoint.
+            // Failure is silent; Vision is always the baseline.
+            if options.enableLocalEmbeddings, LocalModelBridge.isProvisioned(.clipImage) {
+                if let emb = scheduler.perform(as: .medium) { [self] () -> (dim: Int, data: Data)? in
+                    LocalModelBridge.embedImage(at: ident.path, model: .clipImage, timeout: 15)
+                }, !emb.data.isEmpty {
+                    _ = LocalModelBridge.saveEmbedding(fileID: id, catalog: catalog, vector: emb.data, dim: emb.dim, model: .clipImage)
+                }
+            }
+        }
+        // Tier-2 text semantic embedding (MiniLM) — opt-in, offline.
+        if options.enableLocalEmbeddings,
+           let t = textContent, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           LocalModelBridge.isProvisioned(.miniLMText) {
+            if let emb = scheduler.perform(as: .medium) { LocalModelBridge.embedText(t) }, !emb.data.isEmpty {
+                _ = LocalModelBridge.saveEmbedding(fileID: id, catalog: catalog, vector: emb.data, dim: emb.dim, model: .miniLMText)
             }
         }
 
