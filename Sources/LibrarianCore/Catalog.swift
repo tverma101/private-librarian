@@ -207,6 +207,31 @@ public final class Catalog: @unchecked Sendable {
             loaded_at REAL
         );
 
+        CREATE TABLE IF NOT EXISTS corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            action TEXT NOT NULL,
+            created REAL NOT NULL,
+            provenance TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_corrections_file ON corrections(file_id);
+        CREATE TABLE IF NOT EXISTS learned_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_type TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            target_category TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            provenance TEXT NOT NULL,
+            created REAL NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_learned_rules_unique ON learned_rules(pattern_type, pattern, target_category);
+        CREATE TABLE IF NOT EXISTS learned_reindex_queue (
+            file_id TEXT PRIMARY KEY,
+            enqueued REAL NOT NULL
+        );
+
         INSERT OR IGNORE INTO virtual_categories(name) VALUES ('Review');
         INSERT OR IGNORE INTO meta(k,v) VALUES ('schema_version','1');
         """)

@@ -256,10 +256,32 @@ public final class Indexer: @unchecked Sendable {
         let classification = scheduler.perform(as: .medium) { [self] () -> Classification in
             classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent, visionLabels: visionLabels)
         }
-        let validatedClass: Classification? = {
+        var validatedClass: Classification? = {
             guard let data = try? classification.jsonData() else { return nil }
             return ClassifierContract.validate(data)
         }()
+        // Post-classifier deterministic enrichment from enabled learned rules (Issue #20).
+        if var vc = validatedClass {
+            if let ruleRows = try? catalog.enabledRules(), !ruleRows.isEmpty {
+                let engine = LearnedRuleEngine(rules: ruleRows)
+                let res = engine.enrich(categories: vc.categories, identity: ident, evidence: ev)
+                let dupCats = res.categories.count != Set(res.categories).count
+                if !res.reasons.isEmpty || res.categories != vc.categories {
+                    // Re-validate after enrichment (categories still must pass contract charset).
+                    let merged = res.categories
+                    let mergedReasons = (vc.reasonCodes + res.reasons).prefix(ClassifierContract.maxReasonCodes).map { $0 }
+                    // Clamp categories to max
+                    let finalCats = Array(merged.prefix(ClassifierContract.maxCategories))
+                    // Build a new Classification preserving fileID/description/confidence, extended categories/reasons.
+                    let trial = Classification(fileID: vc.fileID, categories: finalCats, description: vc.description, confidence: vc.confidence, reasonCodes: Array(mergedReasons))
+                    if let d = try? trial.jsonData(), let ok = ClassifierContract.validate(d) {
+                        vc = ok
+                        validatedClass = ok
+                    }
+                }
+                _ = dupCats
+            }
+        }
         let hashToRecord: Data? = {
             guard (try? Self.shouldHashCandidate(fileID: id, identity: ident, catalog: catalog)) == true else { return nil }
             return try? DuplicateDetector.sha256(path: ident.path, broker: broker)
@@ -345,6 +367,7 @@ public final class Indexer: @unchecked Sendable {
                         """, binds: [.text(id), .int(ident.size), .blob(digest), .real(Date().timeIntervalSince1970)])
                 }
                 try catalog.txRun("UPDATE files SET last_extractor=? WHERE id=?", binds: [.text(processingVersion), .text(id)])
+                try catalog.txRun("DELETE FROM learned_reindex_queue WHERE file_id=?", binds: [.text(id)])
                 try catalog.txRun("UPDATE files SET status='indexed' WHERE id=?", binds: [.text(id)])
             }
         } catch {
