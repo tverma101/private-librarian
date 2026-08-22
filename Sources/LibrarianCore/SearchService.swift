@@ -8,11 +8,14 @@ public struct SearchService: Sendable {
 
     let catalog: Catalog
     private let enableLocalEmbeddings: Bool
+    public let embeddingProvider: any EmbeddingProvider
 
-    public init(catalog: Catalog, enableLocalEmbeddings: Bool? = nil) {
+    public init(catalog: Catalog, enableLocalEmbeddings: Bool? = nil, embeddingProvider: (any EmbeddingProvider)? = nil) {
         self.catalog = catalog
         if let v = enableLocalEmbeddings { self.enableLocalEmbeddings = v }
         else { self.enableLocalEmbeddings = UserDefaults.standard.bool(forKey: "tier2-enabled-v1") }
+        if let p = embeddingProvider { self.embeddingProvider = p }
+        else { self.embeddingProvider = LocalModelEmbeddingProvider() }
     }
 
     public enum Filter: Sendable {

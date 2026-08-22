@@ -17,6 +17,7 @@ public final class Indexer: @unchecked Sendable {
         /// requires `Models/` provisioned and `scripts/embed.py` deps. When off,
         /// no subprocess is ever spawned. Set true for opt-in higher recall.
         public var enableLocalEmbeddings = false
+        public var embeddingProviderKind: String? = nil
         public init() {}
     }
 
@@ -35,14 +36,18 @@ public final class Indexer: @unchecked Sendable {
     private let visionAnalyzer = VisionImageAnalyzer()
     private let options: Options
     private let processingVersion: String
+    public let embeddingProvider: any EmbeddingProvider
 
-    public init(broker: SourceBroker, catalog: Catalog, scheduler: Scheduler, options: Options = .init()) {
+    public init(broker: SourceBroker, catalog: Catalog, scheduler: Scheduler, options: Options = .init(), embeddingProvider: (any EmbeddingProvider)? = nil) {
         self.broker = broker
         self.catalog = catalog
         self.scheduler = scheduler
         self.options = options
         self.evidence = EvidenceExtractor(broker: broker)
-        self.processingVersion = Self.makeProcessingVersion(options: options)
+        if let p = embeddingProvider { self.embeddingProvider = p }
+        else if let kind = options.embeddingProviderKind { self.embeddingProvider = EmbeddingProviderFactory.make(kind: kind) }
+        else { self.embeddingProvider = LocalModelEmbeddingProvider() }
+        self.processingVersion = Self.makeProcessingVersion(options: options, providerID: self.embeddingProvider.providerID)
     }
 
     /// Embedding-space version — derived from pinned HF SHAs + pipeline
@@ -52,7 +57,7 @@ public final class Indexer: @unchecked Sendable {
     /// Full identity of the processing pipeline used for incremental invalidation.
     /// Includes embedding-space identity when Tier 2 is enabled so a model change
     /// forces at least one re-index of every file that carries an embedding.
-    private static func makeProcessingVersion(options: Options) -> String {
+    private static func makeProcessingVersion(options: Options, providerID: String? = nil) -> String {
         var parts = [
             ChangeDetection.extractorVersion,
             "classifier:\(ChangeDetection.classifierVersion)",
@@ -61,7 +66,8 @@ public final class Indexer: @unchecked Sendable {
         if options.enableLocalEmbeddings {
             let clip = LocalModelBridge.isProvisioned(.clipImage) ? "clip:on" : "clip:off"
             let mini = LocalModelBridge.isProvisioned(.miniLMText) ? "minilm:on" : "minilm:off"
-            parts.append("tier2:\(clip),\(mini),\(embeddingSpaceVersion)")
+            let prov = providerID ?? options.embeddingProviderKind ?? LocalModelEmbeddingProvider().providerID
+            parts.append("tier2:\(clip),\(mini),\(embeddingSpaceVersion),provider:\(prov)")
         } else {
             parts.append("tier2:off")
         }
