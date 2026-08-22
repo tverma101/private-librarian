@@ -27,11 +27,14 @@ public struct LocalModelBridge: Sendable {
         return check.exitCode == 0
     }
 
-    /// Whether a specific model checkpoint is provisioned under Models/.
+    /// Whether a specific model checkpoint is provisioned under any Models root.
     public static func isProvisioned(_ model: Model) -> Bool {
-        guard let root = repoRoot() else { return false }
-        let cfg = root.appendingPathComponent("Models/\(model.rawValue)/config.json")
-        return FileManager.default.fileExists(atPath: cfg.path)
+        for root in modelsRoots() {
+            if FileManager.default.fileExists(atPath: root.appendingPathComponent("\(model.rawValue)/config.json").path) {
+                return true
+            }
+        }
+        return false
     }
 
     /// Embed raw image bytes via stdin (broker-only; helper never sees a raw path).
@@ -227,6 +230,11 @@ public struct LocalModelBridge: Sendable {
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
         env["HF_DATASETS_OFFLINE"] = "1"
+        env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        env["DO_NOT_TRACK"] = "1"
+        if let root = repoRoot() {
+            env["LIBRARIAN_MODELS_DIR"] = root.appendingPathComponent("Models").path
+        }
         proc.environment = env
         // No shell, no PATH interpolation.
         let outPipe = Pipe(), errPipe = Pipe()
@@ -264,12 +272,16 @@ public struct LocalModelBridge: Sendable {
 
     /// Locate embed.py in both SPM (repo root) and bundled app (Resources/scripts).
     static func scriptsDir() -> URL? {
-        // 1. App bundle: LibrarianApp copies scripts/ into Resources/scripts
+        // Allow explicit override for packaged Helper copies and tests.
+        if let env = ProcessInfo.processInfo.environment["LIBRARIAN_SCRIPTS_DIR"],
+           FileManager.default.fileExists(atPath: URL(fileURLWithPath: env).appendingPathComponent("embed.py").path) {
+            return URL(fileURLWithPath: env)
+        }
         if let res = Bundle.main.resourceURL?.appendingPathComponent("scripts"),
            FileManager.default.fileExists(atPath: res.appendingPathComponent("embed.py").path) {
             return res
         }
-        // 2. SPM / tests: walk up from CWD to repo root (Package.swift marker)
+        // SPM / tests: walk up from CWD to repo root (Package.swift marker)
         if let root = repoRoot() {
             let d = root.appendingPathComponent("scripts")
             if FileManager.default.fileExists(atPath: d.appendingPathComponent("embed.py").path) {
@@ -277,6 +289,19 @@ public struct LocalModelBridge: Sendable {
             }
         }
         return nil
+    }
+
+    /// Resolve Application Support + repo Models roots; bundled .app uses AS, dev overrides with LIBRARIAN_MODELS_DIR.
+    static func modelsRoots() -> [URL] {
+        var roots: [URL] = []
+        if let env = ProcessInfo.processInfo.environment["LIBRARIAN_MODELS_DIR"] {
+            roots.append(URL(fileURLWithPath: env))
+        }
+        if let repo = repoRoot() { roots.append(repo.appendingPathComponent("Models")) }
+        let asURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("PrivateLibrarian/Models")
+        if let asURL { roots.append(asURL) }
+        return roots
     }
 
     static func repoRoot() -> URL? {

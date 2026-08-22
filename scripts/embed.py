@@ -20,8 +20,9 @@ import json
 import sys
 from pathlib import Path
 
+import os
 ROOT = Path(__file__).resolve().parent.parent
-MODELS_DIR = ROOT / "Models"
+MODELS_DIR = Path(os.environ.get("LIBRARIAN_MODELS_DIR", str(ROOT / "Models")))
 
 # Map logical model name -> HF dir + runtime
 # clip-vit-base-patch32: CLIP image + text (PyTorch, PIL processor fallback — no torchvision needed)

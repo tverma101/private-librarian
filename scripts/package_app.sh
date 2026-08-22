@@ -30,9 +30,24 @@ cat > "$ENTITLEMENTS" <<'EOF'
 EOF
 
 rm -rf "$OUT_DIR/$APP_NAME"
-mkdir -p "$OUT_DIR/$APP_NAME/Contents/MacOS" "$OUT_DIR/$APP_NAME/Contents/Resources"
+mkdir -p "$OUT_DIR/$APP_NAME/Contents/MacOS" "$OUT_DIR/$APP_NAME/Contents/Resources/scripts"
+mkdir -p "$OUT_DIR/$APP_NAME/Contents/Resources/Models"
 
 cp "$BUILD_DIR/LibrarianApp" "$OUT_DIR/$APP_NAME/Contents/MacOS/PrivateLibrarian"
+
+# Bundle offline embedding helper for Tier-2 (pinned python + LIBRARIAN_* env).
+if [ -f "scripts/embed.py" ]; then
+    cp "scripts/embed.py" "$OUT_DIR/$APP_NAME/Contents/Resources/scripts/"
+fi
+
+# Optionally bundle provisioned Models for offline Tier-2 in the signed Resources.
+if [ -d "Models" ]; then
+    for m in Models/*; do
+        [ -d "$m" ] || continue
+        name="$(basename "$m")"
+        cp -R "$m" "$OUT_DIR/$APP_NAME/Contents/Resources/Models/$name" 2>/dev/null || true
+    done
+fi
 
 cat > "$OUT_DIR/$APP_NAME/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

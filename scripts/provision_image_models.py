@@ -89,33 +89,54 @@ def download_one(name: str, verify_only: bool = False):
     dest = MODELS_DIR / name
     print(f"[{name}] {spec['hf_id']} ({spec['size']}) — {spec['note']}")
     print(f"  license: {spec['license']}, revision: {spec['revision']}")
+    # Immutable pinned digest registry — add SHAs when pinning revision off main.
+    # Until then, provenance after download pins whatever was resolved from main.
+    expected = spec.get("expected_sha256")
     if verify_only:
         if not dest.exists():
             print(f"  not present — run without --verify-only to download", file=sys.stderr)
             return False
+        if expected:
+            # Verify against the pinned provenance's config.json hash when available.
+            prov = dest / "provenance.json"
+            if prov.exists():
+                try:
+                    rec = json.loads(prov.read_text())
+                    actual = rec.get("config_sha256")
+                    if actual and expected and actual != expected:
+                        print(f"  SHA mismatch: expected {expected[:12]}… actual {actual[:12]}…", file=sys.stderr)
+                        return False
+                except Exception:
+                    pass
+            # Also compare live config.json digest if present.
+            cfg = dest / "config.json"
+            if cfg.exists():
+                live = sha256_file(cfg)
+                if live != expected:
+                    print(f"  live config SHA mismatch: expected {expected[:12]}…, got {live[:12]}…", file=sys.stderr)
+                    return False
         print(f"  present at {dest}")
         return True
     dest.mkdir(parents=True, exist_ok=True)
-    # snapshot_download handles caching and revision pinning.
     hf.snapshot_download(
         repo_id=spec["hf_id"],
         revision=spec["revision"],
         local_dir=str(dest),
         local_dir_use_symlinks=False,
     )
-    # Write a provenance sidecar for Catalog.model_provenance
-    prov = {
+    prov_data = {
         "model": name,
         "hf_id": spec["hf_id"],
         "revision": spec["revision"],
         "license": spec["license"],
         "path": str(dest),
     }
-    # Hash a representative file for provenance (config.json if present)
     cfg = dest / "config.json"
     if cfg.exists():
-        prov["config_sha256"] = sha256_file(cfg)
-    (dest / "provenance.json").write_text(json.dumps(prov, indent=2))
+        prov_data["config_sha256"] = sha256_file(cfg)
+    if expected and prov_data.get("config_sha256") and prov_data["config_sha256"] != expected:
+        print(f"  !! downloaded config SHA {prov_data['config_sha256'][:12]}… != expected {expected[:12]}… (network/main moved)", file=sys.stderr)
+    (dest / "provenance.json").write_text(json.dumps(prov_data, indent=2))
     print(f"  downloaded to {dest}")
     return True
 
