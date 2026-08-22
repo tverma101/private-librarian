@@ -2,6 +2,9 @@
 # Package the sandboxed LibrarianApp into a proper .app bundle with hardened
 # entitlements (plan §2, §38) and ad-hoc signing.
 #
+# The librarian-cli remains a development/verification harness and is
+# intentionally NOT shipped inside the production .app bundle.
+#
 # Usage: scripts/package_app.sh [build-dir]   (default: .build/release)
 set -euo pipefail
 
@@ -30,7 +33,6 @@ rm -rf "$OUT_DIR/$APP_NAME"
 mkdir -p "$OUT_DIR/$APP_NAME/Contents/MacOS" "$OUT_DIR/$APP_NAME/Contents/Resources"
 
 cp "$BUILD_DIR/LibrarianApp" "$OUT_DIR/$APP_NAME/Contents/MacOS/PrivateLibrarian"
-cp "$BUILD_DIR/librarian-cli" "$OUT_DIR/$APP_NAME/Contents/MacOS/librarian-cli" 2>/dev/null || true
 
 cat > "$OUT_DIR/$APP_NAME/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
