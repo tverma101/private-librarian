@@ -57,6 +57,28 @@ final class SymlinkEscapeTests: XCTestCase {
         XCTAssertFalse(forbiddenSeen, "contents behind symlink must never be indexed")
     }
 
+    /// Reviewer finding (deleg_690c9bc4 Q1): a bare "/" (or trailing-slash)
+    /// root must never produce "//name" spellings. Pins the enumerate
+    /// display-path contract at the pathological input.
+    func testRootSlashSpellingNeverDoubleSlashes() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("slashroot-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try "x".write(to: dir.appendingPathComponent("leaf.txt"), atomically: true, encoding: .utf8)
+
+        // Trailing-slash root.
+        var items = try SourceBroker.enumerate(root: URL(fileURLWithPath: dir.path + "/"))
+        XCTAssertTrue(items.contains { $0.path == dir.path + "/leaf.txt" },
+                      "got \(items.map { $0.path })")
+
+        // Bare "/" root: join must yield "/tmp-…/leaf.txt"-style single slashes.
+        let tmpRoot = URL(fileURLWithPath: "/")
+        items = try SourceBroker.enumerate(root: tmpRoot, maxDepth: 0)
+        for i in items where i.path.contains("//") {
+            XCTFail("double slash from / root: \(i.path)")
+        }
+    }
+
     func testBrokerRefusesToOpenSymlinks() throws {
         let root = try TestSupport.makeFixtureTree()
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }

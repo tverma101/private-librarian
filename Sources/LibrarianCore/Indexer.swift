@@ -69,10 +69,18 @@ public final class Indexer: @unchecked Sendable {
             guard stored.path.hasPrefix(rootPrefix + "/") else { continue }
             if seen.contains(stored.path) { continue }
             // Depth-truncation guard: a file beyond maxDepth wasn't *seen*,
-            // but it didn't vanish. Absence = lstat fails (no-follow, same
-            // discipline as every other source-path touch).
-            guard (try? broker.identity(at: stored.path)) == nil else { continue }
-            try catalog.markMissing(path: stored.path)
+            // but it didn't vanish either. Absence must be PROVEN: only
+            // ENOENT/ENOTDIR from the no-follow lstat count. EACCES, ELOOP,
+            // etc. mean "can't look right now" — never "gone".
+            do {
+                _ = try broker.identity(at: stored.path)
+                continue
+            } catch BrokerError.statFailed(let errno)
+                where errno == ENOENT || errno == ENOTDIR {
+                try catalog.markMissing(path: stored.path)
+            } catch {
+                continue
+            }
         }
         return processed
     }

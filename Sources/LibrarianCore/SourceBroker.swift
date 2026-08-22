@@ -236,15 +236,27 @@ public struct SourceBroker: Sendable {
         if baseDisplay.hasSuffix("/") && baseDisplay.count > 1 { baseDisplay = String(baseDisplay.dropLast()) }
         var enqueued: [(dir: URL, display: String, depth: Int)] = [(root, baseDisplay, 0)]
         while let (dir, display, depth) = enqueued.popLast() {
-            let contents = try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [
-                .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey, .totalFileAllocatedSizeKey,
-            ], options: [])
+            // An unreadable directory must not kill the whole scan (plan §42
+            // doctrine): skip the subtree; the missing-sweep's errno check
+            // keeps its already-indexed rows safely 'indexed'.
+            let contents: [URL]
+            do {
+                contents = try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [
+                    .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey, .totalFileAllocatedSizeKey,
+                ], options: [])
+            } catch {
+                continue
+            }
             // Deterministic ordering regardless of filesystem order.
             let sorted = contents.sorted { $0.lastPathComponent < $1.lastPathComponent }
             for child in sorted {
-                // Reported path: caller-dialect join. Disk checks below use
-                // the REAL child.url — only the spelling we emit differs.
-                let childDisplay = display + "/" + child.lastPathComponent
+                // Reported path: caller-dialect join. Trim a trailing slash
+                // first so a bare "/" root yields "/name", never "//name".
+                // Disk checks below use the REAL child.url — only the
+                // spelling we emit differs.
+                let parentDisplay = display.hasSuffix("/")
+                    ? String(display.dropLast()) : display
+                let childDisplay = parentDisplay + "/" + child.lastPathComponent
                 // lstat-level link check FIRST: a symlinked directory must be
                 // recorded as a link and never descended into (plan §40).
                 var lst = stat()

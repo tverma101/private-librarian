@@ -7,11 +7,13 @@ All receipts below are from real executed runs on this machine
 
 ```
 $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-Executed 19 tests, with 0 failures (0 unexpected) in 1.829 (1.832) seconds
+Executed 21 tests, with 0 failures (0 unexpected) in 1.967 (1.969) seconds
 ```
 
 Covers: immutability zero-diff, symlink breakout + broker refusal +
-TOCTOU swap, prompt-injection inertness, malformed-file resilience,
+TOCTOU swap, root-spelling contract (`/` and trailing-slash roots never
+double-slash), unreadable-directory tolerance (EACCES never counts as
+deletion), prompt-injection inertness, malformed-file resilience,
 catalog encryption + wrong-key refusal + no plaintext header, duplicate
 reporting (near-duplicate control excluded), incremental re-index,
 virtual tree multi-label membership, FTS5 search, original-loss → missing.

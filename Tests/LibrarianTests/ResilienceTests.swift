@@ -66,6 +66,33 @@ final class ResilienceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: victim.path))
     }
 
+    /// Reviewer finding (deleg_690c9bc4 Q4): an unreadable directory must NOT
+    /// count as deletion. EACCES means "can't look right now" — the sweep may
+    /// only mark 'missing' when lstat proves absence (ENOENT/ENOTDIR).
+    func testUnreadableDirectoryDoesNotMarkFilesMissing() throws {
+        let root = try TestSupport.makeFixtureTree()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+
+        let catalog = try TestSupport.makeCatalog()
+        let indexer = Indexer(broker: SourceBroker(), catalog: catalog, scheduler: Scheduler())
+        _ = try indexer.indexRoot(root)
+
+        // Make School/ unreadable (not deleted): enumerate sees nothing
+        // inside it, and lstat of children fails with EACCES.
+        let school = root.appendingPathComponent("School")
+        var st = stat()
+        precondition(lstat(school.path, &st) == 0)
+        let originalMode = st.st_mode & 0o7777
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: school.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: originalMode], ofItemAtPath: school.path) }
+        _ = try indexer.indexRoot(root)
+
+        let files = try catalog.allFiles()
+        let worksheet = files.first { $0.path.hasSuffix("School/mat171-worksheet.txt") }
+        XCTAssertEqual(worksheet?.status, "indexed",
+                       "EACCES is not deletion — file must stay indexed, not missing")
+    }
+
     func testCatalogIsEncryptedOnDisk() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("enc-\(UUID().uuidString)")
         let dbPath = dir.appendingPathComponent("catalog.db").path
