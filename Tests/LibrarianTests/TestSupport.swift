@@ -66,6 +66,21 @@ enum TestSupport {
         var nearDup = dupPayload; nearDup[0] = 0x58
         try nearDup.write(to: root.appendingPathComponent("Images/near_dup.bin"))
 
+        // Adversarial dupe pair (P0 regression): 12 MB, identical head/middle/
+        // tail windows AND identical first 8 MB — they differ ONLY at offset
+        // 12 MB. The old 8 MB-capped "full" hash called these duplicates;
+        // a real full-file hash must not.
+        let bigBase = Data(repeating: 0x41, count: 12 * 1_048_576) // 'A' * 12MB
+        let bigA = root.appendingPathComponent("HugeFiles/big_dup_a.bin")
+        let bigB = root.appendingPathComponent("HugeFiles/big_dup_b.bin")
+        try bigBase.write(to: bigA)
+        try bigBase.write(to: bigB)
+        // Flip one byte at offset 12 MB - 4 in B only.
+        var bBytes = try Data(contentsOf: bigB)
+        let flip = 12 * 1_048_576 - 4
+        bBytes[flip] = 0x42
+        try bBytes.write(to: bigB)
+
         return root
     }
 

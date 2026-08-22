@@ -177,6 +177,31 @@ public struct SourceBroker: Sendable {
         }
     }
 
+    /// Stream the ENTIRE file in fixed-size chunks without holding it in
+    /// memory. Unlike the analysis reads above there is NO byte cap: hashing
+    /// a 500 GB file uses ~256 KB of RAM. Bounding MEMORY and bounding TOTAL
+    /// BYTES are different guarantees — extraction needs the second, hashing
+    /// must never have it (a "SHA-256" of only the head is not a SHA-256).
+    /// Still strictly read-only through the no-follow fd.
+    public func streamHash(_ path: String,
+                           _ body: (Data, Bool) throws -> Void) throws {
+        try withReadOnlyHandle(path) { fd in
+            let chunkSize = 262_144
+            let chunk = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+            defer { chunk.deallocate() }
+            while true {
+                let got = read(fd, chunk, chunkSize)
+                if got < 0 {
+                    if errno == EINTR { continue }
+                    throw BrokerError.openFailed(errno)
+                }
+                if got == 0 { break }
+                try body(Data(bytes: chunk, count: got), false)
+            }
+            try body(Data(), true)
+        }
+    }
+
     /// Stream the whole file in chunks without holding it in memory.
     /// Total bytes read are still capped at `maxReadBytes` to bound work.
     public func streamBounded(_ path: String, limit: Int64? = nil,

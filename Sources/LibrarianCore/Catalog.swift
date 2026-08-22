@@ -199,9 +199,43 @@ public final class Catalog: @unchecked Sendable {
         INSERT OR IGNORE INTO virtual_categories(name) VALUES ('Review');
         INSERT OR IGNORE INTO meta(k,v) VALUES ('schema_version','1');
         """)
+        // v1→v2: per-file extractor version for incremental skip decisions.
+        let versionRows = try query("SELECT v FROM meta WHERE k='schema_version'") { $0.text(0) ?? "1" }
+        if (versionRows.first ?? "1") == "1" {
+            try run("ALTER TABLE files ADD COLUMN last_extractor TEXT")
+            try run("UPDATE meta SET v='2' WHERE k='schema_version'")
+        }
     }
 
     // MARK: - Low-level helpers
+
+    /// Run a block of catalog writes atomically: all of it lands, or none.
+    /// Used by the indexer so a file's text/classification/hash are committed
+    /// together, only AFTER the final identity recheck passes.
+    public func transaction<T>(_ body: () throws -> T) throws -> T {
+        var result: Result<T, Error>?
+        try queue.sync {
+            do {
+                try run("BEGIN IMMEDIATE TRANSACTION")
+                do {
+                    let value = try body()
+                    try run("COMMIT")
+                    result = .success(value)
+                } catch {
+                    try? run("ROLLBACK")
+                    result = .failure(error)
+                }
+            } catch {
+                // BEGIN/COMMIT itself failed; ensure no half-open txn remains.
+                try? run("ROLLBACK")
+                result = .failure(error)
+            }
+        }
+        switch result! {
+        case .success(let v): return v
+        case .failure(let e): throw e
+        }
+    }
 
     public func run(_ sql: String, binds: [SQLValue] = []) throws {
         try queue.sync {
@@ -294,6 +328,24 @@ public final class Catalog: @unchecked Sendable {
             .text(identity.kind.rawValue), .int(identity.isSymlink ? 1 : 0),
             .real(Date().timeIntervalSince1970),
         ])
+    }
+
+    /// Fingerprint + state needed to decide whether a file needs reprocessing
+    /// (ChangeDetection.needsProcessing). Nil = never seen.
+    public func storedState(forPath path: String) throws
+        -> (size: Int64, mtime: Double, status: String, lastExtractor: String?)? {
+        let rows = try query("""
+            SELECT size, mtime, status, last_extractor FROM files WHERE path=?
+            """, binds: [.text(path)]) { r in
+            (r.int(0), r.real(1), r.text(2) ?? "", r.text(3))
+        }
+        return rows.first
+    }
+
+    /// Stamp which extractor/classifier version produced this file's data.
+    public func setExtractorVersion(fileID: String, version: String) throws {
+        try run("UPDATE files SET last_extractor=? WHERE id=?",
+                binds: [.text(version), .text(fileID)])
     }
 
     public func setStatus(fileID: String, status: String) throws {
