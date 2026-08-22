@@ -37,6 +37,14 @@ final class LibrarianModel: ObservableObject {
     @Published var searchResults: [String] = []
     @Published var query: String = ""
     @Published var isIndexing = false
+    @Published var localEmbeddingsEnabled: Bool {
+        didSet { UserDefaults.standard.set(localEmbeddingsEnabled, forKey: "tier2-enabled-v1") }
+    }
+    @Published var searchMode: String = "auto" // auto | exact | semantic | visual | clipText
+
+    var isTier2Provisioned: Bool {
+        LocalModelBridge.isProvisioned(.clipImage) || LocalModelBridge.isProvisioned(.miniLMText)
+    }
 
     private var catalog: Catalog?
     private var bookmarkDataByPath: [String: Data] = [:]
@@ -49,6 +57,8 @@ final class LibrarianModel: ObservableObject {
     }
 
     init() {
+        self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
+        if let m = UserDefaults.standard.string(forKey: "tier2-search-mode-v1") { self.searchMode = m }
         loadBookmarks()
         openCatalogIfNeeded()
     }
@@ -111,7 +121,9 @@ final class LibrarianModel: ObservableObject {
         guard let catalog, !isIndexing else { return }
         isIndexing = true
         let broker = SourceBroker()
-        let indexer = Indexer(broker: broker, catalog: catalog, scheduler: Scheduler())
+        var opts = Indexer.Options()
+        opts.enableLocalEmbeddings = localEmbeddingsEnabled
+        let indexer = Indexer(broker: broker, catalog: catalog, scheduler: Scheduler(), options: opts)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             for src in self?.sources ?? [] {
                 _ = self?.withSource(src) { url in
@@ -132,8 +144,30 @@ final class LibrarianModel: ObservableObject {
     func runSearch() {
         guard let catalog, !query.isEmpty else { return }
         let svc = SearchService(catalog: catalog)
-        let hits = (try? svc.search(query)) ?? []
-        searchResults = hits.map { "\($0.fileID) — \(($0.path as NSString).lastPathComponent)" }
+        let mode = searchMode
+        var lines: [String] = []
+        switch mode {
+        case "exact":
+            lines = ((try? svc.search(query)) ?? []).map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent)" }
+        case "semantic":
+            lines = ((try? svc.semanticSearch(query: query)) ?? []).map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent) [\(String(format:"%.2f", h.score))]" }
+        case "clipText":
+            lines = ((try? svc.clipTextToImageSearch(query: query)) ?? []).map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent) [clip \(String(format:"%.2f", h.score))]" }
+        default:
+            let sem = (try? svc.semanticSearch(query: query)) ?? []
+            if !sem.isEmpty {
+                lines = sem.map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent) [\(String(format:"%.2f", h.score))]" }
+            } else {
+                let clip = (try? svc.clipTextToImageSearch(query: query)) ?? []
+                if !clip.isEmpty {
+                    lines = clip.map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent) [clip \(String(format:"%.2f", h.score))]" }
+                } else {
+                    lines = ((try? svc.search(query)) ?? []).map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent)" }
+                }
+            }
+        }
+        if lines.isEmpty { lines = ["No results"] }
+        searchResults = lines
     }
 
     /// Privacy indicators derived from ACTUAL state where possible (plan §45).
@@ -211,6 +245,19 @@ struct ContentView: View {
                     Label("Duplicates", systemImage: "square.on.square")
                     Label("Review", systemImage: "questionmark.folder")
                     Label("Missing", systemImage: "exclamationmark.triangle")
+                }
+                Section("Settings") {
+                    Toggle("Local embeddings (CLIP + MiniLM)", isOn: $model.localEmbeddingsEnabled)
+                        .help(model.isTier2Provisioned ? "On-device only — no network" : "Provision Models/ first: scripts/provision_image_models.py --all")
+                        .disabled(!model.isTier2Provisioned)
+                    Picker("Search mode", selection: $model.searchMode) {
+                        Text("Auto").tag("auto")
+                        Text("Exact (FTS)").tag("exact")
+                        Text("Semantic").tag("semantic")
+                        Text("CLIP text→image").tag("clipText")
+                    }.pickerStyle(.segmented)
+                    .onChange(of: model.searchMode) { _, v in UserDefaults.standard.set(v, forKey: "tier2-search-mode-v1") }
+                    Text(model.isTier2Provisioned ? "Tier-2 ready" : "Tier-2 not provisioned — Vision fallback only").font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Sources (read-only)") {
                     ForEach(model.sources) { src in

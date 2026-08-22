@@ -53,15 +53,22 @@ def _load_clip():
     global _clip_model, _clip_proc
     if _clip_model is not None:
         return _clip_model, _clip_proc
-    from transformers import CLIPImageProcessor, CLIPModel
+    from transformers import CLIPImageProcessor, CLIPModel, CLIPTokenizer
 
-    # CLIPImageProcessor needs no torchvision — falls back to PIL path
     _clip_proc = CLIPImageProcessor.from_pretrained(
         str(MODELS_DIR / "clip-vit-base-patch32"), local_files_only=True
     )
     _clip_model = CLIPModel.from_pretrained(
         str(MODELS_DIR / "clip-vit-base-patch32"), local_files_only=True
     )
+    # Keep tokenizer lazy but warm on first text-CLIP call
+    _clip_model._clip_tokenizer = None  # type: ignore[attr-defined]
+    try:
+        _clip_model._clip_tokenizer = CLIPTokenizer.from_pretrained(  # type: ignore[attr-defined]
+            str(MODELS_DIR / "clip-vit-base-patch32"), local_files_only=True
+        )
+    except Exception:
+        pass
     _clip_model.eval()
     return _clip_model, _clip_proc
 
@@ -188,12 +195,46 @@ def _embed_text_bytes(data: bytes, model: str = "all-MiniLM-L6-v2"):
         return {"error": f"minilm inference failed: {e}"}
 
 
+def _embed_clip_text_bytes(data: bytes):
+    """Natural-language text → CLIP joint space (512-d) for cross-modal image search."""
+    dest = MODELS_DIR / "clip-vit-base-patch32"
+    if not (dest / "config.json").exists():
+        return {"error": "model not provisioned: clip-vit-base-patch32 — run provision_image_models.py --model clip-vit-base-patch32"}
+    text = data.decode("utf-8", errors="replace").strip()
+    if not text:
+        return {"error": "empty text on stdin"}
+    try:
+        import torch
+        clip_model, _ = _load_clip()
+        tok = getattr(clip_model, "_clip_tokenizer", None)
+        if tok is None:
+            from transformers import CLIPTokenizer
+            tok = CLIPTokenizer.from_pretrained(str(dest), local_files_only=True)
+            clip_model._clip_tokenizer = tok  # type: ignore[attr-defined]
+        with torch.no_grad():
+            toks = tok([text[:4000]], padding=True, truncation=True, return_tensors="pt")
+            out = clip_model.get_text_features(**toks)
+            if hasattr(out, "pooler_output"):
+                vec = out.pooler_output[0]
+            elif hasattr(out, "text_embeds"):
+                vec = out.text_embeds[0]
+            else:
+                vec = out[0] if len(out.shape) == 2 else out
+            vec = vec / vec.norm(p=2).clamp(min=1e-9)
+            arr = vec.cpu().tolist()
+            return {"dim": len(arr), "vector": arr, "model": "clip-vit-base-patch32-text"}
+    except Exception as e:
+        return {"error": f"clip text inference failed: {e}"}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Offline embedding helper (no network)")
     ap.add_argument("--image", type=str, help="Image path to embed (legacy)")
     ap.add_argument("--text", type=str, help="Text to embed (legacy)")
     ap.add_argument("--stdin-image", action="store_true", help="Read raw image bytes from stdin (broker-only)")
     ap.add_argument("--stdin-text", action="store_true", help="Read UTF-8 text from stdin (argv-safe)")
+    ap.add_argument("--stdin-clip-text", action="store_true", help="Read UTF-8 text from stdin and embed into CLIP joint space (512-d)")
+    ap.add_argument("--worker", action="store_true", help="Persistent JSONL worker: {op,data} per line -> {dim,vector} per line (image_b64/text/clip_text)")
     ap.add_argument("--model", type=str, default=None, help="Model name (default: clip for --image, minilm for --text)")
     ap.add_argument("--batch-images", type=str, help="File with one image path per line; outputs JSONL (legacy)")
     ap.add_argument("--batch-images-manifest", type=str, help="Manifest file with lines <id>\\t<path>; outputs JSONL with id field")
@@ -253,6 +294,55 @@ def main():
         res = _embed_image_bytes(data, model=model)
         print(json.dumps(res))
         sys.exit(0 if "vector" in res else 1)
+
+    if args.stdin_clip_text:
+        data = sys.stdin.buffer.read()
+        res = _embed_clip_text_bytes(data)
+        print(json.dumps(res))
+        sys.exit(0 if "vector" in res else 1)
+
+    if args.worker:
+        import base64
+        # Pre-warm models so per-file latency is inference only
+        try:
+            if (MODELS_DIR / "clip-vit-base-patch32" / "config.json").exists():
+                _load_clip()
+        except Exception:
+            pass
+        try:
+            if (MODELS_DIR / "all-MiniLM-L6-v2" / "config.json").exists():
+                _load_minilm()
+        except Exception:
+            pass
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                req = json.loads(raw)
+            except Exception as e:
+                print(json.dumps({"error": f"bad json: {e}"}), flush=True)
+                continue
+            op = req.get("op")
+            data_field = req.get("data", "")
+            if op == "image_b64":
+                try:
+                    b = base64.b64decode(data_field)
+                except Exception as e:
+                    print(json.dumps({"error": f"bad base64: {e}"}), flush=True)
+                    continue
+                res = _embed_image_bytes(b, model="clip-vit-base-patch32")
+                print(json.dumps(res), flush=True)
+            elif op == "text":
+                res = _embed_text_bytes(str(data_field).encode("utf-8"), model="all-MiniLM-L6-v2")
+                print(json.dumps(res), flush=True)
+            elif op == "clip_text":
+                res = _embed_clip_text_bytes(str(data_field).encode("utf-8"))
+                print(json.dumps(res), flush=True)
+            else:
+                print(json.dumps({"error": f"unknown op {op!r}"}), flush=True)
+        return
 
     if args.stdin_text:
         model = args.model or "all-MiniLM-L6-v2"

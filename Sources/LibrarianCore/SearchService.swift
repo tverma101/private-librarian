@@ -107,6 +107,24 @@ public struct SearchService: Sendable {
         return Array(scored.prefix(limit))
     }
 
+    /// Cross-modal text → image search: encode the text query with CLIP's text encoder
+    /// (same 512-d joint space as image CLIP) and rank indexed CLIP image embeddings by cosine.
+    /// Requires Models/clip-vit-base-patch32 provisioned; otherwise returns [].
+    public func clipTextToImageSearch(query text: String, limit: Int = 20, threshold: Float = 0.22) throws -> [(fileID: String, path: String, score: Float)] {
+        guard let q = LocalModelBridge.embedClipText(text), !q.data.isEmpty else { return [] }
+        let rows = try catalog.query(
+            "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE e.model=?",
+            binds: [.text(LocalModelBridge.Model.clipImage.rawValue)]
+        ) { r in (r.text(0) ?? "", r.blob(1) ?? Data(), r.text(2) ?? "") }
+        var scored: [(String, String, Float)] = []
+        for (fid, blob, path) in rows {
+            guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
+            if sim >= threshold { scored.append((fid, path, sim)) }
+        }
+        scored.sort { $0.2 > $1.2 }
+        return Array(scored.prefix(limit))
+    }
+
     /// Unified visual search: prefers CLIP when provisioned, falls back to Vision feature-print.
     public func bestVisualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20) throws -> [(fileID: String, path: String, score: Float, source: String)] {
         if LocalModelBridge.isProvisioned(.clipImage) {

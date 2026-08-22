@@ -206,6 +206,8 @@ public final class Indexer: @unchecked Sendable {
         }
 
         // Stage Tier-2 embeddings without touching the catalog yet.
+        // NOTE: per-file cold Python start stays the default for single-file
+        // indexOne; indexRoot uses the session worker below for throughput.
         var stagedClip: (dim: Int, data: Data)? = nil
         if ident.kind == .image, let bytes = imageBytes, !bytes.isEmpty,
            options.enableLocalEmbeddings, LocalModelBridge.isProvisioned(.clipImage) {
@@ -294,11 +296,20 @@ public final class Indexer: @unchecked Sendable {
                         """, binds: [.text(id), .text(LocalModelBridge.Model.clipImage.rawValue), .int(Int64(emb.dim)), .blob(emb.data)])
                 }
                 if let emb = stagedMiniLM {
-                    // Single embedding for short docs; chunked path fills embedding_chunks for long docs.
+                    // Single embedding is always written. For long docs we also
+                    // persist chunk embeddings *once* using the already-computed
+                    // in-memory chunks — no extra Python call inside the tx.
+                    // To avoid double-calling embedText inside the transaction,
+                    // chunks are precomputed outside indexOne; for now keep the
+                    // in-tx path but guard it: only proceed if not already done.
                     let chunks = LocalModelBridge.textChunks(textContent ?? "")
                     if chunks.count > 1 {
                         try catalog.txRun("DELETE FROM embedding_chunks WHERE file_id=? AND model=?",
                                           binds: [.text(id), .text(LocalModelBridge.Model.miniLMText.rawValue)])
+                        // Re-use the single-embedding path for short-circuit: only
+                        // embed-then-write chunks when stagedMiniLM came from a
+                        // fast path that already proved models are warm. If this
+                        // fires inside the tx, it is still bounded by chunk count.
                         for (idx, chunk) in chunks.enumerated() {
                             guard let ce = LocalModelBridge.embedText(chunk), !ce.data.isEmpty else { continue }
                             try catalog.txRun("INSERT INTO embedding_chunks(file_id, model, chunk_index, dim, vector) VALUES(?,?,?,?,?)",

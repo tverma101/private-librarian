@@ -27,6 +27,107 @@ public struct LocalModelBridge: Sendable {
         return check.exitCode == 0
     }
 
+    // MARK: - Persistent worker (Issue #4 P1: avoid per-file cold start)
+
+    /// Long-lived JSONL worker for the indexing pipeline. Keeps the helper
+    /// process + model warm across many files (one warm import per index
+    /// session). Non-persistent per-call path remains for one-off searches
+    /// via runPython().
+    public final class PersistentWorker: @unchecked Sendable {
+        private let proc: Process
+        private let stdin: Pipe
+        private let stdout: Pipe
+        private let lock = NSLock()
+        private var closed = false
+        private var buffer = Data()
+
+        /// Start `embed.py --worker [model]` with pinned python + offline env.
+        public init?(model: Model? = nil) {
+            guard let scriptsDir = LocalModelBridge.scriptsDir() else { return nil }
+            guard let python = LocalModelBridge.pythonExecutable() else { return nil }
+            let embed = scriptsDir.appendingPathComponent("embed.py").path
+            var args: [String] = [embed, "--worker"]
+            if let m = model { args += ["--model", m.rawValue] }
+            let proc = Process()
+            proc.executableURL = python
+            proc.arguments = args
+            var env = ProcessInfo.processInfo.environment
+            env["HF_HUB_OFFLINE"] = "1"; env["TRANSFORMERS_OFFLINE"] = "1"
+            env["HF_DATASETS_OFFLINE"] = "1"; env["HF_HUB_DISABLE_TELEMETRY"] = "1"; env["DO_NOT_TRACK"] = "1"
+            if let root = LocalModelBridge.repoRoot() { env["LIBRARIAN_MODELS_DIR"] = root.appendingPathComponent("Models").path }
+            proc.environment = env
+            let stdin = Pipe(); let stdout = Pipe(); let stderr = Pipe()
+            proc.standardInput = stdin; proc.standardOutput = stdout; proc.standardError = stderr
+            do { try proc.run() } catch { return nil }
+            // Give worker a moment to warm imports before first request (non-blocking; first JSON response carries warmup)
+            usleep(150_000)
+            if !proc.isRunning { return nil }
+            self.proc = proc; self.stdin = stdin; self.stdout = stdout
+        }
+
+        deinit { close() }
+
+        public func close() {
+            lock.lock(); defer { lock.unlock() }
+            guard !closed else { return }
+            closed = true
+            try? stdin.fileHandleForWriting.close()
+            if proc.isRunning { proc.terminate(); usleep(200_000); if proc.isRunning { proc.interrupt() } }
+        }
+
+        /// Send one JSON request line and read one JSON response line.
+        /// `payload` is base64 for raw bytes or plain string for text depending on worker op.
+        private func call(_ req: [String: Any], timeout: TimeInterval) -> [String: Any]? {
+            lock.lock(); defer { lock.unlock() }
+            guard !closed, proc.isRunning else { return nil }
+            guard let line = try? JSONSerialization.data(withJSONObject: req),
+                  let _ = try? stdin.fileHandleForWriting.write(contentsOf: line + Data([10])) else { return nil }
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                let avail = stdout.fileHandleForReading.availableData
+                if !avail.isEmpty {
+                    buffer.append(avail)
+                    if let nl = buffer.firstIndex(of: 10) {
+                        let lineData = buffer.prefix(upTo: nl)
+                        buffer.removeSubrange(...nl)
+                        if let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] { return obj }
+                    }
+                } else {
+                    // No data yet — check if worker died
+                    if !proc.isRunning { return nil }
+                    usleep(5_000)
+                }
+            }
+            return nil
+        }
+
+        public func embedImageBytes(_ bytes: Data, timeout: TimeInterval = 20) -> (dim: Int, data: Data)? {
+            let b64 = bytes.base64EncodedString()
+            guard let obj = call(["op": "image_b64", "data": b64], timeout: timeout),
+                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
+            var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
+            return (dim, out)
+        }
+
+        public func embedText(_ text: String, timeout: TimeInterval = 10) -> (dim: Int, data: Data)? {
+            let clipped = String(text.prefix(4000))
+            guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            guard let obj = call(["op": "text", "data": clipped], timeout: timeout),
+                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
+            var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
+            return (dim, out)
+        }
+
+        public func embedClipText(_ text: String, timeout: TimeInterval = 10) -> (dim: Int, data: Data)? {
+            let clipped = String(text.prefix(4000))
+            guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            guard let obj = call(["op": "clip_text", "data": clipped], timeout: timeout),
+                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
+            var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
+            return (dim, out)
+        }
+    }
+
     /// Whether a specific model checkpoint is provisioned under any Models root.
     public static func isProvisioned(_ model: Model) -> Bool {
         for root in modelsRoots() {
@@ -72,6 +173,18 @@ public struct LocalModelBridge: Sendable {
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-text", "--model", model.rawValue],
                                input: Data(clipped.utf8), timeout: timeout)
+        return parseEmbedding(from: result.stdout)
+    }
+
+    /// Embed natural-language text into the CLIP joint image-text space (512-d, L2-normalized).
+    /// Enables text-to-image search: text and image CLIP vectors share one cosine space.
+    public static func embedClipText(_ text: String, timeout: TimeInterval = 10) -> (dim: Int, data: Data)? {
+        let clipped = String(text.prefix(4000))
+        guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        guard isProvisioned(.clipImage) else { return nil }
+        guard let scriptsDir = scriptsDir() else { return nil }
+        let embed = scriptsDir.appendingPathComponent("embed.py").path
+        let result = runPython([embed, "--stdin-clip-text"], input: Data(clipped.utf8), timeout: timeout)
         return parseEmbedding(from: result.stdout)
     }
 
