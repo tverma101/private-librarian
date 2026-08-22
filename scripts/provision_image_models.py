@@ -28,40 +28,40 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "Models"
 
-# Lightweight registry — pin revisions for reproducibility.
-# Sizes are approximate; actual download size varies by format.
+# Pinned immutable revisions — fetched via HF API on 2026-08-22. Do not float.
+# Use --verify-only to enforce; update SHAs deliberately after reviewing weight changes.
 MODELS = {
     "clip-vit-base-patch32": {
         "hf_id": "openai/clip-vit-base-patch32",
-        "revision": "main",
+        "revision": "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268",
         "size": "~350 MB",
         "license": "MIT",
         "note": "OpenAI CLIP ViT-B/32 — baseline image+text embedding",
     },
     "siglip-base-patch16-224": {
         "hf_id": "google/siglip-base-patch16-224",
-        "revision": "main",
+        "revision": "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
         "size": "~350 MB",
         "license": "Apache-2.0",
         "note": "Google SigLIP — better than CLIP on small models",
     },
     "mobileclip-s0": {
         "hf_id": "apple/MobileCLIP-S0",
-        "revision": "main",
+        "revision": "71aa3e13dda93115871afbd017336535ba29886c",
         "size": "~60 MB",
         "license": "Apple Sample Code License",
         "note": "Apple MobileCLIP-S0 — fastest on-device CLIP variant",
     },
     "dinov2-small": {
         "hf_id": "facebook/dinov2-small",
-        "revision": "main",
+        "revision": "ed25f3a31f01632728cabb09d1542f84ab7b0056",
         "size": "~80 MB",
         "license": "Apache-2.0",
         "note": "Meta DINOv2 small — visual feature embedding, no text",
     },
     "all-MiniLM-L6-v2": {
         "hf_id": "sentence-transformers/all-MiniLM-L6-v2",
-        "revision": "main",
+        "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
         "size": "~80 MB",
         "license": "Apache-2.0",
         "note": "MiniLM — 384-d text embedding for semantic search (wired)",

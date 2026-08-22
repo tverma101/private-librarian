@@ -45,10 +45,10 @@ public final class Indexer: @unchecked Sendable {
         self.processingVersion = Self.makeProcessingVersion(options: options)
     }
 
-    /// Embedding-space version — bump when switching the text embedding model family
-    /// or its pooling/normalization contract (MiniLM -> CLIP text, dim change, etc.)
-    /// so stale embedding spaces don't poison incremental skips.
-    public static let embeddingSpaceVersion = "emb-v1:minilm-384"
+    /// Embedding-space version — derived from pinned HF SHAs + pipeline
+    /// contract (processor revision, dim, poisoning prevention). Bump when any
+    /// checkpoint SHA or embedding pipeline changes.
+    public static let embeddingSpaceVersion = "emb-v2:clip-3d74acf9|siglip-7fd15f06|mclip-71aa3e13|dino-ed25f3a3|minilm-1110a243|dim-512+384"
     /// Full identity of the processing pipeline used for incremental invalidation.
     /// Includes embedding-space identity when Tier 2 is enabled so a model change
     /// forces at least one re-index of every file that carries an embedding.

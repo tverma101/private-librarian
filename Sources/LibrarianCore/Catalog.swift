@@ -547,6 +547,19 @@ public final class Catalog: @unchecked Sendable {
                      .int(verified ? 1 : 0), .real(Date().timeIntervalSince1970)])
     }
 
+    /// Record a full embedding-space provenance snapshot (checkpoint SHAs, dims, pipeline rev).
+    public func recordEmbeddingSpace(version: String, details: String) throws {
+        try run("INSERT OR IGNORE INTO meta(k,v) VALUES('embedding_space_version', ?)", binds: [.text(version)])
+        try run("UPDATE meta SET v=? WHERE k='embedding_space_version'", binds: [.text(version)])
+        try run("INSERT OR IGNORE INTO meta(k,v) VALUES('embedding_space_details', ?)", binds: [.text(details)])
+        try run("UPDATE meta SET v=? WHERE k='embedding_space_details'", binds: [.text(details)])
+    }
+
+    public func embeddingSpaceVersion() throws -> String? {
+        let rows = try query("SELECT v FROM meta WHERE k='embedding_space_version'") { $0.text(0) }
+        return rows.first ?? nil
+    }
+
     // MARK: - Search
 
     public struct SearchHit: Sendable {
