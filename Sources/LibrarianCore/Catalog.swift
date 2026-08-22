@@ -463,6 +463,51 @@ public final class Catalog: @unchecked Sendable {
         """, binds: [.text(fileID), .int(size), .blob(sha256), .real(Date().timeIntervalSince1970)])
     }
 
+    // MARK: - Vision / embeddings
+
+    public func saveVisualFeatures(fileID: String, featurePrint: Data, revision: String) throws {
+        try run("""
+        INSERT INTO visual_features(file_id, featureprint, revision) VALUES(?,?,?)
+        ON CONFLICT(file_id) DO UPDATE SET featureprint=excluded.featureprint, revision=excluded.revision
+        """, binds: [.text(fileID), .blob(featurePrint), .text(revision)])
+    }
+
+    public func visualFeatures(forFile id: String) throws -> (featurePrint: Data, revision: String)? {
+        let rows = try query("SELECT featureprint, revision FROM visual_features WHERE file_id=?",
+                             binds: [.text(id)]) { r in (r.blob(0) ?? Data(), r.text(1) ?? "") }
+        return rows.first
+    }
+
+    public func saveEmbedding(fileID: String, model: String, dim: Int, vector: Data) throws {
+        try run("""
+        INSERT INTO embeddings(file_id, model, dim, vector) VALUES(?,?,?,?)
+        ON CONFLICT(file_id, model) DO UPDATE SET dim=excluded.dim, vector=excluded.vector
+        """, binds: [.text(fileID), .text(model), .int(Int64(dim)), .blob(vector)])
+    }
+
+    public func embedding(forFile id: String, model: String) throws -> (dim: Int, vector: Data)? {
+        let rows = try query("SELECT dim, vector FROM embeddings WHERE file_id=? AND model=?",
+                             binds: [.text(id), .text(model)]) { r in (Int(r.int(0)), r.blob(1) ?? Data()) }
+        return rows.first
+    }
+
+    public func allVisualFeatures() throws -> [(fileID: String, featurePrint: Data)] {
+        try query("SELECT file_id, featureprint FROM visual_features") { r in (r.text(0) ?? "", r.blob(1) ?? Data()) }
+    }
+
+    public func registerModelProvenance(model: String, version: String, source: String, license: String,
+                                        expectedSHA256: String, actualSHA256: String? = nil, verified: Bool = false) throws {
+        try run("""
+        INSERT INTO model_provenance(model, version, source, license, expected_sha256, actual_sha256, verified, loaded_at)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(model) DO UPDATE SET version=excluded.version, source=excluded.source,
+            license=excluded.license, expected_sha256=excluded.expected_sha256,
+            actual_sha256=excluded.actual_sha256, verified=excluded.verified, loaded_at=excluded.loaded_at
+        """, binds: [.text(model), .text(version), .text(source), .text(license),
+                     .text(expectedSHA256), actualSHA256.map { .text($0) } ?? .null,
+                     .int(verified ? 1 : 0), .real(Date().timeIntervalSince1970)])
+    }
+
     // MARK: - Search
 
     public struct SearchHit: Sendable {

@@ -6,3 +6,5 @@ dist/
 .swiftpm
 netns-test/
 /tmp/
+# Downloaded ML models (provisioned via scripts/provision_image_models.py)
+Models/
