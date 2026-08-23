@@ -179,6 +179,32 @@ public final class Catalog: @unchecked Sendable {
             PRIMARY KEY (file_id, model, chunk_index)
         );
 
+        -- Similarity is derivative, encrypted catalog state. The relation and
+        -- signal are explicit so near-duplicate review never masquerades as
+        -- semantic relevance, and providers can be replaced without a schema
+        -- rewrite.
+        CREATE TABLE IF NOT EXISTS similarity_edges (
+            a TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            b TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            score REAL NOT NULL,
+            relation TEXT NOT NULL,
+            signal TEXT NOT NULL,
+            PRIMARY KEY (a, b, relation, signal)
+        );
+        CREATE INDEX IF NOT EXISTS idx_similarity_edges_relation ON similarity_edges(relation, score);
+        CREATE TABLE IF NOT EXISTS similarity_clusters (
+            id TEXT PRIMARY KEY,
+            family_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            representative TEXT NOT NULL,
+            updated REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS similarity_cluster_members (
+            cluster_id TEXT NOT NULL REFERENCES similarity_clusters(id) ON DELETE CASCADE,
+            file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            PRIMARY KEY (cluster_id, file_id)
+        );
+
         CREATE TABLE IF NOT EXISTS processing_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -532,6 +558,53 @@ public final class Catalog: @unchecked Sendable {
 
     public func allVisualFeatures() throws -> [(fileID: String, featurePrint: Data)] {
         try query("SELECT file_id, featureprint FROM visual_features") { r in (r.text(0) ?? "", r.blob(1) ?? Data()) }
+    }
+
+    // MARK: - Similarity graph (stored inside SQLCipher)
+
+    /// Atomically replace the persisted derivative graph. The caller owns
+    /// thresholds/adapters; Catalog only stores the already-vetted result.
+    public func replaceSimilarityGraph(_ update: SimilarityGraphUpdate) throws {
+        try transaction {
+            try txRun("DELETE FROM similarity_cluster_members")
+            try txRun("DELETE FROM similarity_clusters")
+            try txRun("DELETE FROM similarity_edges")
+            for edge in update.edges {
+                try txRun("INSERT INTO similarity_edges(a,b,score,relation,signal) VALUES(?,?,?,?,?)", binds: [
+                    .text(edge.a), .text(edge.b), .real(Double(edge.score)), .text(edge.relation.rawValue), .text(edge.signal.rawValue)
+                ])
+            }
+            for cluster in update.clusters {
+                try txRun("INSERT INTO similarity_clusters(id,family_id,relation,representative,updated) VALUES(?,?,?,?,?)", binds: [
+                    .text(cluster.id), .text(cluster.familyID), .text(cluster.relation.rawValue), .text(cluster.representative), .real(Date().timeIntervalSince1970)
+                ])
+                for member in cluster.members {
+                    try txRun("INSERT INTO similarity_cluster_members(cluster_id,file_id) VALUES(?,?)", binds: [.text(cluster.id), .text(member)])
+                }
+            }
+        }
+    }
+
+    public func similarityEdges(relation: SimilarityRelation? = nil) throws -> [SimilarityEdge] {
+        let sql = "SELECT a,b,score,relation,signal FROM similarity_edges" + (relation == nil ? "" : " WHERE relation=?") + " ORDER BY a,b,relation,signal"
+        let binds = relation.map { [SQLValue.text($0.rawValue)] } ?? []
+        return try query(sql, binds: binds) { r in
+            SimilarityEdge(a: r.text(0) ?? "", b: r.text(1) ?? "", score: Float(r.real(2)),
+                           relation: SimilarityRelation(rawValue: r.text(3) ?? "") ?? .nearDuplicate,
+                           signal: SimilaritySignal(rawValue: r.text(4) ?? "") ?? .featurePrint)
+        }
+    }
+
+    public func similarityClusters(relation: SimilarityRelation? = nil) throws -> [SimilarityCluster] {
+        let sql = "SELECT id,family_id,relation,representative FROM similarity_clusters" + (relation == nil ? "" : " WHERE relation=?") + " ORDER BY id"
+        let binds = relation.map { [SQLValue.text($0.rawValue)] } ?? []
+        let rows = try query(sql, binds: binds) { r in
+            (r.text(0) ?? "", r.text(1) ?? "", SimilarityRelation(rawValue: r.text(2) ?? "") ?? .nearDuplicate, r.text(3) ?? "")
+        }
+        return try rows.map { row in
+            let members = try query("SELECT file_id FROM similarity_cluster_members WHERE cluster_id=? ORDER BY file_id", binds: [.text(row.0)]) { $0.text(0) ?? "" }
+            return SimilarityCluster(id: row.0, members: members, representative: row.3, relation: row.2, familyID: row.1)
+        }
     }
 
     public func registerModelProvenance(model: String, version: String, source: String, license: String,

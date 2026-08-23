@@ -43,6 +43,7 @@ or permission-changed at the source
 | `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
 | `Indexer` | Pipeline: enumerate → identity → extract → classify → commit, with identity re-stat immediately before commit ("changed-during-index" discard). End-of-run missing-sweep marks vanished files `missing` — never deletes anything anywhere. |
 | `DuplicateDetector` | Size-bucket → partial fingerprint (head/middle/tail 64 KiB) → full SHA-256 within matching partial groups. Report-only verdicts. |
+| `SimilarityClustering` | Provider-neutral exact-hash, feature-print, and embedding adapters feed explicit near-duplicate/semantic threshold edges. Stable family/cluster IDs and representatives are persisted in SQLCipher; incremental updates rescore only changed neighborhoods and remove missing-node edges. |
 | `SearchService` | FTS5 query front-end with quote-escaping so user input can't break out of query syntax. |
 | `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree`. |
 | `LibrarianApp` | SwiftUI shell; sandboxed `.app` packaging via `scripts/package_app.sh`. |
@@ -64,6 +65,18 @@ When a previously indexed file under the scanned root is absent at the next
 scan, its row is marked `status='missing'`. Nothing is ever reconstructed,
 re-downloaded, or deleted twice; the record exists so search results can be
 annotated honestly. Rows outside the current root prefix are never touched.
+
+## Similarity semantics
+
+Similarity is derivative catalog state, never a source-file operation. Exact
+hash and feature-print adapters produce `nearDuplicate` relations; embedding
+adapters produce `semantic` relations. Adapters own their providers and score
+spaces, while the graph engine only applies deterministic thresholds and
+connected components. Cluster and family IDs hash the sorted member IDs and
+relation, and representative selection uses weighted graph degree followed by
+optional confidence and lexical tie-breaks. A changed or added node causes
+only its incident neighborhood to be regenerated; a missing node loses its
+edges and catalog membership but is not deleted from the catalog.
 
 ## Fixture honesty
 
