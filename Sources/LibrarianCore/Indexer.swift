@@ -178,7 +178,8 @@ public final class Indexer: @unchecked Sendable {
 
         switch ident.kind {
         case .pdf:
-            if let pdfText = PDFText.extract(path: path, broker: broker) {
+            if let pdfData = try? broker.completeSnapshot(path, maxBytes: 64 * 1024 * 1024),
+               let pdfText = PDFText.extract(data: pdfData) {
                 textContent = String(pdfText.prefix(200_000))
             }
         case .text:
@@ -190,7 +191,7 @@ public final class Indexer: @unchecked Sendable {
         // never sees the raw filesystem path.
         var imageBytes: Data? = nil
         if ident.kind == .image {
-            imageBytes = try? broker.boundedRead(ident.path, limit: Int64(VisionImageAnalyzer.maxVisionBytes))
+            imageBytes = try? broker.completeSnapshot(ident.path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes)
         }
 
         // 3a. Vision image analysis — images only (on-device, no download).
@@ -198,9 +199,9 @@ public final class Indexer: @unchecked Sendable {
         // Runs under MEDIUM slot; failures are non-fatal.
         var visionLabels: [(String, Float)] = []
         var stagedFeaturePrint: (Data, String)? = nil
-        if ident.kind == .image {
+        if ident.kind == .image, let imageBytes {
             let vRes: VisionImageAnalyzer.Result? = scheduler.perform(as: .medium) { [self] () -> VisionImageAnalyzer.Result? in
-                visionAnalyzer.analyze(path: ident.path, broker: broker)
+                visionAnalyzer.analyze(data: imageBytes)
             }
             if let vr = vRes {
                 visionLabels = vr.classifications

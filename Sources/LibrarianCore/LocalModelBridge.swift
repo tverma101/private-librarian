@@ -169,19 +169,11 @@ public struct LocalModelBridge: Sendable {
         return parseEmbedding(from: result.stdout)
     }
 
-    /// Embed an image file (bounded read via SourceBroker path) using local CLIP.
-    /// Returns normalized Float32 vector as Data (little-endian Float32) + dim, or nil.
-    /// Legacy path-based path — prefer embedImageBytes when already holding broker bytes.
+    /// Compatibility wrapper for existing path-based callers. SourceBroker
+    /// owns the path and the local helper receives complete bytes on stdin.
     public static func embedImage(at path: String, model: Model = .clipImage, timeout: TimeInterval = 20) -> (dim: Int, data: Data)? {
-        guard model == .clipImage, isProvisioned(model) else { return nil }
-        guard let scriptsDir = scriptsDir() else { return nil }
-        // Decode under broker-bounded semantics (caps come from caller-supplied maxVisionBytes),
-        // but helper input still goes through stdin so argv never leaks the path.
-        guard let data = try? SourceBroker().boundedRead(path, limit: Int64(VisionImageAnalyzer.maxVisionBytes)) else { return nil }
-        guard !data.isEmpty else { return nil }
-        let embed = scriptsDir.appendingPathComponent("embed.py").path
-        let result = runPython([embed, "--stdin-image", "--model", model.rawValue], input: data, timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        guard let bytes = try? SourceBroker().completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes) else { return nil }
+        return embedImageBytes(bytes, model: model, timeout: timeout)
     }
 
     /// Embed text using local MiniLM (mean-pooled, L2-normalized).
@@ -220,27 +212,23 @@ public struct LocalModelBridge: Sendable {
         } catch { return false }
     }
 
-    /// Batch-embed images listed in `paths` via `embed.py --batch-images` (single warm process).
-    /// Bridges path-based callers that do not already hold broker bytes; stdin-bytes path
-    /// is preferred inside the indexer pipeline. Returns map path -> (dim, Data).
+    /// Compatibility batch wrapper. SourceBroker converts each source path to
+    /// a complete snapshot before the helper sees any bytes; the helper never
+    /// receives the caller's source paths.
     public static func embedImagesBatch(paths: [String], model: Model = .clipImage, timeout: TimeInterval = 60) -> [String: (dim: Int, data: Data)] {
         guard model == .clipImage, isProvisioned(model), !paths.isEmpty else { return [:] }
-        guard let scriptsDir = scriptsDir() else { return [:] }
-        let embed = scriptsDir.appendingPathComponent("embed.py").path
-        let listFile = FileManager.default.temporaryDirectory.appendingPathComponent("librarian-embed-\(UUID().uuidString).txt")
-        defer { try? FileManager.default.removeItem(at: listFile) }
-        let joined = paths.joined(separator: "\n")
-        guard (try? joined.write(to: listFile, atomically: true, encoding: .utf8)) != nil else { return [:] }
-        let result = runPython([embed, "--batch-images", listFile.path, "--model", model.rawValue], timeout: timeout)
-        var out: [String: (Int, Data)] = [:]
-        let lines = result.stdout.split(separator: "\n")
-        for (idx, line) in lines.enumerated() where idx < paths.count {
-            let p = paths[idx]
-            if let parsed = parseEmbedding(from: String(line)) {
-                out[p] = parsed
-            }
+        let broker = SourceBroker()
+        let items = paths.enumerated().compactMap { index, path -> (id: String, bytes: Data)? in
+            guard let bytes = try? broker.completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes) else { return nil }
+            return (String(index), bytes)
         }
-        return out
+        let embedded = embedImagesBatchBytes(items: items, model: model, timeout: timeout)
+        var result: [String: (dim: Int, data: Data)] = [:]
+        for (id, value) in embedded {
+            guard let index = Int(id), paths.indices.contains(index) else { continue }
+            result[paths[index]] = value
+        }
+        return result
     }
 
     /// Batch-embed raw images keyed by an opaque id (bytes provided by caller via stdin-batch).

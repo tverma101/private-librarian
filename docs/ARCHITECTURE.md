@@ -33,11 +33,11 @@ or permission-changed at the source
 
 | Module | Responsibility |
 |---|---|
-| `SourceBroker` | The ONLY component that touches source paths. Opens files `O_RDONLY\|O_NOFOLLOW`, refuses symlinks and non-regular files, bounded reads (`boundedRead` / `readSlice` / `streamBounded`). Enumeration walks breadth-first with per-directory sort, records symlinks as metadata and **never descends into them**, skips packages/bundles. Reported paths are built by joining names onto the caller's root spelling — see "One path dialect" below. |
+| `SourceBroker` | The ONLY component that touches source paths. Opens files `O_RDONLY\|O_NOFOLLOW`, re-stats the opened fd, refuses symlinks and non-regular files, and exposes bounded evidence reads plus complete fail-closed decoder snapshots (`completeSnapshot` / `streamCompleteSnapshot`). Enumeration walks breadth-first with per-directory sort, records symlinks as metadata and **never descends into them**, skips packages/bundles. Reported paths are built by joining names onto the caller's root spelling — see "One path dialect" below. |
 | `SafeReader` semantics | Every read goes through the broker's no-follow fd; a file swapped for a symlink between stat and open fails with ELOOP instead of leaking content. |
 | `FileIdentity` / `FileID` | lstat-level identity (size, mtime, ctime, fs file id). Catalog ids are SHA-256 of the path only — stable across edits so child rows (text, classifications, hashes) survive re-indexing. |
 | `EvidenceExtractor` | Bounded evidence: UTF-8 sample, magic-byte sniffing, cloud-placeholder detection (never hydrates). |
-| `PDFText` / `OfficeContainer` | Content extraction through the read-only fd; malformed input yields empty evidence, never a crash. |
+| `PDFText` / `OfficeContainer` | Content extraction through broker-owned bytes; PDF/container decoders receive a complete snapshot within an explicit cap, or no input. Malformed input yields empty evidence, never a crash. |
 | `RuleBasedClassifier` + `ClassifierContract` | Deterministic v1 classifier; its JSON output must pass schema validation or the result is discarded wholesale (contract wall). |
 | `Scheduler` | Serializes work into LOW/MEDIUM/HIGH slots so indexing never starves interactive work; also the seam where an LLM stage would be rate-limited later. |
 | `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
@@ -46,6 +46,13 @@ or permission-changed at the source
 | `SearchService` | FTS5 query front-end with quote-escaping so user input can't break out of query syntax. |
 | `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree`. |
 | `LibrarianApp` | SwiftUI shell; sandboxed `.app` packaging via `scripts/package_app.sh`. |
+
+Decoder boundary: compressed PDF/image containers must use the broker's
+complete snapshot/stream API. The normal 8 MiB evidence cap is not a decoder
+cap: a valid container above it is read whole when within policy, otherwise it
+is rejected before decoding. Downstream Vision/search/model helpers receive
+bytes only and never source paths. PR #17's media decoder must adopt this same
+API before it is integrated.
 
 ## One path dialect (enumeration contract)
 

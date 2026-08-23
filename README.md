@@ -22,6 +22,7 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 | Incremental re-index of changed files | ✅ fixed via path-stable ids (see below) |
 | **Exact duplicate detection** | ✅ **FIXED** — size-bucket → partial fingerprint → full SHA-256; report-only. The earlier breakage came from unparameterized catalog queries returning wrong rows; fixed in the same pass. |
 | Missing-file sweep | ✅ marks vanished files `missing` on re-scan; one path dialect end-to-end (see ARCHITECTURE.md). |
+| Complete decoder snapshots | ✅ broker-owned whole-container API with explicit fail-closed cap; PDF/image/model consumers receive bytes, never source paths. |
 | SwiftUI app shell | builds; folder picker + bookmark flow unexercised in UI tests |
 | OCR / embeddings / speech / video sampling | not started (Stage D/E) |
 | Sandboxed .app entitlement audit in CI | script exists (`scripts/audit_entitlements.py`); wired into GitHub Actions |
@@ -59,6 +60,12 @@ scripts/gen_fixtures.py /tmp/fl  # synthetic fixture tree (never your real Deskt
 scripts/audit_entitlements.py dist/PrivateLibrarian.app
 scripts/network_negative_probe.py
 ```
+
+Compressed PDF/image containers use `SourceBroker.completeSnapshot` (or its
+streaming form), not the 8 MiB bounded evidence read. Valid containers above
+that evidence cap are passed whole within `maxSnapshotBytes`; oversized
+containers are rejected before decoding. PR #17's media decoder must use the
+same API.
 
 ## Architecture
 

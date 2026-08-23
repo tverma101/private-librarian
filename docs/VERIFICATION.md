@@ -7,7 +7,7 @@ All receipts below are from real executed runs on this machine
 
 ```
 $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-Executed 21 tests, with 0 failures (0 unexpected) in 1.967 (1.969) seconds
+Executed 35 tests, with 0 failures (0 unexpected)
 ```
 
 Covers: immutability zero-diff, symlink breakout + broker refusal +
@@ -17,6 +17,13 @@ deletion), prompt-injection inertness, malformed-file resilience,
 catalog encryption + wrong-key refusal + no plaintext header, duplicate
 reporting (near-duplicate control excluded), incremental re-index,
 virtual tree multi-label membership, FTS5 search, original-loss → missing.
+
+The decoder boundary is covered by `VisionImageTests`: a valid JPEG container
+larger than the 8 MiB evidence cap is snapshotted byte-for-byte, while the
+same container over the explicit snapshot policy fails closed with
+`BrokerError.snapshotTooLarge`. Complete snapshots are bounded by
+`SourceBroker.maxSnapshotBytes`; no decoder is given a prefix. PR #17's media
+decoder must use this boundary as well.
 
 ## End-to-end (scripts/e2e_local.sh, release binary)
 

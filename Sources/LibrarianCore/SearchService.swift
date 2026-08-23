@@ -47,7 +47,7 @@ public struct SearchService: Sendable {
     /// Visual similarity: rank indexed images by Vision feature-print distance to the query image.
     /// Uses the on-device VNGenerateImageFeaturePrint embedding stored in visual_features.
     public func visualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20, threshold: Float = 0.5) throws -> [(fileID: String, path: String, distance: Float)] {
-        guard let data = try? broker.boundedRead(path, limit: VisionImageAnalyzer.maxVisionBytes), !data.isEmpty,
+        guard let data = try? broker.completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes), !data.isEmpty,
               let fp = VisionImageAnalyzer.featurePrint(data: data) else { return [] }
         let qData = fp.data
         var scored: [(String, String, Float)] = []
@@ -98,9 +98,10 @@ public struct SearchService: Sendable {
 
     /// Visual similarity via local CLIP embeddings (512-d, cosine) — higher quality than Vision feature-print.
     /// Requires Models/clip-vit-base-patch32 provisioned; otherwise returns [].
-    public func clipVisualSearch(nearImagePath path: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
+    public func clipVisualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
         guard enableLocalEmbeddings else { return [] }
-        guard let q = LocalModelBridge.embedImage(at: path), !q.data.isEmpty else { return [] }
+        guard let bytes = try? broker.completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes),
+              let q = LocalModelBridge.embedImageBytes(bytes), !q.data.isEmpty else { return [] }
         let rows = try catalog.query(
             "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE e.model=?",
             binds: [.text(LocalModelBridge.Model.clipImage.rawValue)]
@@ -112,6 +113,12 @@ public struct SearchService: Sendable {
         }
         scored.sort { $0.2 > $1.2 }
         return Array(scored.prefix(limit))
+    }
+
+    /// Compatibility wrapper for callers that do not provide a broker.
+    /// It still uses SourceBroker's complete snapshot policy.
+    public func clipVisualSearch(nearImagePath path: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
+        try clipVisualSearch(nearImagePath: path, broker: SourceBroker(), limit: limit, threshold: threshold)
     }
 
     /// Cross-modal text → image search: encode the text query with CLIP's text encoder
@@ -136,7 +143,7 @@ public struct SearchService: Sendable {
     /// Unified visual search: prefers CLIP when provisioned, falls back to Vision feature-print.
     public func bestVisualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20) throws -> [(fileID: String, path: String, score: Float, source: String)] {
         if enableLocalEmbeddings, LocalModelBridge.isProvisioned(.clipImage) {
-            let clip = try clipVisualSearch(nearImagePath: path, limit: limit)
+            let clip = try clipVisualSearch(nearImagePath: path, broker: broker, limit: limit)
             if !clip.isEmpty { return clip.map { ($0.0, $0.1, $0.2, "clip") } }
         }
         // Fallback to Vision (distance -> score for uniform API: score = 1 - distance)

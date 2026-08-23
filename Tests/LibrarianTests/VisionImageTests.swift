@@ -1,11 +1,93 @@
 import XCTest
 import Vision
+import CoreGraphics
+import ImageIO
 @testable import LibrarianCore
 
 /// Vision feature — no network, no ANE guarantee required. Tests run headless
 /// (CI) so we assert graceful nil/empty and deterministic classifier wiring,
 /// not specific Vision label strings.
 final class VisionImageTests: XCTestCase {
+
+    private func paddedJPEG(minimumBytes: Int) throws -> Data {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(data: nil, width: 64, height: 64,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: colorSpace,
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+              let image = context.makeImage() else {
+            throw XCTSkip("CoreGraphics image fixture unavailable")
+        }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil) else {
+            throw XCTSkip("ImageIO JPEG fixture unavailable")
+        }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw XCTSkip("JPEG fixture failed") }
+        let base = output as Data
+        guard base.count > 2, base[0] == 0xFF, base[1] == 0xD8 else { throw XCTSkip("JPEG fixture missing SOI") }
+
+        var result = Data(base.prefix(2))
+        var remaining = max(0, minimumBytes - base.count)
+        while remaining > 0 {
+            let payload = min(65_533, max(1, remaining - 4))
+            let length = UInt16(payload + 2)
+            result.append(contentsOf: [0xFF, 0xFE, UInt8(length >> 8), UInt8(length & 0xFF)])
+            result.append(Data(repeating: 0, count: payload))
+            remaining -= payload + 4
+        }
+        result.append(contentsOf: base.dropFirst(2))
+        return result
+    }
+
+    func testCompleteSnapshotPreservesValidImageContainerAboveEvidenceCap() throws {
+        let bytes = try paddedJPEG(minimumBytes: 8 * 1024 * 1024 + 1)
+        XCTAssertGreaterThan(Int64(bytes.count), 8 * 1024 * 1024)
+        XCTAssertNotNil(CGImageSourceCreateWithData(bytes as CFData, nil))
+
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("large-image-\(UUID().uuidString).jpg")
+        try bytes.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let broker = SourceBroker(maxReadBytes: 64, maxSnapshotBytes: 16 * 1024 * 1024)
+        let snapshot = try broker.completeSnapshot(url.path, maxBytes: 16 * 1024 * 1024)
+        XCTAssertEqual(snapshot, bytes, "decoder input must be the complete container")
+
+        var streamed = Data()
+        var sawEnd = false
+        try broker.streamCompleteSnapshot(url.path, maxBytes: 16 * 1024 * 1024) { chunk, isLast in
+            if isLast { sawEnd = true } else { streamed.append(chunk) }
+        }
+        XCTAssertTrue(sawEnd)
+        XCTAssertEqual(streamed, bytes, "stream API must emit the complete container")
+    }
+
+    func testCompleteSnapshotRejectsOversizedContainerWithoutPrefix() throws {
+        let bytes = try paddedJPEG(minimumBytes: 8 * 1024 * 1024 + 1)
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("oversized-image-\(UUID().uuidString).jpg")
+        try bytes.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let broker = SourceBroker(maxReadBytes: 64, maxSnapshotBytes: 16 * 1024 * 1024)
+        XCTAssertThrowsError(try broker.completeSnapshot(url.path, maxBytes: 8 * 1024 * 1024)) { error in
+            guard case BrokerError.snapshotTooLarge(let size, let limit) = error else {
+                return XCTFail("expected snapshotTooLarge, got \(error)")
+            }
+            XCTAssertEqual(size, Int64(bytes.count))
+            XCTAssertEqual(limit, 8 * 1024 * 1024)
+        }
+    }
+
+    func testExistingPathWrappersRemainSafeAndCompatible() throws {
+        let missing = "/no/such/decoder-input.jpg"
+        XCTAssertNil(VisionImageAnalyzer().analyze(path: missing, broker: SourceBroker()))
+        XCTAssertNil(PDFText.extract(path: missing, broker: SourceBroker()))
+        XCTAssertNil(LocalModelBridge.embedImage(at: missing))
+
+        let catalog = try TestSupport.makeCatalog()
+        let service = SearchService(catalog: catalog)
+        XCTAssertEqual(try service.clipVisualSearch(nearImagePath: missing).count, 0)
+    }
 
     // 1. Analyzer gracefully handles empty / truncated data (never crashes indexing).
     func testVisionAnalyzerHandlesEmptyAndTruncatedData() {
@@ -96,7 +178,7 @@ final class VisionImageTests: XCTestCase {
         // (If models ARE provisioned locally, this test still passes vacuously on empty catalog.)
         let sem = try svc.semanticSearch(query: "hello")
         XCTAssertEqual(sem.count, 0)
-        let clip = try svc.clipVisualSearch(nearImagePath: "/no/such/path.jpg")
+        let clip = try svc.clipVisualSearch(nearImagePath: "/no/such/path.jpg", broker: SourceBroker())
         XCTAssertEqual(clip.count, 0)
         let best = try svc.bestVisualSearch(nearImagePath: "/no/such/path.jpg", broker: SourceBroker())
         XCTAssertEqual(best.count, 0)

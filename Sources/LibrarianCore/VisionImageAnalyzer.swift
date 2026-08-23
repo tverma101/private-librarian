@@ -11,14 +11,18 @@ import AppKit
 ///  1. VNClassifyImageRequest — ~1k ImageNet-style labels (e.g. "cat", "beach")
 ///  2. VNGenerateImageFeaturePrintRequest — compact embedding for visual dedup / similarity
 ///
-/// Both are bounded reads through SourceBroker (O_RDONLY|O_NOFOLLOW) so
-/// symlinks are never followed. Failures return nil — never crash indexing.
+/// The broker supplies complete image-container bytes using
+/// O_RDONLY|O_NOFOLLOW and an explicit fail-closed cap. Failures return nil —
+/// never crash indexing.
 public struct VisionImageAnalyzer: Sendable {
 
     public static let revision = "vision-1.0"
-    /// Max bytes to read for Vision. 8 MiB default covers most photos;
-    /// larger images are truncated — Vision still classifies the header window.
-    public static let maxVisionBytes: Int64 = 8 * 1024 * 1024
+    /// Maximum compressed image-container size accepted by the decoder path.
+    /// This is deliberately above the old 8 MiB evidence-read cap; containers
+    /// are either passed whole or rejected, never prefix-decoded.
+    public static let maxImageContainerBytes: Int64 = 256 * 1024 * 1024
+    @available(*, deprecated, message: "Use maxImageContainerBytes; decoder inputs are complete containers")
+    public static let maxVisionBytes: Int64 = maxImageContainerBytes
 
     public struct Result: Sendable {
         /// Top labels sorted by confidence desc, filtered to confidence >= threshold.
@@ -31,10 +35,10 @@ public struct VisionImageAnalyzer: Sendable {
 
     public init() {}
 
-    /// Analyze an image file through the read-only broker.
-    /// Returns nil if the file cannot be read or Vision produces no result.
+    /// Compatibility wrapper for existing source-path callers. The path is
+    /// consumed only by SourceBroker; Vision receives broker-owned bytes.
     public func analyze(path: String, broker: SourceBroker) -> Result? {
-        guard let data = try? broker.boundedRead(path, limit: Self.maxVisionBytes), !data.isEmpty else {
+        guard let data = try? broker.completeSnapshot(path, maxBytes: Self.maxImageContainerBytes), !data.isEmpty else {
             return nil
         }
         return analyze(data: data)
