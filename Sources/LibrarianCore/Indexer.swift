@@ -17,6 +17,10 @@ public final class Indexer: @unchecked Sendable {
         /// requires `Models/` provisioned and `scripts/embed.py` deps. When off,
         /// no subprocess is ever spawned. Set true for opt-in higher recall.
         public var enableLocalEmbeddings = false
+        /// Absolute source prefixes that are intentionally outside this scan.
+        /// Exclusions affect enumeration and missing-file reconciliation but
+        /// never delete or mutate existing catalog rows.
+        public var excludedPaths: [String] = []
         public init() {}
     }
 
@@ -74,7 +78,7 @@ public final class Indexer: @unchecked Sendable {
     /// all discovered entries scanned so the UI can reach total/total.
     @discardableResult
     public func indexRoot(_ root: URL, onProgress: ((Progress) -> Void)? = nil) throws -> Int {
-        let items = try SourceBroker.enumerate(root: root)
+        let items = try SourceBroker.enumerate(root: root, excludedPrefixes: options.excludedPaths)
         var scanned = 0
         var actuallyProcessed = 0
         let total = min(items.count, options.maxFiles ?? Int.max)
@@ -110,6 +114,7 @@ public final class Indexer: @unchecked Sendable {
         let rootPrefix = root.path.hasSuffix("/") ? String(root.path.dropLast()) : root.path
         for stored in try catalog.allFiles() where stored.status != "missing" {
             guard stored.path.hasPrefix(rootPrefix + "/") else { continue }
+            if options.excludedPaths.contains(where: { SourceBroker.isPath(stored.path, under: $0) }) { continue }
             if seen.contains(stored.path) { continue }
             // Depth-truncation guard: a file beyond maxDepth wasn't *seen*,
             // but it didn't vanish either. Absence must be PROVEN: only
@@ -288,8 +293,9 @@ public final class Indexer: @unchecked Sendable {
                     try catalog.txRun("INSERT INTO text_fts(file_id, body) VALUES(?,?)", binds: [.text(id), .text(t)])
                 }
                 if let validated = validatedClass {
-                    let cats = String(data: try JSONEncoder().encode(validated.categories), encoding: .utf8)!
                     let reasons = String(data: try JSONEncoder().encode(validated.reasonCodes), encoding: .utf8)!
+                    let effectiveCategories = try catalog.txApplyCategoryOverrides(
+                        fileID: validated.fileID, categories: validated.categories)
                     try catalog.txRun("""
                         INSERT INTO classifications(file_id, categories_json, description, confidence, reason_codes_json, classifier, created)
                         VALUES(?,?,?,?,?,?,?)
@@ -297,14 +303,26 @@ public final class Indexer: @unchecked Sendable {
                             categories_json=excluded.categories_json, description=excluded.description,
                             confidence=excluded.confidence, reason_codes_json=excluded.reason_codes_json,
                             classifier=excluded.classifier, created=excluded.created
-                        """, binds: [.text(validated.fileID), .text(cats), .text(validated.description),
+                        """, binds: [.text(validated.fileID), .text(String(data: try JSONEncoder().encode(effectiveCategories), encoding: .utf8)!), .text(validated.description),
                                       .real(validated.confidence), .text(reasons),
-                                      .text("rule-based-v1"), .real(Date().timeIntervalSince1970)])
+                                      .text(ChangeDetection.classifierVersion), .real(Date().timeIntervalSince1970)])
                     try catalog.txRun("DELETE FROM category_membership WHERE file_id=? AND source='classifier'", binds: [.text(validated.fileID)])
-                    for cat in validated.categories {
+                    for cat in effectiveCategories {
                         let catID = try catalog.txEnsureCategory(named: cat)
                         try catalog.txRun("INSERT OR IGNORE INTO category_membership(category_id, file_id, source) VALUES(?,?,'classifier')",
                                           binds: [.int(catID), .text(validated.fileID)])
+                    }
+                    let now = Date().timeIntervalSince1970
+                    if ReviewState.from(confidence: validated.confidence) == .confident {
+                        try catalog.txRun("DELETE FROM review_inbox WHERE file_id=? AND state='open'",
+                                          binds: [.text(validated.fileID)])
+                    } else {
+                        try catalog.txRun("""
+                            INSERT INTO review_inbox(file_id, state, reason, created, updated)
+                            VALUES(?, 'open', ?, ?, ?)
+                            ON CONFLICT(file_id) DO UPDATE SET state='open', reason=excluded.reason, updated=excluded.updated
+                            """, binds: [.text(validated.fileID), .text(validated.reasonCodes.joined(separator: ",")),
+                                           .real(now), .real(now)])
                     }
                 } else {
                     try catalog.txRun("INSERT INTO errors(opaque_ref, stage, message, created) VALUES(?,?,?,?)",

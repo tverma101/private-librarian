@@ -148,6 +148,41 @@ public final class Catalog: @unchecked Sendable {
             PRIMARY KEY (category_id, file_id)
         );
 
+        CREATE TABLE IF NOT EXISTS review_inbox (
+            file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            state TEXT NOT NULL DEFAULT 'open',
+            reason TEXT NOT NULL,
+            created REAL NOT NULL,
+            updated REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_inbox_state ON review_inbox(state, updated);
+
+        CREATE TABLE IF NOT EXISTS category_overrides (
+            file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            category TEXT NOT NULL,
+            action TEXT NOT NULL,
+            updated REAL NOT NULL,
+            PRIMARY KEY (file_id, category)
+        );
+
+        CREATE TABLE IF NOT EXISTS review_corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            category TEXT NOT NULL,
+            action TEXT NOT NULL,
+            provenance TEXT NOT NULL,
+            created REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS organization_edges (
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            weight REAL NOT NULL,
+            PRIMARY KEY (source_id, target_id, relation)
+        );
+        CREATE INDEX IF NOT EXISTS idx_organization_edges_relation ON organization_edges(relation);
+
         CREATE TABLE IF NOT EXISTS exact_hashes (
             file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
             size INTEGER NOT NULL,
@@ -412,6 +447,10 @@ public final class Catalog: @unchecked Sendable {
     }
 
     public func saveClassification(_ c: Classification, classifier: String) throws {
+        let effectiveCategories = try categoryOverridesApplied(fileID: c.fileID, categories: c.categories)
+        let effective = Classification(fileID: c.fileID, categories: effectiveCategories,
+                                       description: c.description, confidence: c.confidence,
+                                       reasonCodes: c.reasonCodes)
         try run("""
         INSERT INTO classifications(file_id, categories_json, description, confidence, reason_codes_json, classifier, created)
         VALUES(?,?,?,?,?,?,?)
@@ -420,19 +459,61 @@ public final class Catalog: @unchecked Sendable {
             confidence=excluded.confidence, reason_codes_json=excluded.reason_codes_json,
             classifier=excluded.classifier, created=excluded.created
         """, binds: [
-            .text(c.fileID),
-            .text(String(data: try JSONEncoder().encode(c.categories), encoding: .utf8)!),
-            .text(c.description), .real(c.confidence),
-            .text(String(data: try JSONEncoder().encode(c.reasonCodes), encoding: .utf8)!),
+            .text(effective.fileID),
+            .text(String(data: try JSONEncoder().encode(effective.categories), encoding: .utf8)!),
+            .text(effective.description), .real(effective.confidence),
+            .text(String(data: try JSONEncoder().encode(effective.reasonCodes), encoding: .utf8)!),
             .text(classifier), .real(Date().timeIntervalSince1970),
         ])
         // Rebuild membership rows for this file.
-        try run("DELETE FROM category_membership WHERE file_id=? AND source='classifier'", binds: [.text(c.fileID)])
-        for cat in c.categories {
+        try run("DELETE FROM category_membership WHERE file_id=? AND source='classifier'", binds: [.text(effective.fileID)])
+        for cat in effective.categories {
             let catID = try ensureCategory(named: cat)
             try run("INSERT OR IGNORE INTO category_membership(category_id, file_id, source) VALUES(?,?,'classifier')",
-                    binds: [.int(catID), .text(c.fileID)])
+                    binds: [.int(catID), .text(effective.fileID)])
         }
+        let now = Date().timeIntervalSince1970
+        if ReviewState.from(confidence: effective.confidence) == .confident {
+            try run("DELETE FROM review_inbox WHERE file_id=? AND state='open'", binds: [.text(effective.fileID)])
+        } else {
+            let reason = effective.reasonCodes.joined(separator: ",")
+            try run("""
+                INSERT INTO review_inbox(file_id, state, reason, created, updated)
+                VALUES(?, 'open', ?, ?, ?)
+                ON CONFLICT(file_id) DO UPDATE SET state='open', reason=excluded.reason, updated=excluded.updated
+                """, binds: [.text(effective.fileID), .text(reason), .real(now), .real(now)])
+        }
+    }
+
+    private func categoryOverridesApplied(fileID: String, categories: [String]) throws -> [String] {
+        let rows = try query("SELECT category, action FROM category_overrides WHERE file_id=?",
+                             binds: [.text(fileID)]) { ($0.text(0) ?? "", $0.text(1) ?? "") }
+        return Self.applyCategoryOverrides(categories: categories, rows: rows)
+    }
+
+    /// Transaction-local form used by the indexer before it rebuilds
+    /// classifier memberships.
+    public func txApplyCategoryOverrides(fileID: String, categories: [String]) throws -> [String] {
+        let rows = try txQuery("SELECT category, action FROM category_overrides WHERE file_id=?",
+                               binds: [.text(fileID)]) { ($0.text(0) ?? "", $0.text(1) ?? "") }
+        return Self.applyCategoryOverrides(categories: categories, rows: rows)
+    }
+
+    private static func applyCategoryOverrides(categories: [String],
+                                               rows: [(String, String)]) -> [String] {
+        var result = categories
+        for (category, action) in rows {
+            switch action {
+            case ReviewCorrectionAction.addCategory.rawValue:
+                if !result.contains(category) { result.append(category) }
+            case ReviewCorrectionAction.removeCategory.rawValue:
+                result.removeAll { $0 == category }
+            default:
+                continue
+            }
+        }
+        var seen = Set<String>()
+        return result.filter { seen.insert($0).inserted }
     }
 
     /// Transaction-local category ensure — call only inside `transaction {}`.
@@ -569,6 +650,22 @@ public final class Catalog: @unchecked Sendable {
         public let rank: Double?
     }
 
+    public struct FileSummary: Sendable, Equatable, Identifiable {
+        public let id: String
+        public let path: String
+        public let kind: String
+        public let status: String
+        public let confidence: Double?
+
+        public init(id: String, path: String, kind: String, status: String, confidence: Double?) {
+            self.id = id
+            self.path = path
+            self.kind = kind
+            self.status = status
+            self.confidence = confidence
+        }
+    }
+
     /// FTS5 full-text search over extracted content (inside the encrypted db).
     public func searchExact(_ q: String, limit: Int = 50) throws -> [SearchHit] {
         // Escape double quotes so user input cannot break out of the FTS query syntax.
@@ -595,6 +692,214 @@ public final class Catalog: @unchecked Sendable {
         guard let statuses else { return rows }
         let set = Set(statuses)
         return rows.filter { set.contains($0.status) }
+    }
+
+    public func fileSummaries(categoryPrefix: String? = nil, status: String? = nil,
+                              limit: Int = 200) throws -> [FileSummary] {
+        let rows = try query("""
+            SELECT f.id, f.path, f.kind, f.status, c.confidence
+            FROM files f LEFT JOIN classifications c ON c.file_id=f.id
+            ORDER BY f.path
+            """) { r in
+            FileSummary(id: r.text(0) ?? "", path: r.text(1) ?? "", kind: r.text(2) ?? "",
+                        status: r.text(3) ?? "", confidence: r.isNull(4) ? nil : r.real(4))
+        }
+        let categoryIDs: Set<String>? = try categoryPrefix.map { Set(try categoryFileIDs(prefix: $0)) }
+        return Array(rows.filter { row in
+            (status == nil || row.status == status) &&
+            (categoryIDs == nil || categoryIDs!.contains(row.id))
+        }.prefix(max(0, limit)))
+    }
+
+    public func categoryMemberships() throws -> [(categoryPath: String, fileID: String)] {
+        try query("""
+            WITH RECURSIVE category_paths(id, path) AS (
+                SELECT id, name FROM virtual_categories WHERE parent_id IS NULL
+                UNION ALL
+                SELECT c.id, category_paths.path || '/' || c.name
+                FROM virtual_categories c JOIN category_paths ON c.parent_id = category_paths.id
+            )
+            SELECT category_paths.path, m.file_id
+            FROM category_membership m JOIN category_paths ON category_paths.id = m.category_id
+            ORDER BY category_paths.path, m.file_id
+            """) { r in (r.text(0) ?? "", r.text(1) ?? "") }
+    }
+
+    public func categoryFileIDs(prefix: String) throws -> Set<String> {
+        let memberships = try categoryMemberships()
+        return Set(memberships.compactMap { row in
+            row.categoryPath == prefix || row.categoryPath.hasPrefix(prefix + "/") ? row.fileID : nil
+        })
+    }
+
+    /// Exact duplicate candidates only. Near-duplicate and semantic families
+    /// are separate similarity relations and must not appear in this view.
+    public func duplicateFileIDs() throws -> Set<String> {
+        let rows = try query("""
+            SELECT h.file_id
+            FROM exact_hashes h
+            JOIN files f ON f.id=h.file_id
+            JOIN (
+                SELECT size, sha256 FROM exact_hashes
+                GROUP BY size, sha256 HAVING count(*) > 1
+            ) d ON d.size=h.size AND d.sha256=h.sha256
+            WHERE f.status != 'missing'
+            """) { $0.text(0) ?? "" }
+        return Set(rows)
+    }
+
+    public func reviewItems(state: String = "open", limit: Int = 200) throws -> [ReviewItem] {
+        let rows = try query("""
+            SELECT r.file_id, f.path, COALESCE(c.confidence, 0),
+                   COALESCE(c.categories_json, '[]'), COALESCE(c.reason_codes_json, '[]'),
+                   r.state, r.updated
+            FROM review_inbox r
+            JOIN files f ON f.id = r.file_id
+            LEFT JOIN classifications c ON c.file_id = r.file_id
+            WHERE r.state=?
+            ORDER BY r.updated DESC, r.file_id
+            LIMIT ?
+            """, binds: [.text(state), .int(Int64(max(1, limit)))]) { r in
+            let categories = (try? JSONDecoder().decode([String].self, from: Data((r.text(3) ?? "[]").utf8))) ?? []
+            let reasons = (try? JSONDecoder().decode([String].self, from: Data((r.text(4) ?? "[]").utf8))) ?? []
+            return ReviewItem(fileID: r.text(0) ?? "", path: r.text(1) ?? "",
+                              confidence: r.real(2), categories: categories,
+                              reasonCodes: reasons, state: r.text(5) ?? state,
+                              updated: r.real(6))
+        }
+        return rows
+    }
+
+    public func reviewSummary() throws -> ReviewSummary {
+        let rows = try query("""
+            SELECT state, count(*) FROM review_inbox GROUP BY state
+            """) { ($0.text(0) ?? "", Int($0.int(1))) }
+        return ReviewSummary(open: rows.first(where: { $0.0 == "open" })?.1 ?? 0,
+                             resolved: rows.first(where: { $0.0 == "resolved" })?.1 ?? 0)
+    }
+
+    public func resolveReview(fileID: String) throws {
+        try run("UPDATE review_inbox SET state='resolved', updated=? WHERE file_id=?",
+                binds: [.real(Date().timeIntervalSince1970), .text(fileID)])
+    }
+
+    /// Apply a review correction only to catalog memberships and a persistent
+    /// override. Re-indexing therefore cannot silently undo the user's choice.
+    public func applyReviewCorrection(fileID: String, category: String,
+                                      action: ReviewCorrectionAction,
+                                      provenance: String = "review-ui") throws {
+        let normalized = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        try transaction {
+            let existenceRows = try txQuery("SELECT count(*) FROM files WHERE id=?", binds: [.text(fileID)]) { row in row.int(0) }
+            let exists = existenceRows.first ?? 0
+            guard exists > 0 else { return }
+            try txRun("""
+                INSERT INTO category_overrides(file_id, category, action, updated)
+                VALUES(?,?,?,?)
+                ON CONFLICT(file_id, category) DO UPDATE SET action=excluded.action, updated=excluded.updated
+                """, binds: [.text(fileID), .text(normalized), .text(action.rawValue),
+                               .real(Date().timeIntervalSince1970)])
+            let categoryID = try txEnsureCategory(named: normalized)
+            switch action {
+            case .addCategory:
+                try txRun("INSERT OR IGNORE INTO category_membership(category_id, file_id, source) VALUES(?,?, 'review')",
+                         binds: [.int(categoryID), .text(fileID)])
+            case .removeCategory:
+                try txRun("DELETE FROM category_membership WHERE category_id=? AND file_id=?",
+                         binds: [.int(categoryID), .text(fileID)])
+            }
+            try txRun("INSERT INTO review_corrections(file_id, category, action, provenance, created) VALUES(?,?,?,?,?)",
+                     binds: [.text(fileID), .text(normalized), .text(action.rawValue), .text(provenance),
+                             .real(Date().timeIntervalSince1970)])
+            try txRun("UPDATE review_inbox SET state='resolved', updated=? WHERE file_id=?",
+                     binds: [.real(Date().timeIntervalSince1970), .text(fileID)])
+        }
+    }
+
+    public func refreshOrganizationGraph() throws -> OrganizationGraphSnapshot {
+        let files = try allFiles()
+        let memberships = try categoryMemberships()
+        let reviewIDs = Set(try reviewItems(limit: Int.max).map(\.fileID))
+        let snapshot = OrganizationGraphBuilder().build(
+            files: files.map { (id: $0.id, path: $0.path, status: $0.status, kind: $0.kind) },
+            memberships: memberships,
+            reviewFileIDs: reviewIDs,
+            extraEdges: try organizationEdges()
+        )
+        try replaceOrganizationEdges(snapshot.edges)
+        return snapshot
+    }
+
+    public func replaceOrganizationEdges(_ edges: [OrganizationGraphEdge]) throws {
+        try transaction {
+            try txRun("DELETE FROM organization_edges")
+            for edge in edges {
+                try txRun("INSERT INTO organization_edges(source_id, target_id, relation, weight) VALUES(?,?,?,?)",
+                         binds: [.text(edge.sourceID), .text(edge.targetID), .text(edge.relation.rawValue), .real(edge.weight)])
+            }
+        }
+    }
+
+    public func organizationEdges() throws -> [OrganizationGraphEdge] {
+        try query("SELECT source_id, target_id, relation, weight FROM organization_edges ORDER BY source_id, target_id, relation") { r in
+            OrganizationGraphEdge(sourceID: r.text(0) ?? "", targetID: r.text(1) ?? "",
+                                  relation: OrganizationRelation(rawValue: r.text(2) ?? "") ?? .category,
+                                  weight: r.real(3))
+        }
+    }
+
+    public func organizationGraph() throws -> OrganizationGraphSnapshot {
+        let files = try allFiles()
+        let memberships = try categoryMemberships()
+        let reviewIDs = Set(try reviewItems(limit: Int.max).map(\.fileID))
+        return OrganizationGraphBuilder().build(
+            files: files.map { (id: $0.id, path: $0.path, status: $0.status, kind: $0.kind) },
+            memberships: memberships, reviewFileIDs: reviewIDs,
+            extraEdges: try organizationEdges()
+        )
+    }
+
+    public func coverage(roots: [String], excludedPaths: [String] = []) throws -> OnboardingCoverage {
+        let rows = try allFiles()
+        func normalized(_ path: String) -> String {
+            guard path.count > 1, path.hasSuffix("/") else { return path }
+            return String(path.dropLast())
+        }
+        let rootPrefixes = roots.map(normalized)
+        let exclusions = excludedPaths.map(normalized)
+        func under(_ path: String, _ prefix: String) -> Bool {
+            path == prefix || path.hasPrefix(prefix + "/")
+        }
+        let scoped = rows.filter { row in rootPrefixes.contains { under(row.path, $0) } }
+        let excluded = scoped.filter { row in exclusions.contains { under(row.path, $0) } }
+        let eligible = scoped.filter { row in !exclusions.contains { under(row.path, $0) } }
+        let reviewIDs = Set(try reviewItems(limit: Int.max).map(\.fileID))
+        return OnboardingCoverage(
+            authorizedRoots: roots.count,
+            excludedRoots: excludedPaths.count,
+            catalogedFiles: eligible.count,
+            indexedFiles: eligible.filter { $0.status == "indexed" }.count,
+            reviewFiles: eligible.filter { reviewIDs.contains($0.id) }.count,
+            missingFiles: eligible.filter { $0.status == "missing" }.count,
+            excludedCatalogRows: excluded.count
+        )
+    }
+
+    public func dashboard() throws -> CatalogDashboard {
+        let counts = try counts()
+        let summary = try reviewSummary()
+        let categories = try query("SELECT count(*) FROM virtual_categories WHERE name != 'Review'") { Int($0.int(0)) }.first ?? 0
+        let dupes = try query("""
+            SELECT count(*) FROM (
+                SELECT size, sha256 FROM exact_hashes GROUP BY size, sha256 HAVING count(*) > 1
+            )
+            """) { Int($0.int(0)) }.first ?? 0
+        let edgeCount = try query("SELECT count(*) FROM organization_edges") { Int($0.int(0)) }.first ?? 0
+        return CatalogDashboard(total: counts["total"] ?? 0, indexed: counts["indexed"] ?? 0,
+                                review: summary.open, missing: counts["missing"] ?? 0,
+                                categories: categories, duplicateGroups: dupes,
+                                graphEdges: edgeCount)
     }
 
     public func fingerprint(forFile id: String) throws -> (size: Int64, mtime: Double)? {

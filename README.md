@@ -7,7 +7,7 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 > Original files are readable, never writable. The AI layer never receives
 > filesystem-writing capabilities.
 
-## Status: Stage A/B/C core, honestly reported
+## Status: Stage A/B/C core plus roadmap foundation, honestly reported
 
 | Component | State |
 |---|---|
@@ -19,10 +19,14 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 | Catalog-loss rebuild / original-loss → `missing` | ✅ tests pass |
 | Immutability zero-diff (§37) | ✅ tests pass |
 | Virtual categories (multi-label, hierarchical) | ✅ tests pass; no real dirs ever created |
+| Organization graph (multi-label virtual relationships) | ✅ encrypted catalog edges + deterministic graph snapshot; no source mutation |
+| Review Inbox + one-click correction | ✅ low-confidence queue, persistent catalog-only overrides, reversible membership correction |
+| Whole-computer onboarding | ✅ persisted read-only security-scoped roots, per-root pause/remove/reauthorize, exclusions, coverage counters |
+| Magic dashboard / explorers | ✅ native SwiftUI overview, review, graph, screenshot, school, projects, documents, media, duplicate, and missing explorer surfaces |
 | Incremental re-index of changed files | ✅ fixed via path-stable ids (see below) |
 | **Exact duplicate detection** | ✅ **FIXED** — size-bucket → partial fingerprint → full SHA-256; report-only. The earlier breakage came from unparameterized catalog queries returning wrong rows; fixed in the same pass. |
 | Missing-file sweep | ✅ marks vanished files `missing` on re-scan; one path dialect end-to-end (see ARCHITECTURE.md). |
-| SwiftUI app shell | builds; folder picker + bookmark flow unexercised in UI tests |
+| SwiftUI app shell | builds; native dashboard is wired; folder picker + bookmark flow remain human/UI-bound |
 | OCR / embeddings / speech / video sampling | not started (Stage D/E) |
 | Sandboxed .app entitlement audit in CI | script exists (`scripts/audit_entitlements.py`); wired into GitHub Actions |
 
@@ -54,11 +58,17 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 
 ```bash
 swift build                      # all targets
-swift test                       # mandatory security suite (19 tests)
+  swift test                       # mandatory security suite (37 tests)
 scripts/gen_fixtures.py /tmp/fl  # synthetic fixture tree (never your real Desktop)
 scripts/audit_entitlements.py dist/PrivateLibrarian.app
 scripts/network_negative_probe.py
 ```
+
+The dashboard's graph, review corrections, exclusions, and coverage state are
+catalog records. They do not create directories or write to an authorized
+source root. Feature-specific OCR, media, provider, screenshot, similarity,
+and benchmark lanes remain separately validated on their PR branches until
+they are integrated.
 
 ## Architecture
 

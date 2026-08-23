@@ -7,7 +7,7 @@ All receipts below are from real executed runs on this machine
 
 ```
 $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-Executed 21 tests, with 0 failures (0 unexpected) in 1.967 (1.969) seconds
+Executed 37 tests, with 0 failures (0 unexpected)
 ```
 
 Covers: immutability zero-diff, symlink breakout + broker refusal +
@@ -17,6 +17,20 @@ deletion), prompt-injection inertness, malformed-file resilience,
 catalog encryption + wrong-key refusal + no plaintext header, duplicate
 reporting (near-duplicate control excluded), incremental re-index,
 virtual tree multi-label membership, FTS5 search, original-loss → missing.
+
+The roadmap foundation suite also verifies encrypted multi-label graph edges,
+catalog-only review corrections with persistent re-index overrides, exclusion
+safe onboarding coverage, and dashboard counters:
+
+```
+$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter RoadmapCompletionTests
+Executed 5 tests, with 0 failures
+```
+
+The native UI run loop is available through `script/build_and_run.sh`; it stages
+a real `LibrarianApp.app` bundle and supports `--verify` for process startup.
+Bookmark resolution, folder-picker interaction, and reauthorization remain
+human/UI-bound; the source-safe code path is compile- and startup-verified.
 
 ## End-to-end (scripts/e2e_local.sh, release binary)
 

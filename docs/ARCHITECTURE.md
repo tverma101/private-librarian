@@ -38,14 +38,16 @@ or permission-changed at the source
 | `FileIdentity` / `FileID` | lstat-level identity (size, mtime, ctime, fs file id). Catalog ids are SHA-256 of the path only — stable across edits so child rows (text, classifications, hashes) survive re-indexing. |
 | `EvidenceExtractor` | Bounded evidence: UTF-8 sample, magic-byte sniffing, cloud-placeholder detection (never hydrates). |
 | `PDFText` / `OfficeContainer` | Content extraction through the read-only fd; malformed input yields empty evidence, never a crash. |
-| `RuleBasedClassifier` + `ClassifierContract` | Deterministic v1 classifier; its JSON output must pass schema validation or the result is discarded wholesale (contract wall). |
+| `RuleBasedClassifier` + `ClassifierContract` | Deterministic classifier; its JSON output must pass schema validation or the result is discarded wholesale (contract wall). |
 | `Scheduler` | Serializes work into LOW/MEDIUM/HIGH slots so indexing never starves interactive work; also the seam where an LLM stage would be rate-limited later. |
-| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
+| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors, review corrections, and graph edges. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
+| `OrganizationGraphBuilder` | Deterministic multi-label file/category/review/missing relationships persisted as encrypted catalog edges. Graph output is virtual and never performs source filesystem operations. |
+| `ReviewInbox` | Low-confidence queue plus catalog-only correction actions. Corrections persist category overrides so a later re-index cannot silently undo a user's choice. |
 | `Indexer` | Pipeline: enumerate → identity → extract → classify → commit, with identity re-stat immediately before commit ("changed-during-index" discard). End-of-run missing-sweep marks vanished files `missing` — never deletes anything anywhere. |
 | `DuplicateDetector` | Size-bucket → partial fingerprint (head/middle/tail 64 KiB) → full SHA-256 within matching partial groups. Report-only verdicts. |
 | `SearchService` | FTS5 query front-end with quote-escaping so user input can't break out of query syntax. |
 | `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree`. |
-| `LibrarianApp` | SwiftUI shell; sandboxed `.app` packaging via `scripts/package_app.sh`. |
+| `LibrarianApp` | SwiftUI dashboard with persisted read-only security-scoped root onboarding, per-root pause/remove/reauthorize, exclusions, overview, screenshot/missing explorers, review inbox, graph view, and privacy status; sandboxed `.app` packaging via `scripts/package_app.sh` or `script/build_and_run.sh`. |
 
 ## One path dialect (enumeration contract)
 
@@ -64,6 +66,11 @@ When a previously indexed file under the scanned root is absent at the next
 scan, its row is marked `status='missing'`. Nothing is ever reconstructed,
 re-downloaded, or deleted twice; the record exists so search results can be
 annotated honestly. Rows outside the current root prefix are never touched.
+
+Rows intentionally excluded by onboarding are skipped during enumeration and
+are not treated as vanished during the missing-file sweep. Removing an
+exclusion makes the same catalog row eligible for normal incremental
+reconciliation again.
 
 ## Fixture honesty
 

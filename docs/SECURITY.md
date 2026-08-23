@@ -20,6 +20,8 @@ rewrites a source file.
 | Silent downgrade to unencrypted sqlite | `Catalog.onDiskHeaderIsPlaintextSQLite` checks the on-disk header; CLI prints `encrypted-on-disk=` every run | E2E receipts |
 | Duplicate detector deleting "copies" | Detector is report-only by construction — it has no delete API | BehaviorTests assert both copies still exist |
 | Deleted originals ghosting in search results | Missing-sweep marks rows `missing`; nothing is reconstructed or deleted twice | ResilienceTests.testOriginalLossIsRecordedNotRepaired |
+| Review correction accidentally changing originals | Corrections are catalog memberships plus persistent overrides; no source path is opened for writing | RoadmapCompletionTests.testReviewInboxAndOneClickCorrectionAreCatalogOnly |
+| Excluded onboarding roots being indexed or marked missing | SourceBroker skips excluded prefixes and Indexer ignores them during missing reconciliation | RoadmapCompletionTests.testExcludedRootsAreSkippedWithoutMarkingExistingRowsMissing |
 | Over-broad entitlements in packaged app | App Sandbox ON, `user-selected.read-only`, bookmarks app-scope; auditor fails on any write/network/audio/photos entitlement | scripts/audit_entitlements.py in CI |
 | Network exfiltration from the app | No network entitlements; network-negative probe expects all four connection classes DENIED | scripts/network_negative_probe.py |
 | Image inference leaks to cloud | All AI image sorting runs 100% on-device: Apple Vision (`VNClassifyImageRequest`/`VNGenerateImageFeaturePrintRequest`) + optional local models from `Models/`; no network entitlement, no download in CI, no telemetry | VisionImageAnalyzer + LocalModelBridge + scripts/embed.py |

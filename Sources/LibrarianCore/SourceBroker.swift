@@ -261,11 +261,16 @@ public struct SourceBroker: Sendable {
     /// `/private/var` in the child URLs it hands back, and emitting those raw
     /// would put two spellings of the same tree into one index run.
     /// Deterministic order (sorted per directory).
-    public static func enumerate(root: URL, maxDepth: Int = 16) throws -> [DiscoveredItem] {
+    public static func enumerate(root: URL, maxDepth: Int = 16,
+                                 excludedPrefixes: [String] = []) throws -> [DiscoveredItem] {
         var out: [DiscoveredItem] = []
         let fm = FileManager.default
         var baseDisplay = root.path
         if baseDisplay.hasSuffix("/") && baseDisplay.count > 1 { baseDisplay = String(baseDisplay.dropLast()) }
+        let exclusions = excludedPrefixes.map { path in
+            path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+        }
+        if exclusions.contains(where: { Self.isPath(baseDisplay, under: $0) }) { return [] }
         var enqueued: [(dir: URL, display: String, depth: Int)] = [(root, baseDisplay, 0)]
         while let (dir, display, depth) = enqueued.popLast() {
             // An unreadable directory must not kill the whole scan (plan §42
@@ -289,6 +294,7 @@ public struct SourceBroker: Sendable {
                 let parentDisplay = display.hasSuffix("/")
                     ? String(display.dropLast()) : display
                 let childDisplay = parentDisplay + "/" + child.lastPathComponent
+                if exclusions.contains(where: { Self.isPath(childDisplay, under: $0) }) { continue }
                 // lstat-level link check FIRST: a symlinked directory must be
                 // recorded as a link and never descended into (plan §40).
                 var lst = stat()
@@ -317,6 +323,11 @@ public struct SourceBroker: Sendable {
             }
         }
         return out.sorted { $0.path < $1.path }
+    }
+
+    public static func isPath(_ path: String, under prefix: String) -> Bool {
+        let p = prefix.count > 1 && prefix.hasSuffix("/") ? String(prefix.dropLast()) : prefix
+        return path == p || path.hasPrefix(p + "/")
     }
 }
 
