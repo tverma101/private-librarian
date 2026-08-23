@@ -15,7 +15,7 @@ import AppKit
 /// symlinks are never followed. Failures return nil — never crash indexing.
 public struct VisionImageAnalyzer: Sendable {
 
-    public static let revision = "vision-1.0"
+    public static let revision = "vision-1.1-ocr"
     /// Max bytes to read for Vision. 8 MiB default covers most photos;
     /// larger images are truncated — Vision still classifies the header window.
     public static let maxVisionBytes: Int64 = 8 * 1024 * 1024
@@ -27,6 +27,8 @@ public struct VisionImageAnalyzer: Sendable {
         public let featurePrint: Data?
         /// VNFeaturePrint revision string for invalidation.
         public let featureRevision: String
+        /// Bounded OCR text from the same broker-supplied image bytes.
+        public let recognizedText: String?
     }
 
     public init() {}
@@ -47,8 +49,11 @@ public struct VisionImageAnalyzer: Sendable {
         let handler = VNImageRequestHandler(data: data, options: [:])
         let classifyReq = VNClassifyImageRequest()
         let fpReq = VNGenerateImageFeaturePrintRequest()
+        let textReq = VNRecognizeTextRequest()
+        textReq.recognitionLevel = .fast
+        textReq.usesLanguageCorrection = false
         do {
-            try handler.perform([classifyReq, fpReq])
+            try handler.perform([classifyReq, fpReq, textReq])
         } catch {
             return nil
         }
@@ -71,10 +76,14 @@ public struct VisionImageAnalyzer: Sendable {
             }
             return nil
         }()
-        if classifications.isEmpty && fp == nil { return nil }
+        let recognizedText = (textReq.results?.compactMap { $0.topCandidates(1).first?.string }
+            .joined(separator: " ") ?? "").prefix(20_000)
+        let text = recognizedText.isEmpty ? nil : String(recognizedText)
+        if classifications.isEmpty && fp == nil && text == nil { return nil }
         return Result(classifications: classifications,
                       featurePrint: fp?.data,
-                      featureRevision: fp?.revision ?? Self.revision)
+                      featureRevision: fp?.revision ?? Self.revision,
+                      recognizedText: text)
     }
 
     // MARK: - Vision requests (single-request helpers for SearchService.visualSearch + tests)

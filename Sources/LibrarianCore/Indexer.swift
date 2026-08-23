@@ -197,17 +197,27 @@ public final class Indexer: @unchecked Sendable {
         // Video frame extraction is Stage E; raw video bytes cannot be classified.
         // Runs under MEDIUM slot; failures are non-fatal.
         var visionLabels: [(String, Float)] = []
+        var screenshotAssessment: ScreenshotAssessment?
         var stagedFeaturePrint: (Data, String)? = nil
-        if ident.kind == .image {
+        if ident.kind == .image, let bytes = imageBytes, !bytes.isEmpty {
             let vRes: VisionImageAnalyzer.Result? = scheduler.perform(as: .medium) { [self] () -> VisionImageAnalyzer.Result? in
-                visionAnalyzer.analyze(path: ident.path, broker: broker)
+                // The analyzer receives broker-supplied bytes only. It never
+                // receives a source path or folder authority.
+                visionAnalyzer.analyze(data: bytes)
             }
             if let vr = vRes {
                 visionLabels = vr.classifications
+                if let ocr = vr.recognizedText, !ocr.isEmpty { textContent = ocr }
                 if let fp = vr.featurePrint, !fp.isEmpty {
                     stagedFeaturePrint = (fp, vr.featureRevision)
                 }
             }
+            let metadata = ScreenshotIntelligence.metadata(from: bytes)
+            screenshotAssessment = ScreenshotIntelligence().assess(
+                filename: (ident.path as NSString).lastPathComponent,
+                metadata: metadata,
+                ocrText: textContent,
+                visionLabels: visionLabels.map { $0.0 })
         }
 
         // Stage Tier-2 embeddings without touching the catalog yet.
@@ -254,7 +264,8 @@ public final class Indexer: @unchecked Sendable {
 
         // 3b. Classify (deterministic v1 + vision labels) under MEDIUM slot.
         let classification = scheduler.perform(as: .medium) { [self] () -> Classification in
-            classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent, visionLabels: visionLabels)
+            classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent,
+                                visionLabels: visionLabels, screenshot: screenshotAssessment)
         }
         let validatedClass: Classification? = {
             guard let data = try? classification.jsonData() else { return nil }
@@ -310,6 +321,9 @@ public final class Indexer: @unchecked Sendable {
                     try catalog.txRun("INSERT INTO errors(opaque_ref, stage, message, created) VALUES(?,?,?,?)",
                                       binds: [.text(id), .text("classifier"), .text("output failed schema validation; discarded"),
                                               .real(Date().timeIntervalSince1970)])
+                }
+                if let screenshotAssessment {
+                    try catalog.txSaveScreenshotAssessment(fileID: id, assessment: screenshotAssessment)
                 }
                 if let (fp, rev) = stagedFeaturePrint {
                     try catalog.txRun("""

@@ -1,84 +1,109 @@
 import Foundation
+import ImageIO
 
 public enum ScreenshotSubtype: String, Sendable, Codable, CaseIterable {
-    case code
-    case school
-    case lms
-    case receipt
-    case error
-    case conversation
-    case social
-    case map
-    case meme
-    case reference
-    case unknown
+    case code, school, lms, receipt, error, conversation, social, map, meme, reference, unknown
 }
 
-public struct ScreenshotAssessment: Sendable, Equatable {
+public struct ScreenshotImageMetadata: Sendable, Equatable {
+    public let pixelWidth: Int
+    public let pixelHeight: Int
+    public let properties: [String]
+    public init(pixelWidth: Int, pixelHeight: Int, properties: [String] = []) {
+        self.pixelWidth = pixelWidth; self.pixelHeight = pixelHeight; self.properties = properties
+    }
+}
+
+public struct ScreenshotAssessment: Sendable, Equatable, Codable {
     public let isScreenshot: Bool
     public let subtype: ScreenshotSubtype
     public let confidence: Float
     public let reasonCodes: [String]
-
     public init(isScreenshot: Bool, subtype: ScreenshotSubtype, confidence: Float, reasonCodes: [String]) {
-        self.isScreenshot = isScreenshot
-        self.subtype = subtype
-        self.confidence = confidence
-        self.reasonCodes = reasonCodes
+        self.isScreenshot = isScreenshot; self.subtype = subtype
+        self.confidence = max(0, min(1, confidence)); self.reasonCodes = Array(reasonCodes.prefix(16))
     }
+    public var isUncertain: Bool { isScreenshot && confidence < 0.80 }
 }
 
-/// Cheap deterministic first pass for screenshot organization.
-/// Future OCR/MobileCLIP signals can be added without changing callers.
+/// Deterministic screenshot organization. Filename evidence is deliberately
+/// weak: a filename alone can never classify an image as a screenshot.
 public struct ScreenshotIntelligence: Sendable {
     public init() {}
 
-    public func assess(filename: String, ocrText: String?, visionLabels: [String] = []) -> ScreenshotAssessment {
-        let name = filename.lowercased()
-        let text = (ocrText ?? "").lowercased()
+    /// Reads only image bytes supplied by the broker; never opens a source path.
+    public static func metadata(from data: Data) -> ScreenshotImageMetadata? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0, height > 0 else { return nil }
+        let names = props.keys.compactMap { key -> String? in
+            let value = props[key]
+            let text = "\(key) \(String(describing: value))".lowercased()
+            return ["screen", "display", "screenshot", "iphone", "ipad", "simulator"].contains(where: text.contains) ? text : nil
+        }
+        return ScreenshotImageMetadata(pixelWidth: width, pixelHeight: height, properties: names)
+    }
+
+    public func assess(filename: String, metadata: ScreenshotImageMetadata? = nil,
+                       ocrText: String? = nil, visionLabels: [String] = []) -> ScreenshotAssessment {
+        let name = filename.lowercased(), text = (ocrText ?? "").lowercased()
         let labels = visionLabels.map { $0.lowercased() }
-
-        let screenshotHints = ["screenshot", "screen shot", "screen-shot"]
-        let looksLikeScreenshot = screenshotHints.contains(where: { name.contains($0) })
-        guard looksLikeScreenshot else {
-            return ScreenshotAssessment(isScreenshot: false, subtype: .unknown, confidence: 0, reasonCodes: ["not-screenshot-name"])
+        var reasons: [String] = []; var score: Float = 0
+        if name.contains("screenshot") || name.contains("screen shot") || name.contains("screen-shot") {
+            score += 0.20; reasons.append("filename:screenshot")
         }
-
-        struct Rule {
-            let subtype: ScreenshotSubtype
-            let tokens: [String]
-            let reason: String
-        }
-
-        let rules: [Rule] = [
-            Rule(subtype: .lms, tokens: ["blackboard", "canvas", "moodle", "assignment", "course content"], reason: "ocr:lms"),
-            Rule(subtype: .code, tokens: ["public static void", "class ", "import ", "traceback", "exception", "github", "visual studio code", "vscode"], reason: "ocr:code"),
-            Rule(subtype: .school, tokens: ["quiz", "chapter", "homework", "worksheet", "precalculus", "java programming", "wake tech"], reason: "ocr:school"),
-            Rule(subtype: .receipt, tokens: ["subtotal", "total", "order #", "order number", "receipt", "tax", "shipping"], reason: "ocr:receipt"),
-            Rule(subtype: .error, tokens: ["error", "failed", "warning", "crash", "cannot", "permission denied"], reason: "ocr:error"),
-            Rule(subtype: .conversation, tokens: ["message", "sent", "delivered", "typing…", "typing..."], reason: "ocr:conversation"),
-            Rule(subtype: .map, tokens: ["directions", "miles", "min", "route", "arrive", "maps"], reason: "ocr:map"),
-            Rule(subtype: .social, tokens: ["followers", "following", "repost", "retweet", "likes", "comments"], reason: "ocr:social"),
-            Rule(subtype: .meme, tokens: ["meme"], reason: "ocr:meme")
-        ]
-
-        var best: (ScreenshotSubtype, Int, String)?
-        for rule in rules {
-            let score = rule.tokens.reduce(0) { $0 + (text.contains($1) ? 1 : 0) }
-            if score > 0 && (best == nil || score > best!.1) {
-                best = (rule.subtype, score, rule.reason)
+        if let metadata {
+            let ratio = Float(max(metadata.pixelWidth, metadata.pixelHeight)) / Float(min(metadata.pixelWidth, metadata.pixelHeight))
+            if Self.screenRatio(ratio) && min(metadata.pixelWidth, metadata.pixelHeight) >= 500 {
+                score += 0.35; reasons.append("dimensions:screen-ratio")
+            }
+            if metadata.properties.contains(where: { $0.contains("screen") || $0.contains("display") || $0.contains("iphone") || $0.contains("ipad") }) {
+                score += 0.25; reasons.append("metadata:display")
             }
         }
-
-        if let best {
-            let confidence = min(0.95, 0.58 + Float(best.1) * 0.09)
-            return ScreenshotAssessment(isScreenshot: true, subtype: best.0, confidence: confidence, reasonCodes: ["filename:screenshot", best.2])
+        let uiTokens = ["settings", "search", "share", "menu", "home", "back", "notifications", "browser", "tab", "http", "www"]
+        let uiHits = uiTokens.filter(text.contains)
+        if !uiHits.isEmpty { score += min(0.30, 0.10 + Float(uiHits.count) * 0.04); reasons.append("content:ui-text") }
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { score += 0.10; reasons.append("content:ocr") }
+        if labels.contains(where: { $0.contains("screen") || $0.contains("computer") || $0.contains("monitor") }) {
+            score += 0.20; reasons.append("vision:screen-like")
         }
-
-        if labels.contains(where: { $0.contains("map") || $0.contains("navigation") }) {
-            return ScreenshotAssessment(isScreenshot: true, subtype: .map, confidence: 0.62, reasonCodes: ["filename:screenshot", "vision:map"])
+        guard score >= 0.40 else {
+            return ScreenshotAssessment(isScreenshot: false, subtype: .unknown, confidence: score,
+                                         reasonCodes: reasons.isEmpty ? ["insufficient-screenshot-evidence"] : reasons)
         }
+        let subtype = Self.subtype(text: text, labels: labels)
+        if subtype == .reference { reasons.append("fallback:reference") }
+        let confidence = min(0.99, 0.35 + score * 0.60 + (subtype == .reference ? 0 : 0.15))
+        if confidence < 0.80 { reasons.append("uncertain:review") }
+        return ScreenshotAssessment(isScreenshot: true, subtype: subtype, confidence: confidence, reasonCodes: reasons)
+    }
 
-        return ScreenshotAssessment(isScreenshot: true, subtype: .reference, confidence: 0.45, reasonCodes: ["filename:screenshot", "fallback:reference"])
+    /// Compatibility overload for callers that only have text/labels.
+    public func assess(filename: String, ocrText: String?, visionLabels: [String] = []) -> ScreenshotAssessment {
+        assess(filename: filename, metadata: nil, ocrText: ocrText, visionLabels: visionLabels)
+    }
+
+    private static func screenRatio(_ ratio: Float) -> Bool {
+        [1.333, 1.5, 1.6, 1.667, 1.778, 1.8, 2.0, 2.167].contains { abs(ratio - $0) < 0.035 }
+    }
+
+    private static func subtype(text: String, labels: [String]) -> ScreenshotSubtype {
+        let rules: [(ScreenshotSubtype, [String])] = [
+            (.lms, ["blackboard", "canvas", "moodle", "course content", "discussion board"]),
+            (.code, ["public static void", "import ", "class ", "traceback", "exception", "github", "vscode", "terminal"]),
+            (.school, ["quiz", "chapter", "homework", "worksheet", "precalculus", "java programming", "wake tech"]),
+            (.receipt, ["subtotal", "total", "order #", "order number", "receipt", "tax", "shipping", "tracking"]),
+            (.error, ["error", "failed", "warning", "crash", "cannot", "permission denied", "stack trace"]),
+            (.conversation, ["message", "sent", "delivered", "typing", "reply", "direct message"]),
+            (.social, ["followers", "following", "repost", "retweet", "likes", "comments", "share"]),
+            (.map, ["directions", "miles", "route", "arrive", "maps", "navigation"]),
+            (.meme, ["meme", "when you", "top text", "bottom text"])
+        ]
+        for (subtype, tokens) in rules where tokens.contains(where: text.contains) { return subtype }
+        if labels.contains(where: { $0.contains("map") || $0.contains("navigation") }) { return .map }
+        return .reference
     }
 }

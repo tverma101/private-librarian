@@ -21,6 +21,7 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 | Virtual categories (multi-label, hierarchical) | ✅ tests pass; no real dirs ever created |
 | Incremental re-index of changed files | ✅ fixed via path-stable ids (see below) |
 | **Exact duplicate detection** | ✅ **FIXED** — size-bucket → partial fingerprint → full SHA-256; report-only. The earlier breakage came from unparameterized catalog queries returning wrong rows; fixed in the same pass. |
+| Screenshot intelligence | ✅ Tier-1 metadata/dimension/filename/content evidence; OCR and optional Vision labels use broker bytes; subtype/confidence/reasons persist encrypted; virtual `Screenshots/*` plus `Review` routing. |
 | Missing-file sweep | ✅ marks vanished files `missing` on re-scan; one path dialect end-to-end (see ARCHITECTURE.md). |
 | SwiftUI app shell | builds; folder picker + bookmark flow unexercised in UI tests |
 | OCR / embeddings / speech / video sampling | not started (Stage D/E) |

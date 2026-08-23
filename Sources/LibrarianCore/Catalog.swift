@@ -135,6 +135,15 @@ public final class Catalog: @unchecked Sendable {
             created REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS screenshot_assessments (
+            file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            is_screenshot INTEGER NOT NULL,
+            subtype TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            created REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS virtual_categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
@@ -433,6 +442,38 @@ public final class Catalog: @unchecked Sendable {
             try run("INSERT OR IGNORE INTO category_membership(category_id, file_id, source) VALUES(?,?,'classifier')",
                     binds: [.int(catID), .text(c.fileID)])
         }
+    }
+
+    /// Persisted separately so screenshot-specific fields remain queryable
+    /// without parsing the general classifier output. This table is inside the
+    /// same SQLCipher database and is written in the index transaction.
+    public func saveScreenshotAssessment(fileID: String, assessment: ScreenshotAssessment) throws {
+        try transaction { try txSaveScreenshotAssessment(fileID: fileID, assessment: assessment) }
+    }
+
+    public func txSaveScreenshotAssessment(fileID: String, assessment: ScreenshotAssessment) throws {
+        let reasons = String(data: try JSONEncoder().encode(assessment.reasonCodes), encoding: .utf8)!
+        try txRun("""
+            INSERT INTO screenshot_assessments(file_id, is_screenshot, subtype, confidence, reason_codes_json, created)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(file_id) DO UPDATE SET is_screenshot=excluded.is_screenshot,
+                subtype=excluded.subtype, confidence=excluded.confidence,
+                reason_codes_json=excluded.reason_codes_json, created=excluded.created
+            """, binds: [.text(fileID), .int(assessment.isScreenshot ? 1 : 0),
+                          .text(assessment.subtype.rawValue), .real(Double(assessment.confidence)),
+                          .text(reasons), .real(Date().timeIntervalSince1970)])
+    }
+
+    public func screenshotAssessment(forFile id: String) throws -> ScreenshotAssessment? {
+        let rows = try query("SELECT is_screenshot, subtype, confidence, reason_codes_json FROM screenshot_assessments WHERE file_id=?",
+                             binds: [.text(id)]) { row -> ScreenshotAssessment? in
+            guard let subtype = ScreenshotSubtype(rawValue: row.text(1) ?? "unknown"),
+                  let data = row.text(3)?.data(using: .utf8),
+                  let reasons = try? JSONDecoder().decode([String].self, from: data) else { return nil }
+            return ScreenshotAssessment(isScreenshot: row.int(0) != 0, subtype: subtype,
+                                        confidence: Float(row.real(2)), reasonCodes: reasons)
+        }
+        return rows.first ?? nil
     }
 
     /// Transaction-local category ensure — call only inside `transaction {}`.
