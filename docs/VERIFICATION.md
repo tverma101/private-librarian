@@ -1,13 +1,15 @@
 # Verification Receipts
 
 All receipts below are from real executed runs on this machine
-(macOS 26.6, Apple Silicon, Xcode toolchain Swift 6.3.3), August 21 2026.
+(macOS 26.6, Apple Silicon, Xcode toolchain Swift 6.3.3). The original
+baseline receipts are dated August 21 2026; the suite count and provider
+evidence in this audit were re-run August 23 2026.
 
 ## Unit / integration suite
 
 ```
 $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-Executed 36 tests, with 0 failures (0 unexpected)
+Executed 34 tests, with 0 failures (0 unexpected)
 ```
 
 Covers: immutability zero-diff, symlink breakout + broker refusal +
@@ -76,9 +78,9 @@ is an offline, read-only preflight and benchmark. It reports model/checkpoint
 identity, preprocessing identity, expected dimensions, dependency presence,
 warm-worker latency, deterministic text-to-image fixture status, retrieval
 quality status, and a WINNER/FALLBACK decision. On this checkout the observed
-decision is `winner=null`, `fallback=Vision feature-print`: the ignored model
-weights exist in the canonical checkout, but the Python runtime packages are
-not installed and the Core ML pair is not provisioned.
+decision is `winner=null`, `fallback=Vision feature-print`: no local Python
+checkpoints or runtime packages are provisioned, and the Core ML pair is not
+provisioned. The benchmark therefore makes no provider winner claim.
 
 The genuine Core ML path has an executable integration measurement:
 
@@ -112,8 +114,10 @@ OpenAI CLIP tokenizer), the receipt was:
 
 This proves genuine bytes-only Core ML inference and matching image/text
 dimensions. It is not a Golden Library retrieval-quality win, so the native
-provider remains opt-in and Python remains the fallback until Recall@K is
-measured on the shared labeled fixture.
+provider remains opt-in. A provisioned Python runtime is the comparison
+fallback only when it is measured; on this unprovisioned checkout the actual
+fallback is the Tier-1 Vision feature-print path until Recall@K is measured
+on the shared labeled fixture.
 
 ## Reproduce
 
