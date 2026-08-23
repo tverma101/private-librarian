@@ -680,6 +680,14 @@ public final class Catalog: @unchecked Sendable {
         }
     }
 
+    /// Cheap existence probe covering BOTH the segment rows and their FTS
+    /// mirror — a transcript only "exists" while both agree.
+    public func transcriptExists(forFile id: String) throws -> Bool {
+        let seg = try query("SELECT count(*) FROM transcripts WHERE file_id=?", binds: [.text(id)]) { $0.int(0) }
+        let fts = try query("SELECT count(*) FROM transcripts_fts WHERE file_id=?", binds: [.text(id)]) { $0.int(0) }
+        return (seg.first ?? 0) > 0 && (fts.first ?? 0) > 0
+    }
+
     public func transcriptText(forFile id: String) throws -> String? {
         let rows = try transcripts(forFile: id)
         guard !rows.isEmpty else { return nil }

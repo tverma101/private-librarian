@@ -23,8 +23,8 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 | **Exact duplicate detection** | ✅ **FIXED** — size-bucket → partial fingerprint → full SHA-256; report-only. The earlier breakage came from unparameterized catalog queries returning wrong rows; fixed in the same pass. |
 | Missing-file sweep | ✅ marks vanished files `missing` on re-scan; one path dialect end-to-end (see ARCHITECTURE.md). |
 | SwiftUI app shell | builds; folder picker + bookmark flow unexercised in UI tests |
-| Media probe + broker-safe PCM decode + transcript FTS | ✅ fixture-tested; provisioned local Whisper integration is host-conditional; ASR remains opt-in and fail-closed |
-| OCR / embeddings / speech inference / video sampling | partial: local ASR backend is wired and measured when a pre-provisioned model is available; OCR/embeddings/video remain separately staged |
+| Media probe + broker-safe PCM decode + transcript FTS | ✅ E2E-tested on generated WAV (decode → provider → transcript → encrypted catalog → FTS) with no external binaries required; unchanged re-index provably does zero decode/ASR; a changed generation replaces or purges transcripts atomically. Provisioned local Whisper integration is host-conditional; ASR remains opt-in and fail-closed |
+| OCR / embeddings / speech inference / video sampling | partial: local ASR backend is wired and measured when a pre-provisioned model is available; OCR/embeddings remain separately staged; sparse video sampling has an in-process AVAssetWriter fixture test (skips only where the runner lacks an H.264 encoder) |
 | Sandboxed .app entitlement audit in CI | script exists (`scripts/audit_entitlements.py`); wired into GitHub Actions |
 
 ## Bugs found and fixed during verification

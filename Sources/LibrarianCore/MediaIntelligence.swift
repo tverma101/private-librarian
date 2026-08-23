@@ -43,6 +43,15 @@ public protocol SpeechTranscriptionProvider: Sendable {
     func transcribe(_ chunks: [PCMChunk]) -> [TranscriptSegment]?
 }
 
+/// Swappable decode contract for the media lane. Implementations consume
+/// broker-owned bytes only; they never receive authority over the source
+/// filesystem beyond the read-only broker stream.
+public protocol PCMDecoding: Sendable {
+    func decode(path: String, broker: SourceBroker, onChunk: (PCMChunk) throws -> Void) throws
+}
+
+extension BrokerPCMDecoder: PCMDecoding {}
+
 /// Tier-1/default implementation. Keeps the media lane inert until a local ASR
 /// provider is explicitly enabled and benchmarked.
 public struct DisabledSpeechTranscriptionProvider: SpeechTranscriptionProvider {

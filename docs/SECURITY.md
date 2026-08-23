@@ -30,6 +30,8 @@ rewrites a source file.
 | Pipe-buffer deadlock from large embedding JSON | Helper stdout/stderr are drained after the wait rather than read eagerly so a 512-float vector never wedges a fixed pipe buffer | LocalModelBridge.runPython |
 | Long docs lose recall past a single embedding window | Documents are chunked (900-char window, 120 overlap) into `embedding_chunks` alongside the whole-document row; search keeps the max chunk score per file | embedding_chunks + SearchService.semanticSearch |
 | Stale embedding space after a model family change | `processingVersion` carries `Index.embeddingSpaceVersion` when Tier 2 is enabled so a MiniLM→CLIP-text switch forces a one-time re-index | ChangeDetection.needsProcessing |
+| Stale transcript presented as current after a source changes | `processingVersion` carries the ASR opt-in state, so enabling/disabling ASR forces one honest re-index; a regenerated transcript replaces the old rows inside the same commit transaction, and a generation whose decode now fails purges the previous transcript in that same transaction — old speech is never served as current | Indexer media lane + ChangeDetection.needsProcessing |
+| Decoder/model gaining source filesystem authority | The media lane passes only broker streams: `completeSnapshot`/`streamCompleteSnapshot` bytes go to the internal RIFF demuxer or ffmpeg stdin; ASR receives PCM chunks and writes its own temp WAV. Original paths are never handed to a decoder subprocess argv or a model provider | SourceBroker + BrokerPCMDecoder + SpeechTranscriptionProvider |
 
 ## AI image sorting — privacy note
 

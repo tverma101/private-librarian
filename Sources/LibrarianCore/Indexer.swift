@@ -42,8 +42,13 @@ public final class Indexer: @unchecked Sendable {
     private let processingVersion: String
     /// Swappable ASR provider — defaults to Disabled (no transcription until benchmarked).
     private let transcriptionProvider: any SpeechTranscriptionProvider
+    /// Swappable decoder — defaults to the broker-owned PCM decoder.
+    private let pcmDecoder: any PCMDecoding
 
-    public init(broker: SourceBroker, catalog: Catalog, scheduler: Scheduler, options: Options = .init(), transcriptionProvider: any SpeechTranscriptionProvider = DisabledSpeechTranscriptionProvider()) {
+    public init(broker: SourceBroker, catalog: Catalog, scheduler: Scheduler,
+                options: Options = .init(),
+                transcriptionProvider: any SpeechTranscriptionProvider = DisabledSpeechTranscriptionProvider(),
+                pcmDecoder: (any PCMDecoding)? = nil) {
         self.broker = broker
         self.catalog = catalog
         self.scheduler = scheduler
@@ -51,6 +56,7 @@ public final class Indexer: @unchecked Sendable {
         self.evidence = EvidenceExtractor(broker: broker)
         self.processingVersion = Self.makeProcessingVersion(options: options)
         self.transcriptionProvider = transcriptionProvider
+        self.pcmDecoder = pcmDecoder ?? BrokerPCMDecoder(maxSnapshotBytes: options.maxMediaSnapshotBytes)
     }
 
     /// Embedding-space version — derived from pinned HF SHAs + pipeline
@@ -73,6 +79,10 @@ public final class Indexer: @unchecked Sendable {
         } else {
             parts.append("tier2:off")
         }
+        // ASR participation must invalidate incremental state: flipping the
+        // opt-in (or changing providers via a different Indexer configuration)
+        // forces one honest re-index instead of serving stale derived media.
+        parts.append("asr:\(options.enableLocalASR ? "on" : "off")")
         return parts.joined(separator: "|")
     }
 
@@ -243,12 +253,20 @@ public final class Indexer: @unchecked Sendable {
                 if decision.shouldTranscribe, options.enableLocalASR {
                     // Only run when not Disabled — cheap check before any PCM work
                     if !(transcriptionProvider is DisabledSpeechTranscriptionProvider) {
-                        let decoder = BrokerPCMDecoder(maxSnapshotBytes: options.maxMediaSnapshotBytes)
                         var pcmChunks: [PCMChunk] = []
-                        try? scheduler.perform(as: .medium) {
-                            try decoder.decode(path: ident.path, broker: broker) { chunk in
-                                pcmChunks.append(chunk)
+                        do {
+                            try scheduler.perform(as: .medium) {
+                                try pcmDecoder.decode(path: ident.path, broker: broker) { chunk in
+                                    pcmChunks.append(chunk)
+                                }
                             }
+                        } catch {
+                            // Decode failure must never abort indexing (resilience),
+                            // but it is recorded — and the commit below purges any
+                            // transcript from an older generation so a source that
+                            // stopped decoding can't keep serving old speech.
+                            try? catalog.recordError(opaqueRef: id, stage: "media-decode",
+                                                     message: String(describing: error).prefix(200).description)
                         }
                         if !pcmChunks.isEmpty,
                            let segs = scheduler.perform(as: .heavy, { transcriptionProvider.transcribe(pcmChunks) }),
@@ -374,7 +392,21 @@ public final class Indexer: @unchecked Sendable {
                         """, binds: [.text(id), .text(LocalModelBridge.Model.clipImage.rawValue), .int(Int64(emb.dim)), .blob(emb.data)])
                 }
                 if let tr = stagedTranscript, !tr.segments.isEmpty {
+                    // Atomic replacement: the old generation's rows (and FTS
+                    // entries) are deleted and the new ones inserted inside
+                    // this same transaction, so no reader can observe a mix.
                     try catalog.txSaveTranscript(fileID: id, provider: tr.provider, segments: tr.segments)
+                } else {
+                    // Generation-safety invariant: after a generation commits,
+                    // the file's transcript state must reflect THAT generation.
+                    // If it produced no transcript — decode failed, it no
+                    // longer qualifies for ASR, ASR is disabled, or the file
+                    // is no longer media at all — any previous generation's
+                    // transcript is purged here, so stale speech is never
+                    // presented as current. For non-media files the DELETE
+                    // touches zero rows.
+                    try catalog.txRun("DELETE FROM transcripts WHERE file_id=?", binds: [.text(id)])
+                    try catalog.txRun("DELETE FROM transcripts_fts WHERE file_id=?", binds: [.text(id)])
                 }
                 if let emb = stagedMiniLM {
                     if !stagedChunks.isEmpty {
