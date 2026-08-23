@@ -24,6 +24,7 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 | Missing-file sweep | ✅ marks vanished files `missing` on re-scan; one path dialect end-to-end (see ARCHITECTURE.md). |
 | SwiftUI app shell | builds; folder picker + bookmark flow unexercised in UI tests |
 | OCR / embeddings / speech / video sampling | not started (Stage D/E) |
+| Golden Library quality harness | ✅ synthetic-golden-v1 precision/recall/F1, screenshot accuracy, semantic Recall@10, cluster purity, and provider/runtime identity comparison |
 | Sandboxed .app entitlement audit in CI | script exists (`scripts/audit_entitlements.py`); wired into GitHub Actions |
 
 ## Bugs found and fixed during verification

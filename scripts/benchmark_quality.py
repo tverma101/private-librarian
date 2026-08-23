@@ -78,8 +78,9 @@ def evaluate(payload: dict) -> dict:
     def mean(key: str, rows: list[dict]) -> float:
         return sum(r[key] for r in rows) / len(rows) if rows else 1.0
 
-    return {
+    result = {
         "schema": 1,
+        "golden_library": payload.get("golden_library", "synthetic-golden-v1"),
         "screenshot_subtype_accuracy": accuracy(screenshot_rows, "truth", "predicted"),
         "duplicate_precision": mean("precision", duplicate_scores),
         "duplicate_recall": mean("recall", duplicate_scores),
@@ -87,10 +88,23 @@ def evaluate(payload: dict) -> dict:
         "semantic_recall_at_10": recall_at_k(search_rows, k=10),
         "cluster_purity": cluster_purity(clusters),
     }
+    comparisons = []
+    for provider in payload.get("providers", []):
+        quality_payload = provider.get("quality_payload", {})
+        comparisons.append({
+            "provider_id": provider.get("provider_id", "unknown"),
+            "model": provider.get("model", "unknown"),
+            "preprocessing": provider.get("preprocessing", "unknown"),
+            "runtime": provider.get("runtime", {}),
+            "quality": evaluate(quality_payload),
+        })
+    if comparisons:
+        result["provider_comparisons"] = comparisons
+    return result
 
 
 def built_in_fixture() -> dict:
-    return {
+    quality = {
         "screenshots": [
             {"truth": "code", "predicted": "code"},
             {"truth": "school", "predicted": "school"},
@@ -110,6 +124,33 @@ def built_in_fixture() -> dict:
             {"cluster": "c1", "label": "cats"},
             {"cluster": "c2", "label": "code"},
             {"cluster": "c2", "label": "code"},
+        ],
+    }
+    return {
+        **quality,
+        "golden_library": "synthetic-golden-v1",
+        "providers": [
+            {
+                "provider_id": "python-transformers",
+                "model": "clip-vit-base-patch32 + all-MiniLM-L6-v2",
+                "preprocessing": "resize224-centerCrop-normalize;truncate4000-normalize",
+                "runtime": {"status": "fixture-only", "warm_calls": 0},
+                "quality_payload": quality,
+            },
+            {
+                "provider_id": "fileid-openclip-compat",
+                "model": "openai/clip-vit-base-patch32@3d74acf9",
+                "preprocessing": "resize224-centerCrop-normalize",
+                "runtime": {"status": "fixture-only", "warm_calls": 0},
+                "quality_payload": quality,
+            },
+            {
+                "provider_id": "apple-coreml-mobileclip",
+                "model": "apple/coreml-mobileclip@3e0a7bfb",
+                "preprocessing": "CoreML-256x256-ARGB-tokenBPE77",
+                "runtime": {"status": "unavailable", "reason": "No artifact-backed runtime fixture supplied", "warm_calls": 0},
+                "quality_payload": quality,
+            },
         ],
     }
 

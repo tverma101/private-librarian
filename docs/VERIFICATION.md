@@ -18,6 +18,22 @@ catalog encryption + wrong-key refusal + no plaintext header, duplicate
 reporting (near-duplicate control excluded), incremental re-index,
 virtual tree multi-label membership, FTS5 search, original-loss → missing.
 
+The quality benchmark's built-in `synthetic-golden-v1` fixture evaluates the
+same labeled cases for Python, FileID/OpenCLIP-compatible, and Apple
+MobileCLIP provider records. Runtime status is kept separate from fixture
+quality; the MobileCLIP record remains explicitly unavailable without model
+artifacts and an I/O contract fixture.
+
+```
+$ python3 scripts/benchmark_quality.py --output /tmp/private-librarian-quality.json
+{"schema": 1, "golden_library": "synthetic-golden-v1", ...,
+ "provider_comparisons": [{"provider_id": "python-transformers", ...}, ...]}
+```
+
+The command emits the complete JSON document; the abbreviated line above
+records the observed schema and provider-comparison fields without claiming a
+single-line human-readable format.
+
 ## End-to-end (scripts/e2e_local.sh, release binary)
 
 ```

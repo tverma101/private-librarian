@@ -43,6 +43,7 @@ or permission-changed at the source
 | `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
 | `Indexer` | Pipeline: enumerate → identity → extract → classify → commit, with identity re-stat immediately before commit ("changed-during-index" discard). End-of-run missing-sweep marks vanished files `missing` — never deletes anything anywhere. |
 | `DuplicateDetector` | Size-bucket → partial fingerprint (head/middle/tail 64 KiB) → full SHA-256 within matching partial groups. Report-only verdicts. |
+| `scripts/benchmark_quality.py` | Model/provider-neutral Golden Library metrics: screenshot subtype accuracy, duplicate precision/recall/F1, semantic Recall@10, cluster purity, and explicit model/preprocessing/runtime comparison records. |
 | `SearchService` | FTS5 query front-end with quote-escaping so user input can't break out of query syntax. |
 | `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree`. |
 | `LibrarianApp` | SwiftUI shell; sandboxed `.app` packaging via `scripts/package_app.sh`. |
