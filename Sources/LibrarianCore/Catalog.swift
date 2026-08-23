@@ -212,6 +212,9 @@ public final class Catalog: @unchecked Sendable {
             file_id TEXT NOT NULL,
             category TEXT NOT NULL,
             action TEXT NOT NULL,
+            pattern_type TEXT,
+            pattern TEXT,
+            generation TEXT,
             created REAL NOT NULL,
             provenance TEXT NOT NULL
         );

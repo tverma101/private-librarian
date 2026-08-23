@@ -40,7 +40,7 @@ or permission-changed at the source
 | `PDFText` / `OfficeContainer` | Content extraction through the read-only fd; malformed input yields empty evidence, never a crash. |
 | `RuleBasedClassifier` + `ClassifierContract` | Deterministic v1 classifier; its JSON output must pass schema validation or the result is discarded wholesale (contract wall). |
 | `Scheduler` | Serializes work into LOW/MEDIUM/HIGH slots so indexing never starves interactive work; also the seam where an LLM stage would be rate-limited later. |
-| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
+| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors, and correction-bound learned rules. Correction evidence stores a normalized pattern and deterministic file generation; only three matching additive corrections can create a disabled-by-default rule, while removals/wrong-category corrections block or reduce confidence. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
 | `Indexer` | Pipeline: enumerate → identity → extract → classify → commit, with identity re-stat immediately before commit ("changed-during-index" discard). End-of-run missing-sweep marks vanished files `missing` — never deletes anything anywhere. |
 | `DuplicateDetector` | Size-bucket → partial fingerprint (head/middle/tail 64 KiB) → full SHA-256 within matching partial groups. Report-only verdicts. |
 | `SearchService` | FTS5 query front-end with quote-escaping so user input can't break out of query syntax. |

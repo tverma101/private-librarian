@@ -1,9 +1,24 @@
 import XCTest
 @testable import LibrarianCore
 
-/// Issue #20: corrections -> deterministic learned rules.
-/// Three tests: record, promotion after 3x, disable deletes effect.
+/// Issue #20/#34: corrections -> deterministic, evidence-bound learned rules.
 final class LearningLoopTests: XCTestCase {
+
+    private func seedFile(_ cat: Catalog, id: String, path: String) throws {
+        try cat.run("""
+            INSERT INTO files(id, path, volume_uuid, fs_file_id, size, mtime, ctime, kind, status, first_seen, last_extractor)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """, binds: [.text(id), .text(path), .text("volume"), .int(Int64(id.hashValue)),
+                           .int(10), .real(100), .real(100), .text("text"), .text("indexed"),
+                           .real(100), .text("index-v1")])
+    }
+
+    private func recordPathCorrection(_ cat: Catalog, id: String, category: String,
+                                      action: CorrectionAction = .addCategory,
+                                      pattern: String = "extra") throws {
+        try cat.recordCorrection(fileID: id, category: category, action: action,
+                                 patternType: .pathKeyword, pattern: pattern)
+    }
 
     func testRecordCorrection() throws {
         let cat = try TestSupport.makeCatalog()
@@ -16,22 +31,51 @@ final class LearningLoopTests: XCTestCase {
         XCTAssertTrue(rules.isEmpty)
     }
 
-    func testPromotionAfterThreeCorrections() throws {
+    func testThreeUnrelatedCategoryCorrectionsDoNotPromoteArbitraryPattern() throws {
         let cat = try TestSupport.makeCatalog()
         try cat.ensureLearnedTables()
-        try cat.recordCorrection(fileID: "file_a", category: "School/Extra", action: .addCategory)
-        try cat.recordCorrection(fileID: "file_b", category: "School/Extra", action: .addCategory)
-        try cat.recordCorrection(fileID: "file_c", category: "School/Extra", action: .addCategory)
+        for (id, category) in [("file_a", "School/A"), ("file_b", "School/B"), ("file_c", "School/C")] {
+            try seedFile(cat, id: id, path: "/tmp/extra-\(id).txt")
+            try recordPathCorrection(cat, id: id, category: category)
+        }
         let rule = try cat.promoteIfNeeded(patternType: .pathKeyword, pattern: "extra", targetCategory: "School/Extra")
+        XCTAssertNil(rule)
+        XCTAssertTrue(try cat.listRules().isEmpty)
+    }
+
+    func testThreeRemovalsDoNotPromoteAddRule() throws {
+        let cat = try TestSupport.makeCatalog()
+        try cat.ensureLearnedTables()
+        for id in ["file_a", "file_b", "file_c"] {
+            try seedFile(cat, id: id, path: "/tmp/extra-\(id).txt")
+            try recordPathCorrection(cat, id: id, category: "School/Extra", action: .removeCategory)
+        }
+        XCTAssertNil(try cat.promoteIfNeeded(patternType: .pathKeyword, pattern: " EXTRA ", targetCategory: "School/Extra"))
+        XCTAssertTrue(try cat.listRules().isEmpty)
+    }
+
+    func testThreeMatchingPositiveCorrectionsPromote() throws {
+        let cat = try TestSupport.makeCatalog()
+        try cat.ensureLearnedTables()
+        for id in ["file_a", "file_b", "file_c"] {
+            try seedFile(cat, id: id, path: "/tmp/extra-\(id).txt")
+            try recordPathCorrection(cat, id: id, category: "School/Extra")
+        }
+        let evidenceRows = try cat.query("SELECT count(*), count(pattern), count(generation) FROM corrections") {
+            ($0.int(0), $0.int(1), $0.int(2))
+        }.first
+        XCTAssertEqual(evidenceRows?.0, 3)
+        XCTAssertEqual(evidenceRows?.1, 3)
+        XCTAssertEqual(evidenceRows?.2, 3)
+        let rule = try cat.promoteIfNeeded(patternType: .pathKeyword, pattern: " EXTRA ", targetCategory: "School/Extra")
         XCTAssertNotNil(rule)
         XCTAssertEqual(rule?.pattern, "extra")
         XCTAssertEqual(rule?.targetCategory, "School/Extra")
         XCTAssertEqual(rule?.enabled, false, "promoted rule must be disabled by default (reversible)")
-        let listed = try cat.listRules()
-        XCTAssertEqual(listed.count, 1)
+        XCTAssertEqual(try cat.listRules().count, 1)
         // Enabling should be required for effect
         let ev = EvidenceExtractor.Evidence(filenameTokens: ["extra", "notes"], kind: "text", sizeClass: "small")
-        let engineDisabled = LearnedRuleEngine(rules: listed)
+        let engineDisabled = LearnedRuleEngine(rules: try cat.listRules())
         let r0 = engineDisabled.enrich(categories: ["Documents/Text"], evidence: ev, path: "/tmp/extra_notes.txt")
         XCTAssertFalse(r0.categories.contains("School/Extra"), "disabled rule must not fire")
         XCTAssertTrue(r0.reasons.isEmpty)
@@ -43,9 +87,11 @@ final class LearningLoopTests: XCTestCase {
         // Need a file row so setRuleEnabled's invalidation path has something to enqueue/clear
         // and enrichment has a realistic evidence path
         // Use extension pattern for deterministic test.
-        try cat.recordCorrection(fileID: "file_x", category: "Image/Raw", action: .addCategory)
-        try cat.recordCorrection(fileID: "file_y", category: "Image/Raw", action: .addCategory)
-        try cat.recordCorrection(fileID: "file_z", category: "Image/Raw", action: .addCategory)
+        for id in ["file_x", "file_y", "file_z"] {
+            try seedFile(cat, id: id, path: "/tmp/photo-\(id).cr2")
+            try cat.recordCorrection(fileID: id, category: "Image/Raw", action: .addCategory,
+                                     patternType: .extension, pattern: ".CR2")
+        }
         guard let rule = try cat.promoteIfNeeded(patternType: .extension, pattern: "cr2", targetCategory: "Image/Raw") else {
             return XCTFail("promotion failed")
         }
