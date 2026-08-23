@@ -681,11 +681,19 @@ public final class Catalog: @unchecked Sendable {
     }
 
     /// Cheap existence probe covering BOTH the segment rows and their FTS
-    /// mirror — a transcript only "exists" while both agree.
+    /// mirror — a transcript only "exists" while both agree. (Edge case: a
+    /// transcript whose every segment is whitespace-only has segment rows but
+    /// an empty FTS mirror, since blank text is never indexed.)
     public func transcriptExists(forFile id: String) throws -> Bool {
         let seg = try query("SELECT count(*) FROM transcripts WHERE file_id=?", binds: [.text(id)]) { $0.int(0) }
         let fts = try query("SELECT count(*) FROM transcripts_fts WHERE file_id=?", binds: [.text(id)]) { $0.int(0) }
         return (seg.first ?? 0) > 0 && (fts.first ?? 0) > 0
+    }
+
+    /// Remove a file's transcript rows and their FTS mirror.
+    public func purgeTranscript(fileID: String) throws {
+        try run("DELETE FROM transcripts WHERE file_id=?", binds: [.text(fileID)])
+        try run("DELETE FROM transcripts_fts WHERE file_id=?", binds: [.text(fileID)])
     }
 
     public func transcriptText(forFile id: String) throws -> String? {
@@ -694,7 +702,10 @@ public final class Catalog: @unchecked Sendable {
         return rows.map(\.text).joined(separator: " ")
     }
 
-    // Transaction-local variants for use inside Indexer commit
+    /// Transaction-local variants for use inside Indexer commit.
+    /// Replacement is atomic by construction: the previous generation's rows
+    /// (and their FTS mirror) are deleted and the new generation's inserted
+    /// inside one transaction, so no reader can observe a mixed state.
     public func txSaveTranscript(fileID: String, provider: String, segments: [TranscriptSegment]) throws {
         try txRun("DELETE FROM transcripts WHERE file_id=?", binds: [.text(fileID)])
         try txRun("DELETE FROM transcripts_fts WHERE file_id=?", binds: [.text(fileID)])

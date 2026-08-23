@@ -80,8 +80,11 @@ public final class Indexer: @unchecked Sendable {
             parts.append("tier2:off")
         }
         // ASR participation must invalidate incremental state: flipping the
-        // opt-in (or changing providers via a different Indexer configuration)
-        // forces one honest re-index instead of serving stale derived media.
+        // opt-in forces one honest re-index instead of serving stale derived
+        // media. (Provider identity is not encoded here — swapping providers
+        // under the same opt-in state intentionally reuses the existing
+        // transcript until content changes; encode providerID here if that
+        // policy ever changes.)
         parts.append("asr:\(options.enableLocalASR ? "on" : "off")")
         return parts.joined(separator: "|")
     }
@@ -172,6 +175,9 @@ public final class Indexer: @unchecked Sendable {
             try catalog.setStatus(fileID: id, status: "pending")
             try catalog.setExtractorVersion(fileID: id, version: processingVersion)
             try catalog.setStatus(fileID: id, status: "indexed")
+            // A path that is no longer a decodable regular file cannot stand
+            // behind its old generation's transcript.
+            try catalog.purgeTranscript(fileID: id)
             return true
         }
 
@@ -181,6 +187,9 @@ public final class Indexer: @unchecked Sendable {
             try catalog.setStatus(fileID: id, status: "pending")
             try catalog.setExtractorVersion(fileID: id, version: processingVersion)
             try catalog.setStatus(fileID: id, status: "cloud-placeholder")
+            // Placeholder bytes are not present; any earlier transcript does
+            // not describe this generation.
+            try catalog.purgeTranscript(fileID: id)
             return true
         }
 
@@ -248,31 +257,38 @@ public final class Indexer: @unchecked Sendable {
         if ident.kind == .audio || ident.kind == .video {
             let ext = (ident.path as NSString).pathExtension
             // Complete broker snapshot for probe — never reopens path inside AudioProbe.
-            if let mBytes = try? broker.completeSnapshot(ident.path, maxBytes: options.maxMediaSnapshotBytes), !mBytes.isEmpty {
-                let decision = AudioProbe.probe(bytes: mBytes, fileExtension: ext.isEmpty ? nil : ext, tagHint: nil)
-                if decision.shouldTranscribe, options.enableLocalASR {
-                    // Only run when not Disabled — cheap check before any PCM work
-                    if !(transcriptionProvider is DisabledSpeechTranscriptionProvider) {
-                        var pcmChunks: [PCMChunk] = []
-                        do {
-                            try scheduler.perform(as: .medium) {
-                                try pcmDecoder.decode(path: ident.path, broker: broker) { chunk in
-                                    pcmChunks.append(chunk)
-                                }
+            // A read failure here is NOT evidence that speech vanished; it must
+            // not purge a valid transcript below, and it must not be recorded
+            // as indexed either (that would end incremental retries).
+            guard let mBytes = try? broker.completeSnapshot(ident.path, maxBytes: options.maxMediaSnapshotBytes),
+                  !mBytes.isEmpty else {
+                try catalog.setStatus(fileID: id, status: "pending")
+                return true
+            }
+            let decision = AudioProbe.probe(bytes: mBytes, fileExtension: ext.isEmpty ? nil : ext, tagHint: nil)
+            if decision.shouldTranscribe, options.enableLocalASR {
+                // Only run when not Disabled — cheap check before any PCM work
+                if !(transcriptionProvider is DisabledSpeechTranscriptionProvider) {
+                    var pcmChunks: [PCMChunk] = []
+                    do {
+                        try scheduler.perform(as: .medium) {
+                            try pcmDecoder.decode(path: ident.path, broker: broker) { chunk in
+                                pcmChunks.append(chunk)
                             }
-                        } catch {
-                            // Decode failure must never abort indexing (resilience),
-                            // but it is recorded — and the commit below purges any
-                            // transcript from an older generation so a source that
-                            // stopped decoding can't keep serving old speech.
-                            try? catalog.recordError(opaqueRef: id, stage: "media-decode",
-                                                     message: String(describing: error).prefix(200).description)
                         }
-                        if !pcmChunks.isEmpty,
-                           let segs = scheduler.perform(as: .heavy, { transcriptionProvider.transcribe(pcmChunks) }),
-                           !segs.isEmpty {
-                            stagedTranscript = (transcriptionProvider.providerID, segs)
-                        }
+                    } catch {
+                        // Decode failure must never abort indexing (resilience),
+                        // but it is recorded — and partial PCM from a decoder
+                        // that threw mid-stream must not be transcribed either:
+                        // a prefix of a corrupt file is still a lie.
+                        pcmChunks = []
+                        try? catalog.recordError(opaqueRef: id, stage: "media-decode",
+                                                 message: String(describing: error).prefix(200).description)
+                    }
+                    if !pcmChunks.isEmpty,
+                       let segs = scheduler.perform(as: .heavy, { transcriptionProvider.transcribe(pcmChunks) }),
+                       !segs.isEmpty {
+                        stagedTranscript = (transcriptionProvider.providerID, segs)
                     }
                 }
             }

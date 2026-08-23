@@ -69,17 +69,26 @@ public struct BrokerPCMDecoder: Sendable {
         // analyze identical bytes from a single read of the original.
         let snapshot = try broker.completeSnapshot(path, maxBytes: min(maxSnapshotBytes, broker.maxSnapshotBytes))
 
-        if let riff = RIFFWave(data: snapshot) {
-            return try emitChunks(from: riff.samples(atTargetRate: sampleRate),
+        switch Self.classifyRIFFWave(snapshot) {
+        case .ok(let wave):
+            return try emitChunks(from: wave.samples(atTargetRate: sampleRate),
                                   sampleRate: sampleRate, onChunk: onChunk)
+        case .truncatedOrInvalid:
+            // A RIFF/WAVE container whose declared chunks outrun the snapshot,
+            // or whose header lies about its layout, must NEVER reach the
+            // tolerant external demuxer — ffmpeg would happily decode the
+            // surviving prefix and exit 0. Fail closed instead.
+            throw MediaDecoderError.decoderFailed(status: -1,
+                                                  detail: "truncated or invalid RIFF/WAVE-PCM snapshot; refusing partial decode")
+        case .notRIFFWave, .unsupportedFormat:
+            // Genuinely not uncompressed WAVE-PCM (or a valid container with an
+            // unsupported encoding such as float/ADPCM): the external demuxer
+            // may handle it and must be explicitly available.
+            guard case .available = Self.preflight(executablePath: executablePath) else {
+                throw MediaDecoderError.decoderUnavailable(executablePath)
+            }
+            try decodeViaExternalDemuxer(snapshot: snapshot, onChunk: onChunk)
         }
-
-        // Everything else (compressed containers) goes through the external
-        // demuxer, which must be explicitly available.
-        guard case .available = Self.preflight(executablePath: executablePath) else {
-            throw MediaDecoderError.decoderUnavailable(executablePath)
-        }
-        try decodeViaExternalDemuxer(snapshot: snapshot, onChunk: onChunk)
     }
 
     // MARK: - External demuxer (ffmpeg)
@@ -186,56 +195,91 @@ public struct BrokerPCMDecoder: Sendable {
 
     // MARK: - Internal RIFF/WAVE-PCM demuxer
 
-    /// Minimal parser for uncompressed RIFF/WAVE-PCM (format tag 1, 16-bit).
-    /// Returns nil for anything else so callers can fall back to the external
-    /// demuxer. Parsing is bounds-disciplined: a truncated or lying header is
-    /// rejected outright (fail closed), never partially honored.
-    private struct RIFFWave {
+    /// Outcome classification for candidate RIFF/WAVE bytes. Distinguishing
+    /// "not RIFF/WAVE at all" from "RIFF/WAVE that failed validation" is what
+    /// keeps truncated containers away from the tolerant external demuxer
+    /// (which would otherwise decode the surviving prefix and exit 0).
+    fileprivate enum RIFFClassification {
+        case ok(RIFFWave)
+        /// Bytes are not a RIFF/WAVE container at all.
+        case notRIFFWave
+        /// Well-formed container carrying an encoding this demuxer does not
+        /// implement (IEEE float, ADPCM, ...). The external demuxer may handle it.
+        case unsupportedFormat
+        /// A RIFF/WAVE container whose declared structure outruns or
+        /// contradicts the actual snapshot: truncated payload, lying headers.
+        case truncatedOrInvalid
+    }
+
+    fileprivate static func classifyRIFFWave(_ data: Data) -> RIFFClassification {
+        guard data.count >= 12,
+              data.subdata(in: 0..<4) == Data("RIFF".utf8),
+              data.subdata(in: 8..<12) == Data("WAVE".utf8) else {
+            return .notRIFFWave
+        }
+
+        var fmtRate: UInt32?
+        var fmtChannels: UInt16?
+        var sawUnsupportedEncoding = false
+        var sawValidPCMFormat = false
+        var pcmPayload: Data?
+
+        var offset = 12
+        while offset + 8 <= data.count {
+            let chunkID = data.subdata(in: offset..<offset + 4)
+            // Chunk size cannot straddle the buffer end (overflow-safe:
+            // Int64 arithmetic before any Int conversion).
+            let rawSize = leUInt32(data, offset + 4)
+            let bodyStart = offset + 8
+            let bodyEnd = Int64(bodyStart) + Int64(rawSize)
+            guard bodyEnd <= Int64(data.count) else {
+                return .truncatedOrInvalid
+            }
+
+            if chunkID == Data("fmt ".utf8) {
+                guard rawSize >= 16 else { return .truncatedOrInvalid }
+                let formatTag = leUInt16(data, bodyStart)
+                if formatTag == 1 {
+                    let channels = leUInt16(data, bodyStart + 2)
+                    let rate = leUInt32(data, bodyStart + 4)
+                    let bitsPerSample = leUInt16(data, bodyStart + 14)
+                    // The header must tell the truth about its own geometry;
+                    // implausible values mean a corrupt/lying header, while a
+                    // truthful non-16-bit PCM encoding is merely unsupported.
+                    guard channels >= 1, channels <= 8, rate >= 8_000, rate <= 192_000 else {
+                        return .truncatedOrInvalid
+                    }
+                    guard bitsPerSample == 16 else { return .unsupportedFormat }
+                    fmtChannels = channels
+                    fmtRate = rate
+                    sawValidPCMFormat = true
+                } else {
+                    sawUnsupportedEncoding = true
+                }
+            } else if chunkID == Data("data".utf8) {
+                // Last data chunk wins (metadata chunks may legally follow).
+                pcmPayload = data.subdata(in: bodyStart..<Int(bodyEnd))
+            }
+            // RIFF chunks are word-aligned: odd sizes carry one pad byte.
+            offset = bodyStart + Int(rawSize) + (Int(rawSize) % 2)
+        }
+
+        if sawUnsupportedEncoding { return .unsupportedFormat }
+        guard sawValidPCMFormat, let rate = fmtRate, let channels = fmtChannels else {
+            return .truncatedOrInvalid // RIFF/WAVE with no usable fmt chunk
+        }
+        guard let payload = pcmPayload else {
+            return .truncatedOrInvalid // RIFF/WAVE with no data chunk
+        }
+        return .ok(RIFFWave(sourceRate: Double(rate), sourceChannels: Int(channels), pcm: payload))
+    }
+
+    /// Minimal model of an uncompressed RIFF/WAVE-PCM (format tag 1, 16-bit)
+    /// container that has ALREADY passed bounds validation.
+    fileprivate struct RIFFWave {
         let sourceRate: Double
         let sourceChannels: Int
         let pcm: Data
-
-        init?(data: Data) {
-            guard data.count >= 12 else { return nil }
-            guard data.subdata(in: 0..<4) == Data("RIFF".utf8),
-                  data.subdata(in: 8..<12) == Data("WAVE".utf8) else { return nil }
-
-            var fmtRate: UInt32?
-            var fmtChannels: UInt16?
-            var pcmPayload: Data?
-
-            var offset = 12
-            while offset + 8 <= data.count {
-                let chunkID = data.subdata(in: offset..<offset + 4)
-                // Chunk size cannot straddle the buffer end (overflow-safe:
-                // UInt64 arithmetic before any advance).
-                let rawSize = Self.leUInt32(data, offset + 4)
-                let bodyStart = offset + 8
-                let bodyEnd = Int64(bodyStart) + Int64(rawSize)
-                guard bodyEnd <= Int64(data.count) else { return nil }
-
-                if chunkID == Data("fmt ".utf8) {
-                    guard rawSize >= 16 else { return nil }
-                    let formatTag = Self.leUInt16(data, bodyStart)
-                    guard formatTag == 1 else { return nil } // PCM only
-                    fmtChannels = Self.leUInt16(data, bodyStart + 2)
-                    fmtRate = Self.leUInt32(data, bodyStart + 4)
-                    let bitsPerSample = Self.leUInt16(data, bodyStart + 14)
-                    guard bitsPerSample == 16, let ch = fmtChannels, ch >= 1, ch <= 8,
-                          let r = fmtRate, r >= 8_000, r <= 192_000 else { return nil }
-                } else if chunkID == Data("data".utf8) {
-                    pcmPayload = data.subdata(in: bodyStart..<Int(bodyEnd))
-                }
-                // RIFF chunks are word-aligned: odd sizes carry one pad byte.
-                offset = bodyStart + Int(rawSize) + (Int(rawSize) % 2)
-            }
-
-            guard let rate = fmtRate, let channels = fmtChannels, let payload = pcmPayload,
-                  !payload.isEmpty else { return nil }
-            self.sourceRate = Double(rate)
-            self.sourceChannels = Int(channels)
-            self.pcm = payload
-        }
 
         /// Deterministic mono Float conversion at the requested rate: channel
         /// fold by mean, then linear-interpolation resample. Identical inputs
@@ -277,13 +321,13 @@ public struct BrokerPCMDecoder: Sendable {
             }
             return out
         }
+    }
 
-        private static func leUInt16(_ d: Data, _ o: Int) -> UInt16 {
-            UInt16(d[o]) | (UInt16(d[o + 1]) << 8)
-        }
-        private static func leUInt32(_ d: Data, _ o: Int) -> UInt32 {
-            UInt32(d[o]) | (UInt32(d[o + 1]) << 8) | (UInt32(d[o + 2]) << 16) | (UInt32(d[o + 3]) << 24)
-        }
+    fileprivate static func leUInt16(_ d: Data, _ o: Int) -> UInt16 {
+        UInt16(d[o]) | (UInt16(d[o + 1]) << 8)
+    }
+    fileprivate static func leUInt32(_ d: Data, _ o: Int) -> UInt32 {
+        UInt32(d[o]) | (UInt32(d[o + 1]) << 8) | (UInt32(d[o + 2]) << 16) | (UInt32(d[o + 3]) << 24)
     }
 
     /// Slice a mono sample array into timestamped chunks of at most

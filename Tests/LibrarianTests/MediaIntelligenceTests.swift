@@ -352,6 +352,148 @@ final class MediaIntelligenceTests: XCTestCase {
         XCTAssertFalse(try catalog.searchExact("fixture").contains { $0.fileID == row.id })
     }
 
+    /// Regression for the adversarial-review BLOCKER: a WAV whose data chunk
+    /// declares more bytes than the snapshot contains must fail closed. The
+    /// tolerant external demuxer would otherwise decode the surviving prefix
+    /// and exit 0, presenting corrupt partial speech as current.
+    func testTruncatedWAVFailsClosedInsteadOfDecodingPrefix() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("media-trunc-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let media = dir.appendingPathComponent("truncated.wav")
+
+        // Truthful-looking header for 1 second of 16 kHz mono…
+        var wav = Data("RIFF".utf8)
+        func appendLE<T: FixedWidthInteger>(_ value: T) {
+            var v = value.littleEndian
+            withUnsafeBytes(of: &v) { wav.append(contentsOf: $0) }
+        }
+        appendLE(UInt32(36 + 32_000)); wav.append(contentsOf: Data("WAVEfmt ".utf8))
+        appendLE(UInt32(16)); appendLE(UInt16(1)); appendLE(UInt16(1)); appendLE(UInt32(16_000))
+        appendLE(UInt32(32_000)); appendLE(UInt16(2)); appendLE(UInt16(16))
+        wav.append(contentsOf: Data("data".utf8)); appendLE(UInt32(32_000))
+        // …but only 64 bytes of payload survive.
+        wav.append(Data(repeating: 0x11, count: 64))
+        try wav.write(to: media)
+
+        let decoder = BrokerPCMDecoder()
+        let broker = SourceBroker(maxSnapshotBytes: 16 * 1024 * 1024)
+        var chunks: [PCMChunk] = []
+        XCTAssertThrowsError(try decoder.decode(path: media.path, broker: broker) { chunks.append($0) },
+                             "truncated RIFF/WAVE must never reach the tolerant external demuxer")
+        XCTAssertTrue(chunks.isEmpty, "no partial prefix may be emitted")
+    }
+
+    /// A decoder that emits one chunk and then throws mid-stream must not let
+    /// its partial PCM reach ASR: a prefix of a failed decode is still a lie.
+    private struct PartialThenThrowingDecoder: PCMDecoding {
+        func decode(path: String, broker: SourceBroker,
+                    onChunk: (PCMChunk) throws -> Void) throws {
+            try onChunk(PCMChunk(samples: [0.5, -0.5], sampleRate: 16_000, channels: 1, startTime: 0))
+            throw MediaDecoderError.decoderFailed(status: -1, detail: "synthetic mid-stream failure")
+        }
+    }
+
+    func testMidStreamDecodeFailureClearsPartialPCMBeforeASR() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("media-partial-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let media = root.appendingPathComponent("partial.wav")
+        try Self.makeWAV(sampleRate: 16_000, channels: 1, seconds: 2, amplitude: 8_000).write(to: media)
+
+        let provider = RecordingProvider()
+        let catalog = try TestSupport.makeCatalog(tag: "partial-\(UUID().uuidString)")
+        var options = Indexer.Options()
+        options.enableLocalASR = true
+        options.maxMediaSnapshotBytes = 16 * 1024 * 1024
+        let indexer = Indexer(broker: SourceBroker(maxSnapshotBytes: options.maxMediaSnapshotBytes),
+                              catalog: catalog, scheduler: Scheduler(), options: options,
+                              transcriptionProvider: provider, pcmDecoder: PartialThenThrowingDecoder())
+
+        XCTAssertTrue(try indexer.indexOne(path: media.path))
+        XCTAssertEqual(provider.transcribeCalls, 0, "partial PCM must be cleared before ASR")
+        XCTAssertEqual(provider.received.count, 0)
+        let row = try XCTUnwrap(try catalog.allFiles().first { $0.path == media.path })
+        XCTAssertFalse(try catalog.transcriptExists(forFile: row.id))
+        XCTAssertFalse(try catalog.searchExact("fixture").contains { $0.fileID == row.id })
+    }
+
+    /// Replacing a transcribed audio file with a SYMLINK at the same path
+    /// reuses the path-derived id; the old generation's speech must be purged.
+    func testSymlinkReplacementPurgesStaleTranscript() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("media-syml-\(UUID().uuidString)")
+        let container = root.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let media = root.appendingPathComponent("now-a-link.wav")
+
+        let provider = RecordingProvider()
+        let catalog = try TestSupport.makeCatalog(tag: "syml-\(UUID().uuidString)")
+        var options = Indexer.Options()
+        options.enableLocalASR = true
+        options.maxMediaSnapshotBytes = 16 * 1024 * 1024
+        let indexer = Indexer(broker: SourceBroker(maxSnapshotBytes: options.maxMediaSnapshotBytes),
+                              catalog: catalog, scheduler: Scheduler(), options: options,
+                              transcriptionProvider: provider)
+
+        // Generation 1: audio with a transcript.
+        try Self.makeWAV(sampleRate: 16_000, channels: 1, seconds: 2, amplitude: 8_000).write(to: media)
+        XCTAssertTrue(try indexer.indexOne(path: media.path))
+        let row = try XCTUnwrap(try catalog.allFiles().first { $0.path == media.path })
+        XCTAssertTrue(try catalog.transcriptExists(forFile: row.id))
+
+        // Generation 2: the path is now a symlink (never opened by the broker).
+        let target = container.appendingPathComponent("outside-\(UUID().uuidString).txt")
+        try "harmless target".write(to: target, atomically: true, encoding: .utf8)
+        try? FileManager.default.removeItem(at: media)
+        try FileManager.default.createSymbolicLink(at: media, withDestinationURL: target)
+
+        XCTAssertTrue(try indexer.indexOne(path: media.path))
+        XCTAssertFalse(try catalog.transcriptExists(forFile: row.id),
+                       "audio transcript must not survive under a symlink generation")
+        XCTAssertFalse(try catalog.searchExact("fixture").contains { $0.fileID == row.id })
+    }
+
+    /// A regeneration whose snapshot exceeds the media policy (file grew past
+    /// the ceiling) is NOT evidence that speech vanished: the read failure
+    /// leaves the entry pending for retry and must NOT purge a valid
+    /// transcript or mark the generation indexed.
+    func testOversizeRegenerationKeepsTranscriptAndStaysPending() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("media-oversize-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let media = root.appendingPathComponent("grew.wav")
+
+        var options = Indexer.Options()
+        options.enableLocalASR = true
+        options.maxMediaSnapshotBytes = 1024 * 1024 // 1 MB ceiling
+        let provider = RecordingProvider()
+        let catalog = try TestSupport.makeCatalog(tag: "oversize-\(UUID().uuidString)")
+        let indexer = Indexer(broker: SourceBroker(maxSnapshotBytes: options.maxMediaSnapshotBytes),
+                              catalog: catalog, scheduler: Scheduler(), options: options,
+                              transcriptionProvider: provider)
+
+        // Generation 1: small clip gains a transcript.
+        try Self.makeWAV(sampleRate: 16_000, channels: 1, seconds: 2, amplitude: 8_000).write(to: media)
+        XCTAssertTrue(try indexer.indexOne(path: media.path))
+        let row = try XCTUnwrap(try catalog.allFiles().first { $0.path == media.path })
+        XCTAssertTrue(try catalog.transcriptExists(forFile: row.id))
+        provider.reset()
+
+        // Generation 2: the file grew far beyond the snapshot ceiling.
+        try Data(repeating: 0x21, count: 3 * 1024 * 1024).write(to: media)
+        XCTAssertTrue(try indexer.indexOne(path: media.path))
+        let status = try XCTUnwrap(catalog.allFiles().first { $0.id == row.id }?.status)
+        XCTAssertEqual(status, "pending", "unreadable-generation must stay retryable, not indexed")
+        XCTAssertTrue(try catalog.transcriptExists(forFile: row.id),
+                      "transcript must be retained until a readable generation proves it stale")
+        XCTAssertEqual(provider.transcribeCalls, 0)
+
+        // Unchanged follow-up pass retries (pending never qualifies for skip).
+        XCTAssertTrue(try indexer.indexOne(path: media.path))
+        XCTAssertTrue(try catalog.transcriptExists(forFile: row.id))
+    }
+
     // MARK: - ASR preflight determinism
 
     /// The three preflight outcomes are distinguished independently of
@@ -536,7 +678,16 @@ final class MediaIntelligenceTests: XCTestCase {
         writer.startSession(atSourceTime: .zero)
 
         for i in 0..<frames {
-            while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.005) }
+            // Bounded readiness wait: a wedged encoder must fail the fixture,
+            // not hang the runner.
+            var waited: TimeInterval = 0
+            while !input.isReadyForMoreMediaData {
+                guard waited < 10 else {
+                    throw XCTSkip("encoder never became ready for more media data (runner limitation)")
+                }
+                Thread.sleep(forTimeInterval: 0.005)
+                waited += 0.005
+            }
             let pixelBuffer = try Self.grayPixelBuffer(gray: UInt8((i * 37) % 200 + 20), width: width, height: height)
             let time = CMTime(value: CMTimeValue(i), timescale: CMTimeScale(fps))
             guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
@@ -544,11 +695,13 @@ final class MediaIntelligenceTests: XCTestCase {
             }
         }
         input.markAsFinished()
+        // Bounded finalization: a wedged encoder must fail the fixture, not
+        // hang the runner forever.
         let semaphore = DispatchSemaphore(value: 0)
         writer.finishWriting { semaphore.signal() }
-        semaphore.wait()
-        guard writer.status == .completed else {
-            throw XCTSkip("encoder failed to finalize (runner limitation): \(writer.error.map(String.init(describing:)) ?? "unknown")")
+        guard semaphore.wait(timeout: .now() + 30) == .success,
+              writer.status == .completed else {
+            throw XCTSkip("encoder failed to finalize (runner limitation): \(writer.error.map(String.init(describing:)) ?? "timeout")")
         }
     }
 
