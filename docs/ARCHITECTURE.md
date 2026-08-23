@@ -44,6 +44,7 @@ or permission-changed at the source
 | `Indexer` | Pipeline: enumerate → identity → extract → classify → commit, with identity re-stat immediately before commit ("changed-during-index" discard). End-of-run missing-sweep marks vanished files `missing` — never deletes anything anywhere. |
 | `DuplicateDetector` | Size-bucket → partial fingerprint (head/middle/tail 64 KiB) → full SHA-256 within matching partial groups. Report-only verdicts. |
 | `SearchService` | FTS5 query front-end with quote-escaping so user input can't break out of query syntax. |
+| `LiveIndexCoordinator` | Optional read-only FSEvents reconciliation for authorized roots. Streams use `kFSEventStreamCreateFlagUseCFTypes` and decode bounded CFArray path delivery; catalog, model, cache, and temporary paths remain excluded even beneath watched roots. Dropped events trigger the existing bounded full-rescan fallback. |
 | `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree`. |
 | `LibrarianApp` | SwiftUI shell; sandboxed `.app` packaging via `scripts/package_app.sh`. |
 

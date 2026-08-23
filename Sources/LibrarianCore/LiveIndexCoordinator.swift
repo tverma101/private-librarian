@@ -96,7 +96,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable{
     public func ingest(events:[LiveRawEvent]){
         guard !events.isEmpty else{return}
         if let m=events.map(\.eventId).max(),m>lastEventId{lastEventId=m}
-        let filt=events.filter{!LiveExclusions.isExcluded(path:$0.path,prefixes:exclusionPrefixes) || isUnderWatchedRoot($0.path)}
+        let filt=events.filter{isUnderWatchedRoot($0.path) && !LiveExclusions.isExcluded(path:$0.path,prefixes:exclusionPrefixes)}
         let hasDrop=events.contains{LiveCoalescingQueue.isDroppedEvent(flags:$0.flags)}
         if filt.isEmpty && !hasDrop{return}
         var toIngest=filt
@@ -117,7 +117,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable{
     @discardableResult private func drainAndProcessSync()->LiveCoalescingQueue.CoalescedBatch?{guard let b=queue.drain() else{return nil}; process(batch:b); return b}
     private func process(batch:LiveCoalescingQueue.CoalescedBatch){
         if batch.needsFullRescan || batch.paths.count>options.maxCoalescedPaths{doFullRescan(reason:batch.needsFullRescan ? "dropped-events":"storm-overflow"); return}
-        let ps=batch.paths.filter{!LiveExclusions.isExcluded(path:$0,prefixes:exclusionPrefixes) || isUnderWatchedRoot($0)}; guard !ps.isEmpty else{return}
+        let ps=batch.paths.filter{isUnderWatchedRoot($0) && !LiveExclusions.isExcluded(path:$0,prefixes:exclusionPrefixes)}; guard !ps.isEmpty else{return}
         for p in ps{do{try processSinglePath(p)}catch{try? catalog.recordError(opaqueRef:FileID.workerError(0),stage:"live-index",message:String(describing:error).prefix(200).description)}}
     }
     private func processSinglePath(_ p:String)throws{if (try? broker.identity(at:p))==nil{try markMissing(atOrUnder:p); return}; if let h=testIndexOneHandler{_=try h(p)}else{_=try? indexer.indexOne(path:p)}}
@@ -144,14 +144,20 @@ public final class LiveIndexCoordinator: @unchecked Sendable{
         for url in urls{
             let p=url.path as NSString
             var ctx=FSEventStreamContext(version:0,info:Unmanaged.passUnretained(self).toOpaque(),retain:nil,release:nil,copyDescription:nil)
-            let fl:FSEventStreamCreateFlags=UInt32(kFSEventStreamCreateFlagFileEvents|kFSEventStreamCreateFlagNoDefer|kFSEventStreamCreateFlagWatchRoot)
+            let fl:FSEventStreamCreateFlags=UInt32(kFSEventStreamCreateFlagFileEvents|kFSEventStreamCreateFlagNoDefer|kFSEventStreamCreateFlagWatchRoot|kFSEventStreamCreateFlagUseCFTypes)
             let lat:CFTimeInterval=options.debounceInterval
             let cb:FSEventStreamCallback={_,info,numEvents,eventPaths,eventFlags,eventIds in
                 guard let info else{return}
                 let c=Unmanaged<LiveIndexCoordinator>.fromOpaque(info).takeUnretainedValue()
-                let ps=unsafeBitCast(eventPaths,to:NSArray.self) as! [String]
+                let paths=Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue()
+                let count=min(numEvents,CFArrayGetCount(paths))
                 var evs:[LiveRawEvent]=[]; evs.reserveCapacity(numEvents)
-                for i in 0..<numEvents{evs.append(LiveRawEvent(path:ps[i],flags:eventFlags[i],eventId:eventIds[i]))}
+                for i in 0..<count{
+                    guard let value=CFArrayGetValueAtIndex(paths,i) else{continue}
+                    let object=Unmanaged<AnyObject>.fromOpaque(value).takeUnretainedValue()
+                    guard let path=object as? String else{continue}
+                    evs.append(LiveRawEvent(path:path,flags:eventFlags[i],eventId:eventIds[i]))
+                }
                 c.ingest(events:evs)
             }
             let w=[p] as CFArray

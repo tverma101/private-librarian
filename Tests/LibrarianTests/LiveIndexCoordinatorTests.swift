@@ -1,5 +1,8 @@
 import XCTest
 @testable import LibrarianCore
+#if canImport(CoreServices)
+import CoreServices
+#endif
 final class LiveIndexCoordinatorTests: XCTestCase {
     private func makeCatalog() throws -> Catalog { try TestSupport.makeCatalog() }
     func testCoalescingDedupesByPath(){let q=LiveCoalescingQueue(debounceInterval:0.8); q.ingest([LiveRawEvent(path:"/a/file.txt",flags:LiveRawEvent.itemModified,eventId:1)]); q.ingest([LiveRawEvent(path:"/a/file.txt",flags:LiveRawEvent.itemModified,eventId:2)]); q.ingest([LiveRawEvent(path:"/a/file.txt",flags:LiveRawEvent.itemModified,eventId:3)]); XCTAssertEqual(q.drain()?.paths,["/a/file.txt"])}
@@ -8,7 +11,7 @@ final class LiveIndexCoordinatorTests: XCTestCase {
     func testDroppedEventSetsMustScanFlag(){let q=LiveCoalescingQueue(debounceInterval:0.8); q.ingest([LiveRawEvent(path:"/",flags:LiveRawEvent.mustScanSubDirs,eventId:99)]); XCTAssertTrue(q.hasPendingFullRescan); XCTAssertTrue(q.drain()?.needsFullRescan==true); XCTAssertFalse(q.hasPendingFullRescan)}
     func testUserAndKernelDroppedAlsoTriggerRescan(){for flag in [LiveRawEvent.userDropped,LiveRawEvent.kernelDropped,LiveRawEvent.historyDone,LiveRawEvent.rootChanged]{let q=LiveCoalescingQueue(debounceInterval:0.8); q.ingest([LiveRawEvent(path:"/a/b",flags:flag,eventId:1)]); XCTAssertTrue(q.hasPendingFullRescan,"flag \(flag) must trigger rescan")}}
     func testCreateModifyDeleteOneFileProducesExpectedDelta() throws {
-        let tmp=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("live-delta-\(UUID().uuidString)")
+        let tmp=URL(fileURLWithPath:"/private/tmp").appendingPathComponent("live-delta-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:tmp)}
         let catalog=try makeCatalog(); let indexer=Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler())
         let c=LiveIndexCoordinator(catalog:catalog,indexer:indexer,broker:SourceBroker(),scheduler:Scheduler(),roots:[tmp])
@@ -27,7 +30,7 @@ final class LiveIndexCoordinatorTests: XCTestCase {
         XCTAssertTrue(mis.contains(f.path)); XCTAssertTrue(idx.isEmpty)
     }
     func testDeletionMarksMissingNeverRecreates() throws {
-        let tmp=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("live-del-\(UUID().uuidString)")
+        let tmp=URL(fileURLWithPath:"/private/tmp").appendingPathComponent("live-del-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:tmp)}
         let catalog=try makeCatalog()
         let c=LiveIndexCoordinator(catalog:catalog,indexer:Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler()),broker:SourceBroker(),scheduler:Scheduler(),roots:[tmp])
@@ -39,7 +42,7 @@ final class LiveIndexCoordinatorTests: XCTestCase {
         XCTAssertTrue(mis.contains(g)); XCTAssertTrue(idx.isEmpty); XCTAssertFalse(FileManager.default.fileExists(atPath:g))
     }
     func testStormCollapsesWithoutFullRescanWhenUnderLimit() throws {
-        let tmp=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("live-storm-\(UUID().uuidString)")
+        let tmp=URL(fileURLWithPath:"/private/tmp").appendingPathComponent("live-storm-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:tmp)}
         let catalog=try makeCatalog(); var opts=LiveIndexCoordinator.Options(); opts.maxCoalescedPaths=2_000
         let c=LiveIndexCoordinator(catalog:catalog,indexer:Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler()),broker:SourceBroker(),scheduler:Scheduler(),roots:[tmp],options:opts)
@@ -60,7 +63,7 @@ final class LiveIndexCoordinatorTests: XCTestCase {
     }
     func testCoordinatorExcludesCatalogPathsFromQueue() throws {
         let catalog=try makeCatalog()
-        let tmp=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("live-excl-\(UUID().uuidString)")
+        let tmp=URL(fileURLWithPath:"/private/tmp").appendingPathComponent("live-excl-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:tmp)}
         let c=LiveIndexCoordinator(catalog:catalog,indexer:Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler()),broker:SourceBroker(),scheduler:Scheduler(),roots:[tmp])
         var idx:[String]=[]; c.testIndexOneHandler={idx.append($0); return true}
@@ -70,9 +73,52 @@ final class LiveIndexCoordinatorTests: XCTestCase {
         c.ingest(events:[bad,LiveRawEvent(path:good,flags:LiveRawEvent.itemModified,eventId:2)])
         _ = c.flushForTesting(); XCTAssertFalse(idx.contains(bad.path)); XCTAssertTrue(idx.contains(good))
     }
+    func testExcludedPathNeverOverridesWatchedRoot() throws {
+        let root=URL(fileURLWithPath:"/private/tmp/live-exclusion-root-\(UUID().uuidString)")
+        let state=root.appendingPathComponent(".state")
+        try FileManager.default.createDirectory(at:state,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:root)}
+        let catalog=try Catalog(path:state.appendingPathComponent("catalog.db").path,key:Data("test-key".utf8))
+        let c=LiveIndexCoordinator(catalog:catalog,indexer:Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler()),broker:SourceBroker(),scheduler:Scheduler(),roots:[root])
+        var indexed:[String]=[]; c.testIndexOneHandler={indexed.append($0); return true}
+        let excluded=state.appendingPathComponent("catalog.db-wal").path
+        let included=root.appendingPathComponent("note.txt").path
+        FileManager.default.createFile(atPath:included,contents:Data("x".utf8))
+        c.ingest(events:[LiveRawEvent(path:excluded,flags:LiveRawEvent.itemModified,eventId:1),LiveRawEvent(path:included,flags:LiveRawEvent.itemModified,eventId:2)])
+        _=c.flushForTesting()
+        XCTAssertFalse(indexed.contains(excluded)); XCTAssertTrue(indexed.contains(included))
+    }
+#if canImport(CoreServices)
+    func testRealFSEventsCreateModifyDeletePathDelivery() throws {
+        let root=URL(fileURLWithPath:"/private/tmp/live-fsevents-\(UUID().uuidString)")
+        let state=root.appendingPathComponent(".state")
+        try FileManager.default.createDirectory(at:state,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:root)}
+        let catalog=try Catalog(path:state.appendingPathComponent("catalog.db").path,key:Data("test-key".utf8))
+        var options=LiveIndexCoordinator.Options(); options.debounceInterval=0.05
+        let c=LiveIndexCoordinator(catalog:catalog,indexer:Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler()),broker:SourceBroker(),scheduler:Scheduler(),roots:[root],options:options)
+        let file=root.appendingPathComponent("real-event.txt")
+        let lock=NSLock(); var received:[String]=[]; var stage=0
+        let created=XCTestExpectation(description:"real FSEvents create callback"); let modified=XCTestExpectation(description:"real FSEvents modify callback"); let removed=XCTestExpectation(description:"real FSEvents delete callback")
+        c.testIndexOneHandler={path in
+            lock.lock(); received.append(path); let currentStage=stage; lock.unlock()
+            if path==file.path && FileManager.default.fileExists(atPath:path){if currentStage==0{created.fulfill()} else if currentStage==1{modified.fulfill()}}
+            return true
+        }
+        c.testMarkMissingHandler={path in if path==file.path{removed.fulfill()}}
+        c.start(); defer{c.stop()}
+        try Data("one".utf8).write(to:file)
+        XCTAssertEqual(XCTWaiter.wait(for:[created],timeout:8),.completed)
+        lock.lock(); stage=1; lock.unlock()
+        try Data("two".utf8).write(to:file)
+        XCTAssertEqual(XCTWaiter.wait(for:[modified],timeout:8),.completed)
+        try FileManager.default.removeItem(at:file)
+        XCTAssertEqual(XCTWaiter.wait(for:[removed],timeout:8),.completed)
+        lock.lock(); let paths=received; lock.unlock()
+        XCTAssertTrue(paths.contains(file.path),"real callback path was not delivered")
+    }
+#endif
     func testDoubleFlushIsEmpty() throws {
         let catalog=try makeCatalog()
-        let tmp=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("live-fence-\(UUID().uuidString)")
+        let tmp=URL(fileURLWithPath:"/private/tmp").appendingPathComponent("live-fence-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:tmp)}
         let c=LiveIndexCoordinator(catalog:catalog,indexer:Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler()),broker:SourceBroker(),scheduler:Scheduler(),roots:[tmp])
         c.testIndexOneHandler={_ in true}; let p=tmp.appendingPathComponent("a.txt").path
@@ -88,7 +134,7 @@ final class LiveIndexCoordinatorTests: XCTestCase {
         XCTAssertFalse(low.contains("com.apple.security.files.bookmarks.document-scope"))
     }
     func testDroppedEventRecoveryTriggersSafeReconciliation() throws {
-        let tmp=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("live-drop-\(UUID().uuidString)")
+        let tmp=URL(fileURLWithPath:"/private/tmp").appendingPathComponent("live-drop-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:tmp)}
         let catalog=try makeCatalog()
         let c=LiveIndexCoordinator(catalog:catalog,indexer:Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler()),broker:SourceBroker(),scheduler:Scheduler(),roots:[tmp])
@@ -107,7 +153,7 @@ final class LiveIndexCoordinatorTests: XCTestCase {
         c.addRoot(a); XCTAssertEqual(c.currentRoots.count,2)
     }
     func testAppSleepWakeTriggersReconciliationWhenRunning() throws {
-        let tmp=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("live-wake-\(UUID().uuidString)")
+        let tmp=URL(fileURLWithPath:"/private/tmp").appendingPathComponent("live-wake-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:tmp)}
         let catalog=try makeCatalog()
         let c=LiveIndexCoordinator(catalog:catalog,indexer:Indexer(broker:SourceBroker(),catalog:catalog,scheduler:Scheduler()),broker:SourceBroker(),scheduler:Scheduler(),roots:[tmp])
@@ -117,7 +163,7 @@ final class LiveIndexCoordinatorTests: XCTestCase {
         if !did{_ = c.flushForTesting()}; XCTAssertTrue(did)
     }
     func testDirectoryDeletionMarksAllChildrenMissing() throws {
-        let tmp=URL(fileURLWithPath:NSTemporaryDirectory()).appendingPathComponent("live-dir-del-\(UUID().uuidString)")
+        let tmp=URL(fileURLWithPath:"/private/tmp").appendingPathComponent("live-dir-del-\(UUID().uuidString)")
         let sub=tmp.appendingPathComponent("sub")
         try FileManager.default.createDirectory(at:sub,withIntermediateDirectories:true); defer{try? FileManager.default.removeItem(at:tmp)}
         let catalog=try makeCatalog(); let broker=SourceBroker()

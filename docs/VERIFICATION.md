@@ -18,6 +18,15 @@ catalog encryption + wrong-key refusal + no plaintext header, duplicate
 reporting (near-duplicate control excluded), incremental re-index,
 virtual tree multi-label membership, FTS5 search, original-loss → missing.
 
+The live-indexing focused suite also verifies exclusion precedence, dropped-event
+full-rescan recovery, and a bounded create/modify/delete sequence delivered by
+a real macOS FSEventStream callback (not only synthetic event injection):
+
+```
+$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter LiveIndexCoordinatorTests
+Executed 18 tests, with 0 failures
+```
+
 ## End-to-end (scripts/e2e_local.sh, release binary)
 
 ```
