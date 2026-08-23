@@ -24,8 +24,16 @@ missing-model fail-closed path:
 
 ```
 $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter MediaIntelligenceTests
-Executed 3 tests, with 0 failures
+Executed 4 tests, with 0 failures (one real Whisper integration test is
+conditionally skipped when whisper.cpp or the pre-provisioned model is absent)
 ```
+
+On a host with `/opt/homebrew/bin/whisper-cli` and
+`~/Library/Application Support/AI Audio/Models/ggml-base.en.bin`, the fourth
+test uses macOS `say` to create a temporary speech fixture and verifies the
+complete path: broker snapshot → ffmpeg stdin → PCM → whisper.cpp → encrypted
+transcript row → transcript FTS. The source file is never passed to ffmpeg or
+Whisper; only broker-produced bytes cross the decoder boundary.
 
 ## End-to-end (scripts/e2e_local.sh, release binary)
 

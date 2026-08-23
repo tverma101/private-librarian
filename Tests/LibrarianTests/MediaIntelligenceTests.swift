@@ -83,6 +83,44 @@ final class MediaIntelligenceTests: XCTestCase {
         XCTAssertTrue(reason.contains("model unavailable"))
     }
 
+    func testProvisionedWhisperBackendIndexesRealSpeech() throws {
+        let whisperPath = Self.firstAvailablePath([
+            "/opt/homebrew/bin/whisper-cli",
+            "/usr/local/bin/whisper-cli",
+        ], executable: true)
+        let sayPath = Self.firstAvailablePath(["/usr/bin/say"], executable: true)
+        let modelPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AI Audio/Models/ggml-base.en.bin").path
+        guard let whisperPath, let sayPath,
+              FileManager.default.isReadableFile(atPath: modelPath) else {
+            throw XCTSkip("local whisper.cpp executable, macOS say, and ggml-base.en.bin are required")
+        }
+
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("media-whisper-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let media = root.appendingPathComponent("spoken.aiff")
+        try Self.renderSpeech("Private librarian keeps every original file read only", with: sayPath, to: media)
+
+        let catalog = try TestSupport.makeCatalog()
+        var options = Indexer.Options()
+        options.enableLocalASR = true
+        options.maxMediaSnapshotBytes = 16 * 1024 * 1024
+        let provider = WhisperCLITranscriptionProvider(executablePath: whisperPath, modelPath: modelPath)
+        let indexer = Indexer(broker: SourceBroker(maxSnapshotBytes: options.maxMediaSnapshotBytes),
+                              catalog: catalog, scheduler: Scheduler(), options: options,
+                              transcriptionProvider: provider)
+
+        XCTAssertTrue(try indexer.indexOne(path: media.path))
+        let row = try XCTUnwrap(try catalog.allFiles().first { $0.path == media.path })
+        let transcript = try catalog.transcripts(forFile: row.id)
+        let text = transcript.map(\.text).joined(separator: " ").lowercased()
+        XCTAssertFalse(transcript.isEmpty)
+        XCTAssertEqual(Set(transcript.map(\.provider)), Set([provider.providerID]))
+        XCTAssertTrue(text.contains("private"), "unexpected local ASR transcript: \(text)")
+        XCTAssertTrue(try catalog.searchExact("private").contains { $0.fileID == row.id })
+    }
+
     private static func makeWAV(seconds: Int) -> Data {
         let sampleRate = 16_000
         let count = sampleRate * seconds
@@ -101,5 +139,20 @@ final class MediaIntelligenceTests: XCTestCase {
         appendLE(UInt32(sampleRate * 2)); appendLE(UInt16(2)); appendLE(UInt16(16))
         wav.append(contentsOf: Data("data".utf8)); appendLE(UInt32(pcm.count)); wav.append(pcm)
         return wav
+    }
+
+    private static func firstAvailablePath(_ paths: [String], executable: Bool) -> String? {
+        paths.first { path in
+            executable ? FileManager.default.isExecutableFile(atPath: path) : FileManager.default.isReadableFile(atPath: path)
+        }
+    }
+
+    private static func renderSpeech(_ phrase: String, with executablePath: String, to output: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = ["-o", output.path, phrase]
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
     }
 }

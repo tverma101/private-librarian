@@ -44,7 +44,9 @@ Tiering: **Tier 1 Vision** (zero-download, always on) handles image labels + fea
 
 ## What is deliberately NOT here yet
 
-- OCR / speech / video sampling (Stage E) — not started.
+- OCR / speech / video sampling (Stage E) — speech has a broker-safe, opt-in
+  local Whisper seam and host-conditional integration coverage; OCR and video
+  quality remain staged work.
 - LLM-assisted classification — the seam exists (Scheduler slots +
   ClassifierContract wall) but no LLM runs; tag quality is Vision + rules.
 - ANN index — `SearchService` linear-scans the encrypted `embeddings` table; fine for <100k docs, will need `sqlite-vec` or HNSW for larger libraries.
