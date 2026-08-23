@@ -18,6 +18,13 @@ public struct LocalModelBridge: Sendable {
         case miniLMText = "all-MiniLM-L6-v2"      // 384-d text embedding (MiniLM)
     }
 
+    public static func expectedDimension(_ model: Model) -> Int {
+        switch model {
+        case .clipImage: return 512
+        case .miniLMText: return 384
+        }
+    }
+
     /// Whether the bridge can run on this machine right now (python + deps + at least one model).
     public static func isAvailable() -> Bool {
         guard let scriptsDir = scriptsDir() else { return false }
@@ -125,7 +132,8 @@ public struct LocalModelBridge: Sendable {
         public func embedImageBytes(_ bytes: Data, timeout: TimeInterval = 20) -> (dim: Int, data: Data)? {
             let b64 = bytes.base64EncodedString()
             guard let obj = call(["op": "image_b64", "data": b64], timeout: timeout),
-                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
+                  let dim = obj["dim"] as? Int, dim == LocalModelBridge.expectedDimension(.clipImage),
+                  let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
             var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
             return (dim, out)
         }
@@ -134,7 +142,8 @@ public struct LocalModelBridge: Sendable {
             let clipped = String(text.prefix(4000))
             guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             guard let obj = call(["op": "text", "data": clipped], timeout: timeout),
-                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
+                  let dim = obj["dim"] as? Int, dim == LocalModelBridge.expectedDimension(.miniLMText),
+                  let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
             var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
             return (dim, out)
         }
@@ -143,7 +152,8 @@ public struct LocalModelBridge: Sendable {
             let clipped = String(text.prefix(4000))
             guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             guard let obj = call(["op": "clip_text", "data": clipped], timeout: timeout),
-                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
+                  let dim = obj["dim"] as? Int, dim == LocalModelBridge.expectedDimension(.clipImage),
+                  let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
             var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
             return (dim, out)
         }
@@ -152,7 +162,12 @@ public struct LocalModelBridge: Sendable {
     /// Whether a specific model checkpoint is provisioned under any Models root.
     public static func isProvisioned(_ model: Model) -> Bool {
         for root in modelsRoots() {
-            if FileManager.default.fileExists(atPath: root.appendingPathComponent("\(model.rawValue)/config.json").path) {
+            let dir = root.appendingPathComponent(model.rawValue)
+            let hasConfig = FileManager.default.fileExists(atPath: dir.appendingPathComponent("config.json").path)
+            let hasWeights = ["pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack"].contains {
+                FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).path)
+            }
+            if hasConfig && hasWeights {
                 return true
             }
         }
@@ -166,7 +181,7 @@ public struct LocalModelBridge: Sendable {
         guard let scriptsDir = scriptsDir() else { return nil }
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-image", "--model", model.rawValue], input: bytes, timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        return parseEmbedding(from: result.stdout, expectedDim: expectedDimension(.clipImage))
     }
 
     /// Embed an image file (bounded read via SourceBroker path) using local CLIP.
@@ -181,7 +196,7 @@ public struct LocalModelBridge: Sendable {
         guard !data.isEmpty else { return nil }
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-image", "--model", model.rawValue], input: data, timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        return parseEmbedding(from: result.stdout, expectedDim: expectedDimension(.clipImage))
     }
 
     /// Embed text using local MiniLM (mean-pooled, L2-normalized).
@@ -194,7 +209,7 @@ public struct LocalModelBridge: Sendable {
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-text", "--model", model.rawValue],
                                input: Data(clipped.utf8), timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        return parseEmbedding(from: result.stdout, expectedDim: expectedDimension(.miniLMText))
     }
 
     /// Embed natural-language text into the CLIP joint image-text space (512-d, L2-normalized).
@@ -206,7 +221,7 @@ public struct LocalModelBridge: Sendable {
         guard let scriptsDir = scriptsDir() else { return nil }
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-clip-text"], input: Data(clipped.utf8), timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        return parseEmbedding(from: result.stdout, expectedDim: expectedDimension(.clipImage))
     }
 
     // MARK: - Catalog helpers
@@ -236,7 +251,7 @@ public struct LocalModelBridge: Sendable {
         let lines = result.stdout.split(separator: "\n")
         for (idx, line) in lines.enumerated() where idx < paths.count {
             let p = paths[idx]
-            if let parsed = parseEmbedding(from: String(line)) {
+            if let parsed = parseEmbedding(from: String(line), expectedDim: expectedDimension(.clipImage)) {
                 out[p] = parsed
             }
         }
@@ -328,11 +343,12 @@ public struct LocalModelBridge: Sendable {
 
     // MARK: - Internals
 
-    static func parseEmbedding(from json: String) -> (dim: Int, data: Data)? {
+    static func parseEmbedding(from json: String, expectedDim: Int? = nil) -> (dim: Int, data: Data)? {
         guard let raw = json.data(using: .utf8),
               let o = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
               let dim = o["dim"] as? Int,
-              let vec = o["vector"] as? [Double], vec.count == dim else { return nil }
+              let vec = o["vector"] as? [Double], vec.count == dim,
+              dim > 0, expectedDim == nil || expectedDim == dim else { return nil }
         var data = Data(capacity: dim * 4)
         for v in vec {
             var f = Float(v)

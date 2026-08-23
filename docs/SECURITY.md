@@ -28,6 +28,7 @@ rewrites a source file.
 | Pipe-buffer deadlock from large embedding JSON | Helper stdout/stderr are drained after the wait rather than read eagerly so a 512-float vector never wedges a fixed pipe buffer | LocalModelBridge.runPython |
 | Long docs lose recall past a single embedding window | Documents are chunked (900-char window, 120 overlap) into `embedding_chunks` alongside the whole-document row; search keeps the max chunk score per file | embedding_chunks + SearchService.semanticSearch |
 | Stale embedding space after a model family change | `processingVersion` carries `Index.embeddingSpaceVersion` when Tier 2 is enabled so a MiniLM→CLIP-text switch forces a one-time re-index | ChangeDetection.needsProcessing |
+| Native model path downloads or reads originals directly | MobileCLIP provisioning is a separate opt-in script; runtime accepts only broker-supplied image bytes, reads model artifacts outside authorized source roots, and fails closed when the compiled image/text pair or tokenizer is incomplete | CoreMLMobileCLIPProvider + provider-smoke |
 
 ## AI image sorting — privacy note
 
@@ -39,6 +40,11 @@ on-device Vision works without one. Downloaded models (`Models/clip-vit-base-pat
 `scripts/provision_image_models.py --all`) also run locally and offline via `scripts/embed.py` (`local_files_only=True`, `sentence_transformers` / `transformers` on CPU) bridged by `LocalModelBridge` (timeout-bounded subprocess, no shell, no network). `Models/` is outside the indexed tree.
 
 Tiering: **Tier 1 Vision** (zero-download, always on) handles image labels + feature-print dedup. **Tier 2 local embeddings** (opt-in, provisioned) add `clip-vit-base-patch32` 512-d image search (higher recall than Vision) and `all-MiniLM-L6-v2` 384-d semantic text search; when not provisioned every call returns `[]` and indexing/search never block.
+
+The genuine MobileCLIP S0 adapter is a separate 512-D joint space. It requires
+compiled `mobileclip_s0_image.mlmodelc` and `mobileclip_s0_text.mlmodelc` files
+plus the pinned CLIP BPE vocabulary. `EmbeddingProviderPreflight` reports that
+exact state; artifact presence alone never activates the provider.
 
 ## What is deliberately NOT here yet
 

@@ -87,6 +87,46 @@ final class VisionImageTests: XCTestCase {
         XCTAssertEqual(p?.dim, 3)
         XCTAssertEqual(p?.data.count, 12)
         XCTAssertNil(LocalModelBridge.parseEmbedding(from: #"{"bad":1}"#))
+        XCTAssertNil(LocalModelBridge.parseEmbedding(from: #"{"dim":3,"vector":[0.1,0.2,0.3]}"#, expectedDim: 512))
+        XCTAssertEqual(LocalModelBridge.expectedDimension(.clipImage), 512)
+        XCTAssertEqual(LocalModelBridge.expectedDimension(.miniLMText), 384)
+    }
+
+    func testProviderDecisionIsExplicitAndProvenanceIncludesPreprocessing() {
+        let python = LocalModelEmbeddingProvider()
+        XCTAssertTrue(python.providerID.contains("clip-vit-base-patch32"))
+        XCTAssertTrue(python.providerID.contains("resize224-centerCrop"))
+        XCTAssertEqual(python.preflight.providerID, python.providerID)
+
+        let native = CoreMLMobileCLIPProvider()
+        XCTAssertTrue(native.providerID.contains("mobileclip-s0"))
+        XCTAssertEqual(native.preflight.providerID, native.providerID)
+        if !native.preflight.available {
+            XCTAssertFalse(native.preflight.reason.isEmpty)
+            XCTAssertNil(native.embedImageBytes(Data([0x00])))
+            XCTAssertNil(native.embedJointText("native preflight"))
+        }
+    }
+
+    func testMobileCLIPTokenizerProducesBoundedCoreMLInput() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mobileclip-tokenizer-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(#"{"<|startoftext|>":1,"<|endoftext|>":2,"h":3,"i</w>":4}"#.utf8)
+            .write(to: root.appendingPathComponent("vocab.json"))
+        try Data("#version: 0.2\n".utf8).write(to: root.appendingPathComponent("merges.txt"))
+        guard let tokenizer = MobileCLIPTokenizer(modelRoots: [root]) else {
+            XCTFail("fixture tokenizer failed to load")
+            return
+        }
+        let tokens = tokenizer.encodeFull("hi")
+        XCTAssertEqual(tokens.count, 77)
+        XCTAssertEqual(tokens[0], 1)
+        XCTAssertEqual(tokens[1], 3)
+        XCTAssertEqual(tokens[2], 4)
+        XCTAssertEqual(tokens[3], 2)
+        XCTAssertTrue(tokens.allSatisfy { $0 >= 0 })
     }
 
     func testSemanticAndClipSearchReturnEmptyWithoutProvisionedModels() throws {

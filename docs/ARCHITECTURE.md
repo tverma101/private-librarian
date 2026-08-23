@@ -41,10 +41,12 @@ or permission-changed at the source
 | `RuleBasedClassifier` + `ClassifierContract` | Deterministic v1 classifier; its JSON output must pass schema validation or the result is discarded wholesale (contract wall). |
 | `Scheduler` | Serializes work into LOW/MEDIUM/HIGH slots so indexing never starves interactive work; also the seam where an LLM stage would be rate-limited later. |
 | `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
+| `EmbeddingProvider` | Provider-neutral image/text contract. The Python adapter remains an offline fallback; `CoreMLMobileCLIPProvider` loads the pinned genuine MobileCLIP S0 image/text pair lazily, validates 512-D output, and accepts broker bytes only. |
+| `MobileCLIPTokenizer` | Local CLIP BPE tokenizer for the Core ML text input (`[1,77]` Int32); it reads only the provisioned vocab/merges assets and never receives a source path. |
 | `Indexer` | Pipeline: enumerate → identity → extract → classify → commit, with identity re-stat immediately before commit ("changed-during-index" discard). End-of-run missing-sweep marks vanished files `missing` — never deletes anything anywhere. |
 | `DuplicateDetector` | Size-bucket → partial fingerprint (head/middle/tail 64 KiB) → full SHA-256 within matching partial groups. Report-only verdicts. |
 | `SearchService` | FTS5 query front-end with quote-escaping so user input can't break out of query syntax. |
-| `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree`. |
+| `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree` / `provider-smoke`. |
 | `LibrarianApp` | SwiftUI shell; sandboxed `.app` packaging via `scripts/package_app.sh`. |
 
 ## One path dialect (enumeration contract)

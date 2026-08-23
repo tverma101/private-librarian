@@ -23,7 +23,8 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 | **Exact duplicate detection** | ✅ **FIXED** — size-bucket → partial fingerprint → full SHA-256; report-only. The earlier breakage came from unparameterized catalog queries returning wrong rows; fixed in the same pass. |
 | Missing-file sweep | ✅ marks vanished files `missing` on re-scan; one path dialect end-to-end (see ARCHITECTURE.md). |
 | SwiftUI app shell | builds; folder picker + bookmark flow unexercised in UI tests |
-| OCR / embeddings / speech / video sampling | not started (Stage D/E) |
+| Vision image analysis + optional local embeddings | ✅ on-device Vision always works; Python Tier-2 and provider preflight are fail-closed |
+| Genuine MobileCLIP Core ML | ✅ real bytes-only runtime + tokenizer + artifact smoke command; optional model pair is not provisioned here |
 | Sandboxed .app entitlement audit in CI | script exists (`scripts/audit_entitlements.py`); wired into GitHub Actions |
 
 ## Bugs found and fixed during verification
@@ -58,7 +59,21 @@ swift test                       # mandatory security suite (19 tests)
 scripts/gen_fixtures.py /tmp/fl  # synthetic fixture tree (never your real Desktop)
 scripts/audit_entitlements.py dist/PrivateLibrarian.app
 scripts/network_negative_probe.py
+python3 scripts/bench_providers.py --providers local fileid coreml
+.build/release/librarian-cli provider-smoke --samples 5
 ```
+
+The Core ML MobileCLIP path is opt-in. Provisioning and compilation are
+separate, explicit steps:
+
+```bash
+python3 scripts/provision_mobileclip_coreml.py --download
+scripts/compile_mobileclip_coreml.sh
+```
+
+The application never downloads models and never passes a source path to an
+embedding provider. See [the upstream reuse audit](docs/UPSTREAM_REUSE.md) for
+the FileID and genuine MobileCLIP decisions.
 
 ## Architecture
 

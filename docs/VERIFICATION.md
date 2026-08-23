@@ -7,7 +7,7 @@ All receipts below are from real executed runs on this machine
 
 ```
 $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-Executed 21 tests, with 0 failures (0 unexpected) in 1.967 (1.969) seconds
+Executed 36 tests, with 0 failures (0 unexpected)
 ```
 
 Covers: immutability zero-diff, symlink breakout + broker refusal +
@@ -68,6 +68,52 @@ PASS connect localhost:1       DENIED
 PASS http fetch                DENIED
 NETWORK-NEGATIVE PASS — all attempts denied
 ```
+
+## Embedding provider decision (Issue #11 / #31)
+
+`python3 scripts/bench_providers.py --providers local fileid coreml --output /tmp/bench-providers.json`
+is an offline, read-only preflight and benchmark. It reports model/checkpoint
+identity, preprocessing identity, expected dimensions, dependency presence,
+warm-worker latency, deterministic text-to-image fixture status, retrieval
+quality status, and a WINNER/FALLBACK decision. On this checkout the observed
+decision is `winner=null`, `fallback=Vision feature-print`: the ignored model
+weights exist in the canonical checkout, but the Python runtime packages are
+not installed and the Core ML pair is not provisioned.
+
+The genuine Core ML path has an executable integration measurement:
+
+```bash
+.build/release/librarian-cli provider-smoke --samples 5
+```
+
+It either emits an explicit `unavailable` preflight record or loads both
+compiled MobileCLIP S0 models, embeds the deterministic red-square PNG and
+the query `a red square`, checks matching 512-D space IDs, and reports p50/p95
+image/text latency plus cosine similarity. The canonical checkout remains
+unprovisioned, so its normal result is the explicit unavailable record.
+
+For the pinned temporary artifact set used to validate the real runtime
+boundary (Apple `coreml-mobileclip` revision `3e0a7bfb`, plus the pinned
+OpenAI CLIP tokenizer), the receipt was:
+
+```json
+{
+  "status": "measured",
+  "provider": "coreml-mobileclip-s0:apple/coreml-mobileclip@3e0a7bfb:prep-408bdc1b",
+  "dimensions": {"image": 512, "text": 512},
+  "cold_image_latency_ms": 300.94,
+  "cold_text_latency_ms": 107.33,
+  "image_latency_ms": {"p50": 64.21, "p95": 64.40},
+  "text_latency_ms": {"p50": 65.49, "p95": 66.24},
+  "text_to_image_cosine": 0.259351,
+  "warm_calls": 5
+}
+```
+
+This proves genuine bytes-only Core ML inference and matching image/text
+dimensions. It is not a Golden Library retrieval-quality win, so the native
+provider remains opt-in and Python remains the fallback until Recall@K is
+measured on the shared labeled fixture.
 
 ## Reproduce
 

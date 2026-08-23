@@ -31,6 +31,7 @@ MODEL_HANDLERS = {
     "clip-vit-base-patch32": "clip",
     "all-MiniLM-L6-v2": "minilm",
 }
+MODEL_DIMS = {"clip-vit-base-patch32": 512, "all-MiniLM-L6-v2": 384}
 
 # Lazy singletons — keep model warm within one process invocation (batch mode)
 _clip_model = None
@@ -244,10 +245,14 @@ def main():
     if args.check:
         ok = _check_deps()
         # Also verify at least one model is provisioned
-        any_model = any((MODELS_DIR / m / "config.json").exists() for m in MODEL_HANDLERS)
+        any_model = any((MODELS_DIR / m / "config.json").exists() and any(
+            (MODELS_DIR / m / w).exists() for w in ("pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack")
+        ) for m in MODEL_HANDLERS)
         if not any_model:
             print(json.dumps({"error": "no models provisioned under Models/"}), file=sys.stderr)
             sys.exit(2)
+        print(json.dumps({"status": "ready", "models_dir": str(MODELS_DIR), "dimensions": MODEL_DIMS,
+                          "offline": True}))
         sys.exit(0 if ok else 1)
 
     if args.batch_images_manifest:
