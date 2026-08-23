@@ -18,6 +18,15 @@ catalog encryption + wrong-key refusal + no plaintext header, duplicate
 reporting (near-duplicate control excluded), incremental re-index,
 virtual tree multi-label membership, FTS5 search, original-loss → missing.
 
+Media verification additionally covers complete snapshot policy, real local
+PCM decoding into timestamped chunks, transcript persistence/search, and the
+missing-model fail-closed path:
+
+```
+$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter MediaIntelligenceTests
+Executed 3 tests, with 0 failures
+```
+
 ## End-to-end (scripts/e2e_local.sh, release binary)
 
 ```

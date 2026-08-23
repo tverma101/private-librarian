@@ -20,6 +20,8 @@ rewrites a source file.
 | Silent downgrade to unencrypted sqlite | `Catalog.onDiskHeaderIsPlaintextSQLite` checks the on-disk header; CLI prints `encrypted-on-disk=` every run | E2E receipts |
 | Duplicate detector deleting "copies" | Detector is report-only by construction — it has no delete API | BehaviorTests assert both copies still exist |
 | Deleted originals ghosting in search results | Missing-sweep marks rows `missing`; nothing is reconstructed or deleted twice | ResilienceTests.testOriginalLossIsRecordedNotRepaired |
+| Truncated media container reaching a decoder | Complete snapshots reject oversize sources instead of decoding a prefix; decoder receives broker stdin only | MediaIntelligenceTests.testBrokerCompleteSnapshotIsNotTruncatedAndFailsClosed |
+| ASR accidentally running without a local model | Whisper backend preflight requires an executable and readable model; Indexer ASR is opt-in | MediaIntelligenceTests.testWhisperBackendPreflightReportsMissingLocalModel |
 | Over-broad entitlements in packaged app | App Sandbox ON, `user-selected.read-only`, bookmarks app-scope; auditor fails on any write/network/audio/photos entitlement | scripts/audit_entitlements.py in CI |
 | Network exfiltration from the app | No network entitlements; network-negative probe expects all four connection classes DENIED | scripts/network_negative_probe.py |
 | Image inference leaks to cloud | All AI image sorting runs 100% on-device: Apple Vision (`VNClassifyImageRequest`/`VNGenerateImageFeaturePrintRequest`) + optional local models from `Models/`; no network entitlement, no download in CI, no telemetry | VisionImageAnalyzer + LocalModelBridge + scripts/embed.py |

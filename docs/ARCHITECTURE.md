@@ -33,11 +33,12 @@ or permission-changed at the source
 
 | Module | Responsibility |
 |---|---|
-| `SourceBroker` | The ONLY component that touches source paths. Opens files `O_RDONLY\|O_NOFOLLOW`, refuses symlinks and non-regular files, bounded reads (`boundedRead` / `readSlice` / `streamBounded`). Enumeration walks breadth-first with per-directory sort, records symlinks as metadata and **never descends into them**, skips packages/bundles. Reported paths are built by joining names onto the caller's root spelling — see "One path dialect" below. |
+| `SourceBroker` | The ONLY component that touches source paths. Opens files `O_RDONLY\|O_NOFOLLOW`, refuses symlinks and non-regular files, bounded reads plus complete fail-closed snapshots (`completeSnapshot` / `streamCompleteSnapshot`) for decoder/container APIs. Enumeration walks breadth-first with per-directory sort, records symlinks as metadata and **never descends into them**, skips packages/bundles. Reported paths are built by joining names onto the caller's root spelling — see "One path dialect" below. |
 | `SafeReader` semantics | Every read goes through the broker's no-follow fd; a file swapped for a symlink between stat and open fails with ELOOP instead of leaking content. |
 | `FileIdentity` / `FileID` | lstat-level identity (size, mtime, ctime, fs file id). Catalog ids are SHA-256 of the path only — stable across edits so child rows (text, classifications, hashes) survive re-indexing. |
 | `EvidenceExtractor` | Bounded evidence: UTF-8 sample, magic-byte sniffing, cloud-placeholder detection (never hydrates). |
 | `PDFText` / `OfficeContainer` | Content extraction through the read-only fd; malformed input yields empty evidence, never a crash. |
+| `BrokerPCMDecoder` / `WhisperCLITranscriptionProvider` | Optional local-only media path: complete broker snapshot → ffmpeg stdin → bounded timestamped PCM → preflighted local ASR. No indexed source path is passed to the decoder or model. |
 | `RuleBasedClassifier` + `ClassifierContract` | Deterministic v1 classifier; its JSON output must pass schema validation or the result is discarded wholesale (contract wall). |
 | `Scheduler` | Serializes work into LOW/MEDIUM/HIGH slots so indexing never starves interactive work; also the seam where an LLM stage would be rate-limited later. |
 | `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, hashes, errors. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |

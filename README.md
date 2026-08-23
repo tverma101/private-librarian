@@ -23,7 +23,8 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 | **Exact duplicate detection** | ✅ **FIXED** — size-bucket → partial fingerprint → full SHA-256; report-only. The earlier breakage came from unparameterized catalog queries returning wrong rows; fixed in the same pass. |
 | Missing-file sweep | ✅ marks vanished files `missing` on re-scan; one path dialect end-to-end (see ARCHITECTURE.md). |
 | SwiftUI app shell | builds; folder picker + bookmark flow unexercised in UI tests |
-| OCR / embeddings / speech / video sampling | not started (Stage D/E) |
+| Media probe + broker-safe PCM decode + transcript FTS | ✅ fixture-tested; ASR opt-in and fail-closed without a local model |
+| OCR / embeddings / speech inference / video sampling | partial: local ASR backend is wired behind preflight; no model is provisioned on this host |
 | Sandboxed .app entitlement audit in CI | script exists (`scripts/audit_entitlements.py`); wired into GitHub Actions |
 
 ## Bugs found and fixed during verification

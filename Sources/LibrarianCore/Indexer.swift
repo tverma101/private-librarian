@@ -17,6 +17,11 @@ public final class Indexer: @unchecked Sendable {
         /// requires `Models/` provisioned and `scripts/embed.py` deps. When off,
         /// no subprocess is ever spawned. Set true for opt-in higher recall.
         public var enableLocalEmbeddings = false
+        /// Explicit opt-in for decode/ASR. The default remains metadata-only.
+        public var enableLocalASR = false
+        /// Complete container snapshot ceiling for probe/video APIs that need
+        /// random access. Oversize media is analyzed no further.
+        public var maxMediaSnapshotBytes: Int64 = 256 * 1024 * 1024
         public init() {}
     }
 
@@ -218,8 +223,8 @@ public final class Indexer: @unchecked Sendable {
         // Sparse video sampling (self-contained, no audio decode). Runs under MEDIUM slot.
         var videoFrameCount: Int = 0
         if ident.kind == .video {
-            // Bounded read for sampling — do not reopen original path
-            if let vBytes = try? broker.boundedRead(ident.path, limit: 32 * 1024 * 1024), !vBytes.isEmpty {
+            // Complete broker snapshot for sampling; oversize containers fail closed.
+            if let vBytes = try? broker.completeSnapshot(ident.path, maxBytes: options.maxMediaSnapshotBytes), !vBytes.isEmpty {
                 let ext = (ident.path as NSString).pathExtension
                 videoFrameCount = scheduler.perform(as: .medium) {
                     VideoSampler.sampleFrames(bytes: vBytes, fileExtension: ext.isEmpty ? nil : ext)
@@ -232,15 +237,22 @@ public final class Indexer: @unchecked Sendable {
         var stagedTranscript: (provider: String, segments: [TranscriptSegment])? = nil
         if ident.kind == .audio || ident.kind == .video {
             let ext = (ident.path as NSString).pathExtension
-            // Bounded bytes for probe — never reopens path inside AudioProbe
-            if let mBytes = try? broker.boundedRead(ident.path, limit: 16 * 1024 * 1024), !mBytes.isEmpty {
+            // Complete broker snapshot for probe — never reopens path inside AudioProbe.
+            if let mBytes = try? broker.completeSnapshot(ident.path, maxBytes: options.maxMediaSnapshotBytes), !mBytes.isEmpty {
                 let decision = AudioProbe.probe(bytes: mBytes, fileExtension: ext.isEmpty ? nil : ext, tagHint: nil)
-                if decision.shouldTranscribe {
+                if decision.shouldTranscribe, options.enableLocalASR {
                     // Only run when not Disabled — cheap check before any PCM work
                     if !(transcriptionProvider is DisabledSpeechTranscriptionProvider) {
-                        // For now: empty PCM chunks — provider returns nil for disabled/inert
-                        // Real PCM decode via AVFoundation will populate chunks when provider is enabled
-                        if let segs = scheduler.perform(as: .medium, { transcriptionProvider.transcribe([]) }), !segs.isEmpty {
+                        let decoder = BrokerPCMDecoder(maxSnapshotBytes: options.maxMediaSnapshotBytes)
+                        var pcmChunks: [PCMChunk] = []
+                        try? scheduler.perform(as: .medium) {
+                            try decoder.decode(path: ident.path, broker: broker) { chunk in
+                                pcmChunks.append(chunk)
+                            }
+                        }
+                        if !pcmChunks.isEmpty,
+                           let segs = scheduler.perform(as: .heavy, { transcriptionProvider.transcribe(pcmChunks) }),
+                           !segs.isEmpty {
                             stagedTranscript = (transcriptionProvider.providerID, segs)
                         }
                     }

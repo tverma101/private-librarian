@@ -51,6 +51,112 @@ public struct DisabledSpeechTranscriptionProvider: SpeechTranscriptionProvider {
     public func transcribe(_ chunks: [PCMChunk]) -> [TranscriptSegment]? { nil }
 }
 
+/// Local whisper.cpp CLI adapter. The provider is intentionally opt-in and
+/// fails closed when either the executable or a pre-provisioned model is
+/// absent. It receives only PCM chunks; the temporary WAV path is an adapter
+/// implementation detail and never the indexed source path.
+public struct WhisperCLITranscriptionProvider: SpeechTranscriptionProvider {
+    public let providerID = "whisper.cpp-cli"
+    public let executablePath: String
+    public let modelPath: String
+
+    public init(executablePath: String = "/opt/homebrew/bin/whisper-cli", modelPath: String) {
+        self.executablePath = executablePath
+        self.modelPath = modelPath
+    }
+
+    public enum Preflight: Sendable, Equatable {
+        case available
+        case unavailable(String)
+    }
+
+    public static func preflight(executablePath: String = "/opt/homebrew/bin/whisper-cli",
+                                 modelPath: String) -> Preflight {
+        guard FileManager.default.isExecutableFile(atPath: executablePath) else {
+            return .unavailable("ASR executable unavailable: \(executablePath)")
+        }
+        guard FileManager.default.isReadableFile(atPath: modelPath) else {
+            return .unavailable("ASR model unavailable: \(modelPath)")
+        }
+        return .available
+    }
+
+    public func transcribe(_ chunks: [PCMChunk]) -> [TranscriptSegment]? {
+        guard !chunks.isEmpty,
+              case .available = Self.preflight(executablePath: executablePath, modelPath: modelPath),
+              let wav = try? Self.makeWAV(chunks: chunks) else { return nil }
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("librarian-asr-\(UUID().uuidString)")
+        let input = dir.appendingPathComponent("input.wav")
+        let outputBase = dir.appendingPathComponent("result")
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: dir) }
+            try wav.write(to: input, options: .atomic)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = ["-m", modelPath, "-f", input.path, "-oj", "-of", outputBase.path,
+                                 "-np", "-l", "en"]
+            let errorPipe = Pipe()
+            process.standardError = errorPipe
+            process.standardOutput = Pipe()
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let jsonURL = outputBase.appendingPathExtension("json")
+            guard let data = try? Data(contentsOf: jsonURL),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rows = object["transcription"] as? [[String: Any]] else { return nil }
+            return rows.compactMap { row in
+                let text = (row["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { return nil }
+                let timestamps = row["timestamps"] as? [String: Any]
+                let offsets = row["offsets"] as? [String: Any]
+                let start = Self.timestamp(timestamps?["from"] as? String) ??
+                    (offsets?["from"] as? NSNumber).map { $0.doubleValue / 1000.0 } ?? 0
+                let end = Self.timestamp(timestamps?["to"] as? String) ??
+                    (offsets?["to"] as? NSNumber).map { $0.doubleValue / 1000.0 } ?? start
+                return TranscriptSegment(start: start, end: max(start, end), text: text)
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    private static func timestamp(_ value: String?) -> TimeInterval? {
+        guard let value else { return nil }
+        let parts = value.replacingOccurrences(of: ",", with: ".").split(separator: ":")
+        guard parts.count == 3,
+              let hours = Double(parts[0]), let minutes = Double(parts[1]), let seconds = Double(parts[2]) else { return nil }
+        return hours * 3600 + minutes * 60 + seconds
+    }
+
+    private static func makeWAV(chunks: [PCMChunk]) throws -> Data {
+        guard let first = chunks.first, first.sampleRate > 0, first.channels == 1,
+              chunks.allSatisfy({ $0.sampleRate == first.sampleRate && $0.channels == 1 }) else {
+            throw MediaDecoderError.invalidConfiguration
+        }
+        var pcm = Data()
+        for chunk in chunks {
+            for sample in chunk.samples {
+                let value = Int16(max(-1, min(1, sample)) * 32767).littleEndian
+                withUnsafeBytes(of: value) { pcm.append(contentsOf: $0) }
+            }
+        }
+        var wav = Data("RIFF".utf8)
+        func appendLE<T: FixedWidthInteger>(_ value: T) {
+            var v = value.littleEndian
+            withUnsafeBytes(of: &v) { wav.append(contentsOf: $0) }
+        }
+        appendLE(UInt32(36 + pcm.count)); wav.append(contentsOf: Data("WAVEfmt ".utf8))
+        appendLE(UInt32(16)); appendLE(UInt16(1)); appendLE(UInt16(1))
+        appendLE(UInt32(first.sampleRate)); appendLE(UInt32(first.sampleRate * 2))
+        appendLE(UInt16(2)); appendLE(UInt16(16)); wav.append(contentsOf: Data("data".utf8))
+        appendLE(UInt32(pcm.count)); wav.append(pcm)
+        return wav
+    }
+}
+
 /// Cheap gating result produced before expensive ASR. Future AVFoundation-based
 /// probing can populate this from bounded metadata/audio samples while keeping
 /// the original file under SourceBroker authority.

@@ -587,7 +587,7 @@ public final class Catalog: @unchecked Sendable {
     public func searchExact(_ q: String, limit: Int = 50) throws -> [SearchHit] {
         // Escape double quotes so user input cannot break out of the FTS query syntax.
         let safe = q.replacingOccurrences(of: "\"", with: "\"\"")
-        return try query("""
+        let textHits = try query("""
             SELECT f.id, f.path, snippet(text_fts, 1, '[', ']', '…', 12), bm25(text_fts)
             FROM text_fts JOIN files f ON f.id = text_fts.file_id
             WHERE text_fts MATCH ?
@@ -597,6 +597,23 @@ public final class Catalog: @unchecked Sendable {
             SearchHit(fileID: r.text(0) ?? "", path: r.text(1) ?? "",
                       snippet: r.text(2), rank: r.real(3))
         }
+        let transcriptHits = try query("""
+            SELECT f.id, f.path, snippet(transcripts_fts, 1, '[', ']', '…', 12), bm25(transcripts_fts)
+            FROM transcripts_fts JOIN files f ON f.id = transcripts_fts.file_id
+            WHERE transcripts_fts MATCH ?
+            ORDER BY bm25(transcripts_fts)
+            LIMIT ?
+            """, binds: [.text("\"" + safe + "\""), .int(Int64(limit))]) { r in
+            SearchHit(fileID: r.text(0) ?? "", path: r.text(1) ?? "",
+                      snippet: r.text(2), rank: r.real(3))
+        }
+        var merged: [SearchHit] = []
+        var seen = Set<String>()
+        for hit in textHits + transcriptHits where seen.insert(hit.fileID).inserted {
+            merged.append(hit)
+            if merged.count == limit { break }
+        }
+        return merged
     }
 
     public func allFiles(statuses: [String]? = nil) throws -> [(id: String, path: String, size: Int64, mtime: Double, kind: String, status: String)] {
