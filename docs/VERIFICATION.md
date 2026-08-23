@@ -69,6 +69,24 @@ PASS http fetch                DENIED
 NETWORK-NEGATIVE PASS — all attempts denied
 ```
 
+## Synthetic library benchmark (Issue #10)
+
+Direct release-binary run on August 23, 2026 with
+`python3 scripts/benchmark_librarian.py --files 10000 --search-iters 5`:
+
+```
+cold index:       61.39 s   163.0 files/s   26.8 MB RSS   10006 indexed
+warm index:        1.079 s  9275.9 files/s  26.8 MB RSS       0 indexed
+one-file change:   1.139 s  8783.6 files/s  26.8 MB RSS       1 indexed
+duplicate pass:    0.546 s                    2 groups
+FTS search:      p50 111.08 ms / p95 112.91 ms
+catalog size: 15,904,768 bytes; fixture bytes: 1,202,644
+```
+
+The optional 100k run was started against the release binary but cancelled
+after roughly 20 minutes without a completed result; no 100k performance claim
+is made. The cancellation left no worker process or result artifact.
+
 ## Reproduce
 
 ```bash
