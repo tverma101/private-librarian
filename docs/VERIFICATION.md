@@ -7,7 +7,7 @@ All receipts below are from real executed runs on this machine
 
 ```
 $ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-Executed 21 tests, with 0 failures (0 unexpected) in 1.967 (1.969) seconds
+Executed 37 tests, with 0 failures (0 unexpected)
 ```
 
 Covers: immutability zero-diff, symlink breakout + broker refusal +
@@ -17,6 +17,15 @@ deletion), prompt-injection inertness, malformed-file resilience,
 catalog encryption + wrong-key refusal + no plaintext header, duplicate
 reporting (near-duplicate control excluded), incremental re-index,
 virtual tree multi-label membership, FTS5 search, original-loss → missing.
+
+The OCR-focused suite also verifies that complete snapshots ignore the normal
+evidence read cap and reject an over-policy container instead of returning a
+truncated PDF prefix:
+
+```
+$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter OCRVisionTests
+Executed 5 tests, with 0 failures
+```
 
 ## End-to-end (scripts/e2e_local.sh, release binary)
 

@@ -195,7 +195,8 @@ public final class Indexer: @unchecked Sendable {
         // never sees the raw filesystem path.
         var imageBytes: Data? = nil
         if ident.kind == .image {
-            imageBytes = try? broker.boundedRead(ident.path, limit: Int64(VisionImageAnalyzer.maxVisionBytes))
+            let limit = options.enableOCR ? Int64(VisionOCR.maxImageBytes) : Int64(VisionImageAnalyzer.maxVisionBytes)
+            imageBytes = try? broker.completeSnapshot(ident.path, maxBytes: limit)
         }
 
         // 2b. OCR injection after PDF/Office extraction — broker-bytes only, MEDIUM scheduler.

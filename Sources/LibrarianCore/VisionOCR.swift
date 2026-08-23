@@ -90,7 +90,10 @@ public struct VisionOCR: Sendable {
         guard Self.needsOCR(pdfText: pdfText) else { return nil }
 #if canImport(PDFKit) && canImport(Vision)
 #if canImport(AppKit)
-        guard let data = try? broker.boundedRead(path, limit: Int64(Self.maxImageBytes)), !data.isEmpty else { return nil }
+        // The PDF container itself is complete; maxImageBytes applies only to
+        // each rendered image passed into Vision, not to the compressed PDF
+        // prefix used to create the PDFDocument.
+        guard let data = try? broker.completeSnapshot(path), !data.isEmpty else { return nil }
         guard let doc = PDFDocument(data: data), doc.pageCount > 0 else { return nil }
         let pageLimit = min(doc.pageCount, 10)
         var allLines: [Line] = []

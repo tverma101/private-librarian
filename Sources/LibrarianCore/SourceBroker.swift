@@ -20,10 +20,16 @@ public struct SourceBroker: Sendable {
     /// Files larger than this are treated as huge: metadata-only unless a
     /// worker explicitly streams within the cap.
     public let hugeFileThreshold: Int64
+    /// Maximum complete snapshot permitted for decoder/container APIs. A
+    /// source larger than this is rejected rather than partially decoded.
+    public let maxSnapshotBytes: Int64
 
-    public init(maxReadBytes: Int64 = 8 * 1024 * 1024, hugeFileThreshold: Int64 = 2 * 1024 * 1024 * 1024) {
+    public init(maxReadBytes: Int64 = 8 * 1024 * 1024,
+                hugeFileThreshold: Int64 = 2 * 1024 * 1024 * 1024,
+                maxSnapshotBytes: Int64 = 256 * 1024 * 1024) {
         self.maxReadBytes = maxReadBytes
         self.hugeFileThreshold = hugeFileThreshold
+        self.maxSnapshotBytes = maxSnapshotBytes
     }
 
     // MARK: - Identity
@@ -230,6 +236,44 @@ public struct SourceBroker: Sendable {
         }
     }
 
+    /// Stream a complete broker-owned snapshot. Container decoders must never
+    /// receive a truncated prefix because valid metadata may live at EOF.
+    public func streamCompleteSnapshot(_ path: String, maxBytes: Int64? = nil,
+                                       _ body: (Data, Bool) throws -> Void) throws {
+        let cap = min(maxBytes ?? maxSnapshotBytes, maxSnapshotBytes)
+        guard cap > 0 else { throw BrokerError.snapshotTooLarge(size: 0, limit: cap) }
+        try withReadOnlyHandle(path) { fd in
+            var st = stat()
+            guard fstat(fd, &st) == 0 else { throw BrokerError.openFailed(errno) }
+            let declaredSize = Int64(st.st_size)
+            guard declaredSize <= cap else { throw BrokerError.snapshotTooLarge(size: declaredSize, limit: cap) }
+            var total: Int64 = 0
+            let chunkSize = 262_144
+            let chunk = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+            defer { chunk.deallocate() }
+            while true {
+                let got = read(fd, chunk, chunkSize)
+                if got < 0 {
+                    if errno == EINTR { continue }
+                    throw BrokerError.openFailed(errno)
+                }
+                if got == 0 { break }
+                total += Int64(got)
+                guard total <= cap else { throw BrokerError.snapshotTooLarge(size: total, limit: cap) }
+                try body(Data(bytes: chunk, count: got), false)
+            }
+            try body(Data(), true)
+        }
+    }
+
+    public func completeSnapshot(_ path: String, maxBytes: Int64? = nil) throws -> Data {
+        var out = Data()
+        try streamCompleteSnapshot(path, maxBytes: maxBytes) { chunk, isLast in
+            if !isLast { out.append(chunk) }
+        }
+        return out
+    }
+
     /// Safe metadata that never requires opening content:
     /// size, dates, kind, plus UTType description string.
     public func safeMetadata(for ident: FileIdentity) -> [String: String] {
@@ -325,6 +369,7 @@ public enum BrokerError: Error, CustomStringConvertible, Sendable {
     case openFailed(Int32)
     case isSymlink
     case notRegularFile
+    case snapshotTooLarge(size: Int64, limit: Int64)
 
     public var description: String {
         switch self {
@@ -332,6 +377,7 @@ public enum BrokerError: Error, CustomStringConvertible, Sendable {
         case .openFailed(let e): return "open failed errno=\(e)"
         case .isSymlink: return "refusing to open symlink"
         case .notRegularFile: return "not a regular file"
+        case .snapshotTooLarge(let size, let limit): return "complete snapshot too large (size=\(size), limit=\(limit))"
         }
     }
 }

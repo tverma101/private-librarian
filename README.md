@@ -23,7 +23,7 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 | **Exact duplicate detection** | ✅ **FIXED** — size-bucket → partial fingerprint → full SHA-256; report-only. The earlier breakage came from unparameterized catalog queries returning wrong rows; fixed in the same pass. |
 | Missing-file sweep | ✅ marks vanished files `missing` on re-scan; one path dialect end-to-end (see ARCHITECTURE.md). |
 | SwiftUI app shell | builds; folder picker + bookmark flow unexercised in UI tests |
-| OCR / embeddings / speech / video sampling | not started (Stage D/E) |
+| OCR | ✅ broker-byte Vision OCR + scanned-PDF fallback; complete-container snapshot policy; no source writes |
 | Sandboxed .app entitlement audit in CI | script exists (`scripts/audit_entitlements.py`); wired into GitHub Actions |
 
 ## Bugs found and fixed during verification
@@ -54,11 +54,16 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 
 ```bash
 swift build                      # all targets
-swift test                       # mandatory security suite (19 tests)
+  swift test                       # mandatory security suite (37 tests)
 scripts/gen_fixtures.py /tmp/fl  # synthetic fixture tree (never your real Desktop)
 scripts/audit_entitlements.py dist/PrivateLibrarian.app
 scripts/network_negative_probe.py
 ```
+
+OCR container reads use the broker's complete-snapshot API with an explicit
+fail-closed size ceiling. Images passed to OCR may be capped for Vision's
+per-image policy, but compressed PDF/image containers are never silently
+parsed from a truncated prefix.
 
 ## Architecture
 

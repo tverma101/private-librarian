@@ -1,8 +1,93 @@
 import XCTest
 import Vision
+import PDFKit
+import CoreGraphics
+import ImageIO
 @testable import LibrarianCore
 
 final class OCRVisionTests: XCTestCase {
+
+    private func paddedJPEG(minimumBytes: Int) throws -> Data {
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(data: nil, width: 64, height: 64,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: space,
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+            throw XCTSkip("CoreGraphics image fixture unavailable")
+        }
+        context.setFillColor(CGColor(gray: 0.7, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+        guard let image = context.makeImage() else { throw XCTSkip("image fixture unavailable") }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil) else {
+            throw XCTSkip("ImageIO JPEG fixture unavailable")
+        }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw XCTSkip("JPEG fixture failed") }
+        let base = output as Data
+        guard base.count > 2, base[0] == 0xFF, base[1] == 0xD8 else { throw XCTSkip("JPEG fixture missing SOI") }
+
+        var padded = Data(base.prefix(2))
+        var remaining = max(0, minimumBytes - base.count)
+        while remaining > 0 {
+            let payload = min(65_533, max(1, remaining - 4))
+            let segmentLength = UInt16(payload + 2)
+            padded.append(contentsOf: [0xFF, 0xFE,
+                                        UInt8(segmentLength >> 8), UInt8(segmentLength & 0xFF)])
+            padded.append(Data(repeating: 0, count: payload))
+            remaining -= payload + 4
+        }
+        padded.append(contentsOf: base.dropFirst(2))
+        return padded
+    }
+
+    private func paddedPDF(minimumBytes: Int) throws -> Data {
+        let document = PDFDocument()
+        document.insert(PDFPage(), at: 0)
+        guard let base = document.dataRepresentation() else { throw XCTSkip("PDF fixture unavailable") }
+        var result = base
+        result.append(Data("\n".utf8))
+        if result.count < minimumBytes {
+            result.append(Data(repeating: 0x20, count: minimumBytes - result.count))
+        }
+        return result
+    }
+
+    func testCompleteSnapshotNeverReturnsAContainerPrefix() throws {
+        let broker = SourceBroker(maxReadBytes: 64, maxSnapshotBytes: 2 * 1024 * 1024)
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("snapshot-\(UUID().uuidString).pdf")
+        let bytes = Data(repeating: 0x5A, count: 256 * 1024)
+        try bytes.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        XCTAssertEqual(try broker.completeSnapshot(tmp.path), bytes)
+        XCTAssertThrowsError(try broker.completeSnapshot(tmp.path, maxBytes: 128 * 1024))
+    }
+
+    func testOversizedImageContainerIsCompleteAboveVisionEvidenceCap() throws {
+        let bytes = try paddedJPEG(minimumBytes: Int(VisionImageAnalyzer.maxVisionBytes) + 1)
+        XCTAssertGreaterThan(Int64(bytes.count), VisionImageAnalyzer.maxVisionBytes)
+        XCTAssertNotNil(CGImageSourceCreateWithData(bytes as CFData, nil))
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("large-image-\(UUID().uuidString).jpg")
+        try bytes.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let broker = SourceBroker(maxReadBytes: 64, maxSnapshotBytes: Int64(VisionOCR.maxImageBytes))
+        let snapshot = try broker.completeSnapshot(url.path, maxBytes: Int64(VisionOCR.maxImageBytes))
+        XCTAssertEqual(snapshot, bytes, "OCR must receive a complete image container, not the old 8 MiB prefix")
+    }
+
+    func testOversizedPDFContainerIsCompleteAndNotPrefixDecoded() throws {
+        let bytes = try paddedPDF(minimumBytes: 20 * 1024 * 1024 + 1)
+        XCTAssertGreaterThan(bytes.count, 20 * 1024 * 1024)
+        XCTAssertNotNil(PDFDocument(data: bytes))
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("large-pdf-\(UUID().uuidString).pdf")
+        try bytes.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let broker = SourceBroker(maxReadBytes: 64, maxSnapshotBytes: 256 * 1024 * 1024)
+        let snapshot = try broker.completeSnapshot(url.path)
+        XCTAssertEqual(snapshot, bytes, "PDF parsing must use the complete broker snapshot")
+    }
 
     func testMalformedBytesReturnNil() {
         let ocr = VisionOCR()
