@@ -42,8 +42,8 @@ final class PromptInjectionTests: XCTestCase {
             #"{"file_id":"file_abc123","categories":["Ok"],"description":"","confidence":4.2,"reason_codes":[]}"#,
             // Oversized description.
             #"{"file_id":"file_abc123","categories":["Ok"],"description":"# + "\"" + String(repeating: "x", count: 5000) + "\"" + #","confidence":0.5,"reason_codes":[]}"#,
-            // Non-file id (not opaque).
-            #"{"file_id":"/Users/tejas/Desktop/secret.pdf","categories":["Ok"],"description":"","confidence":0.5,"reason_codes":[]}"#,
+            // Non-file id (not opaque). Use a neutral fake path in public tests.
+            #"{"file_id":"/Users/example/Desktop/secret.pdf","categories":["Ok"],"description":"","confidence":0.5,"reason_codes":[]}"#,
         ]
         for json in hostile {
             let parsed = try? JSONDecoder().decode(ClassifierContract.RawClassification.self, from: Data(json.utf8))
