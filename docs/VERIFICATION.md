@@ -1,261 +1,148 @@
-# Verification Receipts
+# Verification
 
-All receipts below are from real executed runs on this machine
-(macOS 26.6, Apple Silicon, Xcode toolchain Swift 6.3.3). The original
-baseline receipts are dated August 21 2026; the integrated suite and safety
-receipts were re-run August 25 2026.
+This page describes how to verify the current repository and how to interpret the measurements recorded here.
 
-## Unit / integration suite
+## Source of truth
 
-```
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-Executed 116 tests, with 0 failures (0 unexpected)
-```
+For a current commit, GitHub Actions and a fresh local run are the source of truth. Historical benchmark numbers below are useful for comparison, but they are not release guarantees.
 
-Re-run August 28 2026 on the integrated tree including the new
-SearchService filter tests and the Tier-2 Indexer→provider→catalog→search
-integration test (no model artifacts required; the injected fixture provider
-exercises the real seams with unchanged-scan zero work asserted).
+The integrated branch has three CI jobs:
 
-Covers: immutability zero-diff, symlink breakout + broker refusal +
-TOCTOU swap, root-spelling contract (`/` and trailing-slash roots never
-double-slash), unreadable-directory tolerance (EACCES never counts as
-deletion), prompt-injection inertness, malformed-file resilience,
-catalog encryption + wrong-key refusal + no plaintext header, duplicate
-reporting (near-duplicate control excluded), incremental re-index,
-virtual tree multi-label membership, FTS5 search, original-loss → missing,
-live FSEvents reconciliation, complete decoder snapshots, OCR, media
-transcription, screenshot intelligence, similarity families, embeddings,
-per-root onboarding coverage, and roadmap foundation behavior.
+- `test` — build, full Swift test suite, Tier-2 provider contract, and vendored SQLCipher provenance checks;
+- `quality` — deterministic Golden Library metric/schema checks;
+- `entitlement-audit` — release build, local E2E verification, packaged-app entitlement audit, and network-negative probe.
 
-The quality benchmark's built-in `synthetic-golden-v1` fixture evaluates the
-same labeled cases for Python, FileID/OpenCLIP-compatible, and Apple
-MobileCLIP provider records. It reports screenshot macro-F1, exact/near
-duplicate precision/recall/F1, semantic Recall@10, cluster purity and
-completeness, OCR recovery, review precision/coverage, and correction
-reduction. Runtime status is kept separate from fixture quality; the
-MobileCLIP record remains explicitly unavailable without model artifacts and
-an I/O contract fixture.
+CI also rejects public-repository hygiene mistakes such as tracked credential/signing files, downloaded model folders, and real-looking personal `/Users/...` paths in source/tests/docs.
 
-```
-$ python3 scripts/benchmark_quality.py --output /tmp/private-librarian-quality.json
-{"schema": 2, "golden_library": "synthetic-golden-v1", ...,
- "provider_comparisons": [{"provider_id": "python-transformers", ...}, ...]}
-```
+## Reproduce the normal checks
 
-The command emits the complete JSON document; the abbreviated line above
-records the observed schema and provider-comparison fields without claiming a
-single-line human-readable format.
-
-The live-indexing focused suite also verifies exclusion precedence, dropped-event
-full-rescan recovery, and a bounded create/modify/delete sequence delivered by
-a real macOS FSEventStream callback (not only synthetic event injection):
-
-```
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter LiveIndexCoordinatorTests
-Executed 18 tests, with 0 failures
-```
-
-The decoder boundary is covered by `VisionImageTests`: a valid JPEG container
-larger than the 8 MiB evidence cap is snapshotted byte-for-byte, while the
-same container over the explicit snapshot policy fails closed with
-`BrokerError.snapshotTooLarge`. Complete snapshots are bounded by
-`SourceBroker.maxSnapshotBytes`; no decoder is given a prefix. The integrated
-media decoder uses this same boundary.
-
-The OCR-focused suite also verifies that complete snapshots ignore the normal
-evidence read cap and reject an over-policy container instead of returning a
-truncated PDF prefix:
-
-```
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter OCRVisionTests
-Executed 5 tests, with 0 failures
-```
-Media verification additionally covers complete snapshot policy, real local
-PCM decoding into timestamped chunks, transcript persistence/search, and the
-missing-model fail-closed path:
-
-```
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter MediaIntelligenceTests
-Executed 16 tests, with 0 failures (one real Whisper integration test is
-conditionally skipped when whisper.cpp or the pre-provisioned model is absent)
-```
-
-On a host with `/opt/homebrew/bin/whisper-cli` and
-`~/Library/Application Support/AI Audio/Models/ggml-base.en.bin`, the real
-Whisper integration test uses macOS `say` to create a temporary speech fixture and verifies the
-complete path: broker snapshot → ffmpeg stdin → PCM → whisper.cpp → encrypted
-transcript row → transcript FTS. The source file is never passed to ffmpeg or
-Whisper; only broker-produced bytes cross the decoder boundary.
-The roadmap foundation suite also verifies encrypted multi-label graph edges,
-catalog-only review corrections with persistent re-index overrides, exclusion
-safe onboarding coverage, and dashboard counters:
-
-```
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter RoadmapCompletionTests
-Executed 10 tests, with 0 failures
-```
-
-The learning-loop focused suite verifies evidence-bound correction capture,
-three-file promotion, negative-correction blocking, disabled-by-default
-rules, and re-index invalidation:
-
-```
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter LearningLoopTests
-Executed 7 tests, with 0 failures
-```
-
-The provider and search seams are also covered directly:
-
-```
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter Tier2IntegrationTests
-Executed 1 test, with 0 failures
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter SearchServiceTests
-Executed 1 test, with 0 failures
-```
-
-The native UI run loop is available through `script/build_and_run.sh`; it stages
-a real `LibrarianApp.app` bundle and supports `--verify` for process startup.
-Bookmark resolution, folder-picker interaction, and reauthorization remain
-human/UI-bound; the source-safe code path is compile- and startup-verified.
-
-The production targets compile without warnings:
-
-```
-$ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release
-Build complete!
-```
-
-## End-to-end (scripts/e2e_local.sh, release binary)
-
-```
-== [1] fixtures ==            fixtures written under /tmp/librarian-e2e.fTnZaD/TestLibrary
-== [2] pre-index manifest ==  manifest entries: 22
-== [3] index ==               indexed 13 files in 0.17s / duplicate groups: 1
-== [4] status ==              failed=0 indexed=13 missing=0 pending=0 total=13
-                              encrypted-on-disk=true
-== [5] search inheritance ==  hit csc151-ch4.txt rank=-0.80 …Java [inheritance] explained…
-== [8] containment ==         search "TOP SECRET" behind symlink → 0 hits
-== [6] dupes ==               duplicate groups: 1
-== [7] virtual tree ==        Archives/Assignment/CSC-151/Image/MAT-171/PDF/School/Text populated
-== immutability ==            before/after manifests byte-identical — ZERO DIFFERENCES
-== [9] missing sweep ==       deleted School/mat171-worksheet.txt, re-indexed:
-                              failed=0 indexed=12 missing=1 pending=0 total=13
-== [10] raw header ==         not "SQLite format 3" — ciphertext on disk
-E2E PASS — all ten checks green
-```
-
-(The CoreGraphics log line during indexing is the truncated-PDF fixture being
-rejected by PDFKit — parser-crash resilience behaving as designed.)
-
-## Packaging + entitlement audit
-
-```
-$ scripts/package_app.sh .build/release
-packaged: dist/PrivateLibrarian.app          (codesign adhoc + runtime)
-
-$ python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
-ENTITLEMENT AUDIT PASS
-  sandbox:           yes
-  read-write access: ABSENT (good)
-  network client:    ABSENT (good)
-  network server:    ABSENT (good)
-
-$ otool -L .build/release/librarian-cli | grep -i sqlite
-(no output — system libsqlite3 NOT linked; SQLCipher amalgamation compiled in)
-```
-
-## Network-negative probe (sandbox-exec, deny network*)
-
-```
-PASS connect example.com:443   DENIED
-PASS connect example.com:80    DENIED
-PASS connect LAN gateway:53    DENIED
-PASS listen on localhost       DENIED
-PASS connect localhost:1       DENIED
-PASS http fetch                DENIED
-NETWORK-NEGATIVE PASS — all attempts denied
-```
-
-## Synthetic library benchmark (Issue #10)
-
-Direct release-binary run on August 25, 2026 with
-`python3 scripts/benchmark_librarian.py --files 10000 --search-iters 5
---relation-iters 3`:
-
-```
-cold index:       72.183 s   138.6 files/s  25.5 MB RSS   10006 indexed
-warm index:        1.077 s  9290.8 files/s  25.5 MB RSS       0 indexed
-one-file change:   1.127 s  8875.2 files/s  25.5 MB RSS       1 indexed
-duplicate pass:    0.533 s                    2 groups
-FTS search:      p50 117.52 ms / p95 119.54 ms
-graph query:     p50 242.56 ms / p95 244.62 ms
-catalog size: 18,243,584 bytes; fixture bytes: 1,202,644
-```
-
-The optional 100k run was started against the release binary but cancelled
-after roughly 20 minutes without a completed result; no 100k performance claim
-is made. The cancellation left no worker process or result artifact.
-
-## Embedding provider decision (Issue #11 / #31)
-
-`python3 scripts/bench_providers.py --providers local fileid coreml --output /tmp/bench-providers.json`
-is an offline, read-only preflight and benchmark. It reports model/checkpoint
-identity, preprocessing identity, expected dimensions, dependency presence,
-warm-worker latency, deterministic text-to-image fixture status, retrieval
-quality status, and a WINNER/FALLBACK decision. On the August 25, 2026
-checkout run, all three requested providers returned explicit `unavailable`
-records: the local Python artifacts have no valid pinned `provenance.json`,
-the FileID-compatible ONNX bridge is absent, and the Core ML pair is not
-provisioned. The observed decision is `winner=null`, `fallback=Vision
-feature-print`; no unverified model is activated or promoted.
-Re-provisioning with the pinned scripts is required before treating local
-Python artifacts as SHA-verified.
-
-The genuine Core ML path has an executable integration measurement:
+From the repository root:
 
 ```bash
-.build/release/librarian-cli provider-smoke --samples 5
+swift build
+swift test
 ```
 
-It either emits an explicit `unavailable` preflight record or loads both
-compiled MobileCLIP S0 models, embeds the deterministic red-square PNG and
-the query `a red square`, checks matching 512-D space IDs, and reports p50/p95
-image/text latency plus cosine similarity. The canonical checkout remains
-unprovisioned, so its normal result is the explicit unavailable record.
-
-For the pinned temporary artifact set used to validate the real runtime
-boundary (Apple `coreml-mobileclip` revision `3e0a7bfb`, plus the pinned
-OpenAI CLIP tokenizer), the receipt was:
-
-```json
-{
-  "status": "measured",
-  "provider": "coreml-mobileclip-s0:apple/coreml-mobileclip@3e0a7bfb:prep-408bdc1b",
-  "dimensions": {"image": 512, "text": 512},
-  "cold_image_latency_ms": 300.94,
-  "cold_text_latency_ms": 107.33,
-  "image_latency_ms": {"p50": 64.21, "p95": 64.40},
-  "text_latency_ms": {"p50": 65.49, "p95": 66.24},
-  "text_to_image_cosine": 0.259351,
-  "warm_calls": 5
-}
-```
-
-This proves genuine bytes-only Core ML inference and matching image/text
-dimensions. It is not a Golden Library retrieval-quality win, so the native
-provider remains opt-in. A provisioned Python runtime is the comparison
-fallback only when it is measured; on this unprovisioned checkout the actual
-fallback is the Tier-1 Vision feature-print path until Recall@K is measured
-on the shared labeled fixture.
-
-## Reproduce
+For the release-style verification path:
 
 ```bash
-swift build -c release && swift test
+swift build -c release
 bash scripts/e2e_local.sh .build/release/librarian-cli
 scripts/package_app.sh .build/release
 python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
 sandbox-exec -f <(printf '(version 1)\n(allow default)\n(deny network*)\n') \
   python3 scripts/network_negative_probe.py
 ```
+
+For the deterministic quality harness:
+
+```bash
+python3 -B scripts/benchmark_quality.py --output quality-result.json
+```
+
+For the synthetic performance harness:
+
+```bash
+python3 scripts/benchmark_librarian.py --files 10000 --search-iters 5 --relation-iters 3
+```
+
+## What the Swift suite covers
+
+The test suite includes coverage for:
+
+- source immutability across indexing passes;
+- symlink refusal, intermediate-symlink breakout, and path-swap/TOCTOU handling;
+- catalog encryption and wrong-key refusal;
+- malformed-file resilience;
+- prompt-injection data remaining inert;
+- exact duplicate detection without deletion;
+- missing-file handling;
+- incremental zero-work behavior for unchanged files;
+- OCR and complete compressed-container snapshots;
+- screenshot classification and persisted evidence;
+- similarity families and incremental neighborhood updates;
+- live FSEvents coalescing, exclusions, and dropped-event reconciliation;
+- Review Inbox corrections and evidence-backed learned rules;
+- media decoding, transcript persistence/search, and stale-transcript handling;
+- provider/indexer/catalog/search integration;
+- organization graph and onboarding coverage.
+
+The real provisioned Whisper test is host-conditional. Hosted CI does not ship a local Whisper executable/model, so that test is expected to skip there while the generated-fixture media pipeline remains exercised without an external model.
+
+## Known compiler warning
+
+The current integrated app still emits Swift concurrency diagnostics around the background indexing callback flow. The build succeeds under the current toolchain, but those diagnostics are tracked in issue #46 because they become errors under Swift 6 language-mode enforcement.
+
+Do not describe the current build as warning-free until #46 is closed and a fresh CI run confirms it.
+
+## Packaging and sandbox checks
+
+`scripts/package_app.sh` builds the release-style `.app` and signs it with the configured identity (ad-hoc by default for local verification).
+
+The entitlement audit expects:
+
+- App Sandbox enabled;
+- user-selected read-only file access;
+- app-scoped bookmarks;
+- no source read-write entitlement;
+- no network client/server entitlement.
+
+The network-negative probe runs inside an additional deny-network sandbox and attempts outbound and local network operations. Those attempts must be denied.
+
+The CLI is a development/verification tool and must not be copied into the production app bundle.
+
+## SQLCipher provenance
+
+SQLCipher is vendored under `ThirdParty/sqlcipher/` with its license and provenance files. CI checks the expected vendored source/provenance rather than allowing an accidental system SQLite fallback to go unnoticed.
+
+Catalog tests also verify encrypted-on-disk behavior and wrong-key failure.
+
+## Optional embedding providers
+
+The default app does not require downloaded model artifacts.
+
+Provider checks are explicit and fail closed. A requested provider should be reported unavailable when its expected artifacts, tokenizer data, dependencies, or provenance are incomplete rather than silently switching model spaces.
+
+Useful commands include:
+
+```bash
+python3 scripts/bench_providers.py --providers local fileid coreml --output provider-results.json
+.build/release/librarian-cli provider-smoke --samples 5
+```
+
+A successful Core ML MobileCLIP smoke run proves that the native provider can produce matching-space image/text vectors from broker-supplied bytes/text. It does not by itself prove that the provider wins the Golden Library retrieval-quality comparison.
+
+## Historical 10k synthetic snapshot
+
+A local 10,000-file synthetic run recorded on August 25, 2026 produced approximately:
+
+| Measurement | Historical result |
+|---|---:|
+| Cold index | 72.183 s |
+| Cold throughput | 138.6 files/s |
+| Warm unchanged index | 1.077 s |
+| One-file change | 1.127 s |
+| Duplicate pass | 0.533 s |
+| FTS search p50 | 117.52 ms |
+| FTS search p95 | 119.54 ms |
+| Graph query p50 | 242.56 ms |
+| Graph query p95 | 244.62 ms |
+| Peak RSS reported by harness | 25.5 MB |
+| Catalog size | 18,243,584 bytes |
+
+Treat these as a historical development snapshot, not an SLA or a current-commit benchmark. Re-run the harness when comparing performance-sensitive changes.
+
+A 100,000-file run was started during development but did not complete, so the project makes no 100k performance claim.
+
+## Current gaps that affect verification
+
+Several important app-level behaviors remain open and should not be inferred from lower-level green tests:
+
+- #42 — ASR provider/model identity must participate in incremental invalidation;
+- #43 — transcription failure needs explicit retry semantics;
+- #44 — live indexing needs a persistent security-scoped permission lifetime in the sandboxed app;
+- #45 — missing/stale saved bookmarks must fail closed rather than falling back to raw-path access;
+- #46 — Swift 6 concurrency warnings need cleanup;
+- #47 — the implemented local transcription backend still needs app-level settings/wiring.
+
+A green CI run means the checked behaviors passed. It does not mean those open product gaps are already solved.
