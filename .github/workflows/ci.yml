@@ -11,6 +11,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Public repository hygiene
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bad_files="$(git ls-files | grep -E '(^|/)(\.env($|\.)|[^/]+\.(pem|key|p12|pfx|mobileprovision)$)' || true)"
+          if [ -n "$bad_files" ]; then
+            echo "Do not commit credentials or signing files:"
+            echo "$bad_files"
+            exit 1
+          fi
+
+          tracked_models="$(git ls-files 'Models/**' || true)"
+          if [ -n "$tracked_models" ]; then
+            echo "Downloaded model artifacts must stay out of git:"
+            echo "$tracked_models"
+            exit 1
+          fi
+
+          personal_paths="$(git grep -nE '/Users/[^/]+/' -- . ':(exclude)ThirdParty/**' ':(exclude).github/workflows/ci.yml' 2>/dev/null | grep -v '/Users/example/' || true)"
+          if [ -n "$personal_paths" ]; then
+            echo "Use neutral synthetic paths in public source/tests/docs:"
+            echo "$personal_paths"
+            exit 1
+          fi
+
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
