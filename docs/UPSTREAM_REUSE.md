@@ -1,57 +1,95 @@
-# Upstream-first roadmap audit
+# Upstream references and adaptation notes
 
-Issue #38 is a research/planning deliverable. This matrix verifies the
-implementation identity of the useful upstream references and keeps their
-filesystem-mutating behavior outside Private Librarian. The audit was run
-against the pinned local checkouts of FileID and `sfomuseum/swift-mobileclip`;
-the URLs below are the reviewable upstream sources.
+Private Librarian reuses ideas from existing open-source work where that saves time, but keeps its own source-safety boundary: originals stay read-only, organization stays virtual, and models do not receive source filesystem authority.
 
-Private Librarian remains canonical for `SourceBroker`, SQLCipher, incremental
-identity/generation checks, bytes-only model inputs, and virtual-only catalog
-organization. No row below authorizes moving, renaming, deleting, tagging, or
-rewriting an original.
+This page records the important upstream references and what was adapted, studied, or deliberately not copied.
 
-| Issue | Capability | Upstream reference(s) | Decision | Exact techniques/files worth borrowing | Private Librarian boundary | Required proof before integration |
-|---|---|---|---|---|---|---|
-| #23 | Screenshot intelligence | Apple Vision; FileID restructure confidence ideas in [`shared/docs/RESTRUCTURE.md`](https://github.com/WebWorldWide/FileID/blob/main/shared/docs/RESTRUCTURE.md) | BUILD OURSELVES / STUDY | `VNImageRequestHandler(data:)`; FileID cluster-profile/review-band concepts | Screenshot evidence consumes broker bytes and writes only encrypted assessment/memberships; no source rename or model-specific contract | 8+ subtype fixtures plus non-screenshot controls, reason codes, OCR/search, unchanged skip, no source diff |
-| #24 | Near-duplicate and semantic families | FileID [`pipeline/identity_clustering.rs`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/engine/Sources/FileIDEngine/Pipeline/IdentityClustering.swift), [`pipeline/RestructureSemantic.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/engine/Sources/FileIDEngine/Pipeline/RestructureSemantic.swift), and [`shared/docs/RESTRUCTURE.md`](https://github.com/WebWorldWide/FileID/blob/main/shared/docs/RESTRUCTURE.md) | ADAPT | Connected components, feature fusion, confidence tiers, representative/medoid ideas | Keep explicit `nearDuplicate` vs `semantic` relations, provider-neutral spaces, SQLCipher graph, virtual membership only | Crops/resizes/screenshot-of-screenshot/lookalike/semantic-sibling fixture; separate precision/recall and purity/completeness; incremental neighborhood benchmark |
-| #25 | Organization graph and multi-label views | FileID restructure data flow and [`ClusterSuggestions.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/app/Sources/FileID/Database/ClusterSuggestions.swift) | BUILD OURSELVES | Stable graph/node identifiers and derived relation presentation | Catalog rows/edges are encrypted and virtual; deleting a relation cannot touch a source | Multi-label fixture, deterministic query order, migration test, relation-query latency at 10k/100k |
-| #26 | Review inbox and uncertainty routing | FileID [`RestructureFeedback.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/engine/Sources/FileIDEngine/Pipeline/RestructureFeedback.swift), [`RestructureRecommendationRow.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/app/Sources/FileID/Views/Restructure/RestructureRecommendationRow.swift) | ADAPT | Confidence/reason display, accept/reject/hold routing, correction feedback | Corrections are catalog-only overrides and learning evidence; no apply/restructure/move action | Ambiguous vs high-confidence fixture, one-interaction resolution, restart/re-index persistence, review precision/coverage |
-| #27 | Golden Library quality metrics | FileID [`RestructureQualityQueryTests.cs`](https://github.com/WebWorldWide/FileID/blob/main/platforms/windows/Tests/FileID.App.Tests/RestructureQualityQueryTests.cs) as a quality-test reference | BUILD OURSELVES | Versioned labeled fixture, independent runtime/quality receipts, regression-visible JSON | Fixtures contain no private files; provider identity and preprocessing are explicit; no speed-only promotion | One local command, schema/version/commit/provider IDs, screenshot/duplicate/semantic/review metrics, comparable provider output |
-| #28 | Decoder-friendly complete snapshots | No upstream filesystem API is adopted; FileID media/runtime code is only a bounded-work reference | BUILD OURSELVES | Single-open `O_NOFOLLOW` broker stream, explicit size/page/duration limits, fail-closed oversize policy | Decoders receive broker data/streams, never source authority; identity checks and read-only syscalls remain | >8 MiB valid image, >20 MiB valid PDF, large audio/video probe, symlink/TOCTOU/changed-read tests |
-| #29 | Whole-computer onboarding | FileID root/library UX is a study reference only; no filesystem mutation is reused | BUILD OURSELVES | Persisted authorized-root state, exclusion explanations, pause/re-authorize controls | Security-scoped read-only bookmarks only; no Full Disk Access shortcut; removing a root changes visibility, not originals | Multiple-root restart, stale bookmark/re-authorize, exclusions prevent indexing and false missing, external disconnect behavior |
-| #30 | Magic dashboard and cluster explorer | FileID [`RestructureView.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/app/Sources/FileID/Views/RestructureView.swift), [`SankeyFlowView.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/app/Sources/FileID/Views/Restructure/SankeyFlowView.swift), [`RestructureRecommendationRow.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/app/Sources/FileID/Views/Restructure/RestructureRecommendationRow.swift) | STUDY / BUILD OURSELVES | Aggregated cluster presentation, drill-down, representative/reason display, confidence-aware actions | Adapt presentation to virtual catalog navigation; omit restructure-apply, move, rename, delete, Finder tags, and WebView/server paths | Major groups reachable in ≤2 interactions, cluster member/representative/relation reason, 10k UI smoke, responsive review action |
-| #31 | FileID ViT-B/32 vs genuine MobileCLIP vs Python | FileID [`MobileCLIPService.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/engine/Sources/FileIDEngine/Models/MobileCLIPService.swift), [`CLIPTextEncoder.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/app/Sources/FileID/Services/CLIPTextEncoder.swift); genuine reference [`swift-mobileclip/Sources/MobileCLIP/S0Model.swift`](https://github.com/sfomuseum/swift-mobileclip/blob/main/Sources/MobileCLIP/S0Model.swift), [`CLIPTokenizer.swift`](https://github.com/sfomuseum/swift-mobileclip/blob/main/Sources/MobileCLIP/Tokenizer/CLIPTokenizer.swift) | ADAPT / BUILD OURSELVES | Warm model reuse, preprocessing/tokenization, dimension guards, bounded concurrency, pinned artifact provenance | Providers receive bytes/text only; exact embedding space is persisted; FileID ONNX and restructure-apply behavior are not imported | Same Golden fixture; model size, cold/warm image+text, throughput/RSS/install, Recall@K/image retrieval; WINNER/FALLBACK/REJECT before defaulting |
-| #32 | Local ASR and media intelligence | FileID media sampling is a reference only; no source-path model API is reused | BUILD OURSELVES | Broker-fed decode, timestamped chunks, speech gate, sparse representative frames | ASR sees PCM only; ffmpeg/whisper are opt-in local adapters and source files remain read-only | Non-empty PCM fixture, real local ASR or explicit unavailable preflight, transcript FTS, unchanged skip, long-media bounded memory |
-| #33 | FSEvents live indexing | Apple FSEvents API documentation; no FileID write watcher behavior | BUILD OURSELVES | `UseCFTypes` callback representation, coalescing, dropped-event reconciliation, root lifecycle | Watcher observes authorized roots only; catalog/model/cache/temp exclusions always win; no write entitlement | Real create/modify/delete callback, exclusion-under-root test, storm bound, dropped-event full rescan |
-| #34 | Evidence-bound learning semantics | FileID [`RestructureFeedback.swift`](https://github.com/WebWorldWide/FileID/blob/main/platforms/apple/engine/Sources/FileIDEngine/Pipeline/RestructureFeedback.swift) | ADAPT CONCEPT / BUILD OURSELVES | Inspectable correction provenance, confidence feedback, reversible promotion gate | Same normalized pattern + category + positive action + current generation required; rules disabled by default; no self-modification | Unrelated evidence no promotion, removals block additive rules, matching positives promote, mixed evidence deterministic |
+## FileID
 
-## Provider identity note
+Repository: `WebWorldWide/FileID`
 
-FileID's Apple `MobileCLIPService.swift` is a ViT-B/32 OpenCLIP-style image
-encoder backed by ONNX Runtime/Core ML acceleration, not genuine Apple
-MobileCLIP. The genuine MobileCLIP reference has S0/S1/S2/BLT model wrappers,
-CLIP BPE resources, and a BSD license. Private Librarian therefore treats
-these as separate candidates and records the exact checkpoint, preprocessing,
-tokenizer, dimension, and runtime receipt rather than selecting by name.
+Useful areas studied:
 
-## External control-board handoff
+- identity/similarity clustering;
+- semantic restructure scoring and confidence ideas;
+- review/feedback presentation;
+- cluster suggestion UI;
+- local CLIP runtime and text-encoder patterns.
 
-This file is the local, reviewable artifact for #38. Posting it to the #18
-control board is a separate GitHub comment action and remains pending explicit
-authorization; no comment, push, merge, or workflow action is performed here.
+What is useful to adapt:
 
-## Current provider status
+- connected-component and cluster-representative ideas;
+- confidence/review bands;
+- warm model-session reuse;
+- preprocessing/dimension checks;
+- bounded concurrency;
+- presentation ideas for clusters and review queues.
 
-`python-transformers` remains the comparison fallback when its local runtime is
-actually provisioned. Genuine Core ML MobileCLIP is implemented and has been
-validated with a temporary pinned compiled S0 pair: `provider-smoke` produced
-real 512-D image/text vectors, warm latency, and a matching-space cosine
-receipt. It remains opt-in because that smoke test does not measure Golden
-Library Recall@K. FileID's OpenCLIP/ONNX path is deferred as a default until
-this checkout has a matching text encoder, ONNX Runtime bridge, and
-artifact-backed quality measurement.
+What is **not** imported into Private Librarian:
 
-The tokenizer adaptation is attributed to the BSD-licensed
-`sfomuseum/swift-mobileclip` project; its required notice is retained in
-`ThirdParty/SWIFT_MOBILECLIP_LICENSE.md`.
+- applying a restructure to real folders;
+- moving, renaming, deleting, or tagging source files;
+- any model/runtime API that would bypass `SourceBroker` and reopen an original independently.
+
+FileID's Apple `MobileCLIPService.swift` was treated as an OpenCLIP/ViT-B/32-style runtime reference rather than proof that the code was using Apple's genuine MobileCLIP model family. Provider identity is verified from the actual implementation/artifacts rather than inferred from a class name.
+
+## swift-mobileclip
+
+Repository: `sfomuseum/swift-mobileclip`
+
+This project was used as a direct reference for genuine MobileCLIP model/tokenizer behavior.
+
+Private Librarian's local tokenizer implementation follows the CLIP BPE/byte-encoding contract from that BSD-licensed reference. The source file identifies that adaptation, and the required BSD notice is retained in:
+
+`ThirdParty/SWIFT_MOBILECLIP_LICENSE.md`
+
+Private Librarian keeps its own provider/preflight/provenance layer and does not add a runtime network dependency on the upstream package.
+
+## SQLCipher
+
+SQLCipher is vendored as an amalgamation under `ThirdParty/sqlcipher/` so the catalog does not silently fall back to the system SQLite library without encryption support.
+
+The repository keeps:
+
+- `LICENSE_SQLCIPHER.md`;
+- `LICENSE_SQLITE.md`;
+- `PROVENANCE.md`;
+- the vendored source/header files used by the SwiftPM target.
+
+CI checks the expected provenance files as part of the normal build.
+
+## Capability-by-capability decisions
+
+| Area | Upstream input | Decision |
+|---|---|---|
+| Screenshot intelligence | Apple Vision + confidence/review ideas from FileID | Build locally; use broker bytes and catalog-only output |
+| Similarity families | FileID clustering/restructure techniques | Adapt clustering ideas; keep explicit virtual near-duplicate/semantic relations |
+| Organization graph | FileID relation/presentation ideas | Build locally in the encrypted catalog |
+| Review Inbox | FileID feedback/review UX ideas | Adapt interaction concepts; corrections remain catalog-only |
+| Golden Library quality checks | General labeled-fixture/quality-test patterns | Build locally with synthetic fixtures and explicit provider identity |
+| Decoder-safe complete snapshots | No upstream source authority adopted | Build locally around `SourceBroker` |
+| Whole-computer onboarding | General authorized-root UX patterns | Build locally with read-only security-scoped bookmarks |
+| Dashboard / cluster explorer | FileID restructure presentation ideas | Study/adapt presentation only; no apply/restructure action |
+| Native image/text embeddings | FileID runtime techniques + genuine `swift-mobileclip` reference | Keep providers separate and benchmark exact implementations |
+| Local ASR/media | Local decoder/ASR patterns | Build locally; ASR receives PCM, not source paths |
+| Live indexing | Apple FSEvents | Build locally; observe authorized roots only |
+| Learned rules | Feedback/evidence concepts | Build locally with inspectable, reversible, evidence-bound rules |
+
+## Rules for future upstream reuse
+
+Before copying or porting code:
+
+1. Verify what the upstream implementation actually does; do not trust filenames or marketing names.
+2. Check the license and keep any required copyright/notice text.
+3. Prefer small, attributable adaptations over copying a large subsystem that brings unrelated behavior.
+4. Keep `SourceBroker`, encrypted catalog state, incremental invalidation, and virtual-only organization as the local architecture boundary.
+5. Add a fixture or benchmark that proves the adaptation is useful before making it the default.
+6. Record model/checkpoint/preprocessing identity when model output depends on it.
+
+Unlicensed/no-license repositories may still be useful research references, but their code should be treated as reference-only unless permission is obtained.
+
+## Current provider position
+
+The repository supports a backend-neutral embedding interface. Genuine Core ML MobileCLIP is implemented as an optional local provider, while the Python-backed path remains a comparison/fallback when its artifacts and dependencies are actually provisioned.
+
+No provider should become the default from theoretical speed or naming alone. Runtime measurements and Golden Library retrieval quality should be compared on the same fixture first.
