@@ -1,0 +1,86 @@
+name: Bug report
+description: Report a reproducible problem in Private Librarian
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please use synthetic or sanitized examples. Do not attach private documents, recordings, screenshots, catalog databases, tokens, or secrets.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem in plain English.
+      placeholder: The app indexed the file, but...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it?
+      description: Give the smallest reliable set of steps you can.
+      placeholder: |
+        1. Add a synthetic folder containing...
+        2. Start indexing...
+        3. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - App / UI
+        - Indexing
+        - Search
+        - Screenshots / OCR
+        - Similarity / duplicates
+        - Media / transcription
+        - Local model provider
+        - Folder permissions / live indexing
+        - Catalog / encryption
+        - Build / CI
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: macOS 15.x
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or branch
+      placeholder: main, PR #9, or a commit SHA
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or extra context
+      description: Remove personal paths, filenames, file contents, tokens, and other private information first.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the open issues for the same problem.
+          required: true
+        - label: I removed private files, secrets, and personal information from this report.
+          required: true
+        - label: This is not a security vulnerability with exploit details. Security reports belong in the private path described in SECURITY.md.
+          required: true
