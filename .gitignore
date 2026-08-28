@@ -1,10 +1,41 @@
+# Swift / Xcode build output
 .build/
 dist/
 *.o
 *.d
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Editor / OS files
 .DS_Store
-.swiftpm
+.vscode/
+.idea/
+
+# Local test and benchmark output
 netns-test/
 /tmp/
-# Downloaded ML models (provisioned via scripts/provision_image_models.py)
+benchmark-results/
+*.log
+
+# Python helper environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.csr
+*.mobileprovision
+
+# Downloaded ML models. Provision them locally with the scripts in scripts/.
 Models/
