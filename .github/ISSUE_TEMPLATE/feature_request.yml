@@ -1,0 +1,49 @@
+name: Feature request
+description: Propose a focused improvement to Private Librarian
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem first. Private Librarian keeps source files read-only, stays local/offline, and stores organization in the encrypted catalog. Feature ideas should preserve those boundaries unless the issue is explicitly about changing them.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Explain the user pain, not just the implementation you want.
+      placeholder: It is hard to find...
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What should the app do?
+      description: Describe the desired behavior in plain English.
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: A small synthetic example is useful if the feature depends on file layout or content.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Other approaches considered
+      description: Optional. Mention a simpler solution if one exists.
+
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Project boundaries
+      options:
+        - label: This can keep original source files read-only.
+          required: true
+        - label: This can work without adding runtime network access or telemetry.
+          required: true
+        - label: Any example data in this issue is synthetic or sanitized.
+          required: true
