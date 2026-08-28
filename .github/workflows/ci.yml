@@ -27,11 +27,51 @@ jobs:
       - name: Suite must be green
         run: grep -q "Executed .* tests, with 0 failures" test.log
 
+      - name: Tier-2 provider contract
+        run: swift test --filter Tier2IntegrationTests
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
       - name: Vendored SQLCipher provenance
         run: |
           test -f ThirdParty/sqlcipher/sqlite3.c
           test -f ThirdParty/sqlcipher/LICENSE_SQLCIPHER.md
-          grep -q "SQLCIPHER_VERSION" ThirdParty/sqlcipher/include/sqlite3.h || true
+          grep -q "SQLCipher 4.17.0" ThirdParty/sqlcipher/PROVENANCE.md
+          grep -q "79c0e164b9c059e7487bf8f29272f601cca5f3312cc267461f81e349962a5058" ThirdParty/sqlcipher/PROVENANCE.md
+
+  quality:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run deterministic Golden Library quality subset
+        run: |
+          python3 -B scripts/benchmark_quality.py --output quality-result.json
+          python3 -B - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(Path("quality-result.json").read_text())
+          assert result["schema"] == 2
+          required = (
+              "screenshot_subtype_macro_f1",
+              "screenshot_control_accuracy",
+              "exact_duplicate_precision",
+              "near_duplicate_recall",
+              "semantic_recall_at_10",
+              "cluster_purity",
+              "cluster_completeness",
+              "ocr_recovery",
+              "ocr_latency_ms",
+              "course_topic_accuracy",
+              "review_precision",
+              "review_coverage",
+              "correction_reduction",
+          )
+          missing = [key for key in required if key not in result]
+          assert not missing, missing
+          assert result["identity"]["commit"] not in (None, "unknown")
+          print("Golden Library schema and metric gate: PASS")
+          PY
 
   entitlement-audit:
     runs-on: macos-15
@@ -40,6 +80,9 @@ jobs:
       - name: Package sandboxed app and audit entitlements
         run: |
           DEVELOPER_DIR=/Applications/Xcode_16.app/Contents/Developer swift build -c release
+          scripts/e2e_local.sh .build/release/librarian-cli
           scripts/package_app.sh .build/release
           test ! -e dist/PrivateLibrarian.app/Contents/MacOS/librarian-cli
           python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
+          sandbox-exec -f <(printf '(version 1)\n(allow default)\n(deny network*)\n') \
+            python3 scripts/network_negative_probe.py

@@ -1,5 +1,9 @@
 import Accelerate
+import CryptoKit
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Bridge to optional downloaded local models (CLIP / MiniLM) running 100% offline.
 ///
@@ -12,10 +16,40 @@ import Foundation
 /// is verified offline by `embed --check`. Swift side is a thin, timeout-bounded
 /// subprocess wrapper with no path interpolation or shell.
 public struct LocalModelBridge: Sendable {
+    private final class BoundedDataBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private let limit: Int
+        private var value = Data()
 
-    public enum Model: String, Sendable {
+        init(limit: Int) {
+            self.limit = limit
+            value.reserveCapacity(min(limit, 64 * 1024))
+        }
+
+        func append(_ data: Data) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard value.count < limit else { return }
+            value.append(data.prefix(limit - value.count))
+        }
+
+        func data() -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    public enum Model: String, CaseIterable, Sendable {
         case clipImage = "clip-vit-base-patch32" // 512-d image embedding (CLIP ViT-B/32)
         case miniLMText = "all-MiniLM-L6-v2"      // 384-d text embedding (MiniLM)
+    }
+
+    public static func expectedDimension(_ model: Model) -> Int {
+        switch model {
+        case .clipImage: return 512
+        case .miniLMText: return 384
+        }
     }
 
     /// Whether the bridge can run on this machine right now (python + deps + at least one model).
@@ -55,7 +89,10 @@ public struct LocalModelBridge: Sendable {
             var env = ProcessInfo.processInfo.environment
             env["HF_HUB_OFFLINE"] = "1"; env["TRANSFORMERS_OFFLINE"] = "1"
             env["HF_DATASETS_OFFLINE"] = "1"; env["HF_HUB_DISABLE_TELEMETRY"] = "1"; env["DO_NOT_TRACK"] = "1"
-            if let root = LocalModelBridge.repoRoot() { env["LIBRARIAN_MODELS_DIR"] = root.appendingPathComponent("Models").path }
+            if env["LIBRARIAN_MODELS_DIR"] == nil,
+               let root = LocalModelBridge.modelsRoot(for: args) {
+                env["LIBRARIAN_MODELS_DIR"] = root.path
+            }
             proc.environment = env
             let stdin = Pipe(); let stdout = Pipe(); let stderr = Pipe()
             proc.standardInput = stdin; proc.standardOutput = stdout; proc.standardError = stderr
@@ -69,10 +106,13 @@ public struct LocalModelBridge: Sendable {
             usleep(150_000)
             if !proc.isRunning { return nil }
             self.proc = proc; self.stdin = stdin; self.stdout = stdout; self.stderr = stderr
-            // Ensure stdout is non-blocking so availableData cannot block the caller.
-            let fd = stdout.fileHandleForReading.fileDescriptor
-            let flags = fcntl(fd, F_GETFL)
-            if flags != -1 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
+            // Ensure both ends are non-blocking so a stalled helper cannot
+            // block a caller while a timeout is being enforced.
+            for fd in [stdin.fileHandleForWriting.fileDescriptor,
+                       stdout.fileHandleForReading.fileDescriptor] {
+                let flags = fcntl(fd, F_GETFL)
+                if flags != -1 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
+            }
         }
 
         deinit { close() }
@@ -81,52 +121,111 @@ public struct LocalModelBridge: Sendable {
             lock.lock(); defer { lock.unlock() }
             guard !closed else { return }
             closed = true
-            try? stdin.fileHandleForWriting.close()
-            if proc.isRunning { proc.terminate(); usleep(200_000); if proc.isRunning { proc.interrupt() } }
+            terminateLocked()
         }
 
         /// Send one JSON request line and read one JSON response line with a trustworthy timeout.
         private func call(_ req: [String: Any], timeout: TimeInterval) -> [String: Any]? {
             lock.lock(); defer { lock.unlock() }
             guard !closed, proc.isRunning else { return nil }
-            guard let line = try? JSONSerialization.data(withJSONObject: req),
-                  let _ = try? stdin.fileHandleForWriting.write(contentsOf: line + Data([10])) else { return nil }
-            let deadline = Date().addingTimeInterval(timeout)
+            guard let line = try? JSONSerialization.data(withJSONObject: req) else { return nil }
+            let deadline = Date().addingTimeInterval(max(0, timeout))
+            guard writeRequest(line + Data([10]), deadline: deadline) else {
+                closed = true
+                terminateLocked()
+                return nil
+            }
             let fd = stdout.fileHandleForReading.fileDescriptor
             while Date() < deadline {
                 var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
                 let ms = max(0, Int32(deadline.timeIntervalSinceNow * 1000))
                 let pr = poll(&pfd, 1, ms)
-                if pr > 0, (pfd.revents & Int16(POLLIN)) != 0 {
-                    let chunk = stdout.fileHandleForReading.readData(ofLength: 8192)
-                    if !chunk.isEmpty {
-                        buffer.append(chunk)
+                if pr > 0 {
+                    var bytes = [UInt8](repeating: 0, count: 16 * 1024)
+                    let count = bytes.withUnsafeMutableBytes { raw -> Int in
+                        guard let base = raw.baseAddress else { return 0 }
+                        return Darwin.read(fd, base, raw.count)
+                    }
+                    if count > 0 {
+                        buffer.append(contentsOf: bytes[..<count])
+                        guard buffer.count <= 16 * 1024 * 1024 else {
+                            closed = true
+                            terminateLocked()
+                            return nil
+                        }
                         if let nl = buffer.firstIndex(of: 10) {
                             let lineData = buffer.prefix(upTo: nl)
                             buffer.removeSubrange(...nl)
-                            if let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] { return obj }
-                            continue
+                            if let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
+                                return obj
+                            }
                         }
-                    } else if !proc.isRunning {
+                    } else if count == 0, !proc.isRunning {
+                        return nil
+                    } else if count < 0, errno != EINTR, errno != EAGAIN, errno != EWOULDBLOCK {
+                        closed = true
+                        terminateLocked()
                         return nil
                     }
                 } else if pr == 0 {
+                    closed = true
+                    terminateLocked()
                     return nil // timeout
                 } else {
-                    if !proc.isRunning { return nil }
                     if errno == EINTR { continue }
-                    usleep(5_000)
+                    closed = true
+                    terminateLocked()
+                    return nil
                 }
                 if !proc.isRunning, buffer.isEmpty { return nil }
             }
+            closed = true
+            terminateLocked()
             return nil
+        }
+
+        private func writeRequest(_ data: Data, deadline: Date) -> Bool {
+            let fd = stdin.fileHandleForWriting.fileDescriptor
+            var offset = 0
+            while offset < data.count {
+                let count = data.withUnsafeBytes { raw -> Int in
+                    guard let base = raw.baseAddress else { return -1 }
+                    return Darwin.write(fd, base.advanced(by: offset), raw.count - offset)
+                }
+                if count > 0 {
+                    offset += count
+                    continue
+                }
+                if count < 0, errno == EINTR { continue }
+                if count < 0, errno != EAGAIN, errno != EWOULDBLOCK { return false }
+                var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                let ms = max(0, Int32(deadline.timeIntervalSinceNow * 1000))
+                if ms <= 0 { return false }
+                let ready = poll(&pfd, 1, ms)
+                if ready < 0, errno == EINTR { continue }
+                if ready <= 0 { return false }
+            }
+            return true
+        }
+
+        private func terminateLocked() {
+            try? stdin.fileHandleForWriting.close()
+            guard proc.isRunning else { return }
+            proc.terminate()
+            let firstDeadline = Date().addingTimeInterval(0.5)
+            while proc.isRunning && Date() < firstDeadline { usleep(20_000) }
+            if proc.isRunning { proc.interrupt() }
+            let secondDeadline = Date().addingTimeInterval(0.5)
+            while proc.isRunning && Date() < secondDeadline { usleep(20_000) }
+            if proc.isRunning { _ = kill(proc.processIdentifier, SIGKILL) }
         }
 
         public func embedImageBytes(_ bytes: Data, timeout: TimeInterval = 20) -> (dim: Int, data: Data)? {
             let b64 = bytes.base64EncodedString()
             guard let obj = call(["op": "image_b64", "data": b64], timeout: timeout),
-                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
-            var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
+                  let dim = obj["dim"] as? Int, dim == LocalModelBridge.expectedDimension(.clipImage),
+                  let vec = obj["vector"] as? [Double],
+                  let out = LocalModelBridge.vectorData(vec, expectedDim: dim) else { return nil }
             return (dim, out)
         }
 
@@ -134,8 +233,9 @@ public struct LocalModelBridge: Sendable {
             let clipped = String(text.prefix(4000))
             guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             guard let obj = call(["op": "text", "data": clipped], timeout: timeout),
-                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
-            var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
+                  let dim = obj["dim"] as? Int, dim == LocalModelBridge.expectedDimension(.miniLMText),
+                  let vec = obj["vector"] as? [Double],
+                  let out = LocalModelBridge.vectorData(vec, expectedDim: dim) else { return nil }
             return (dim, out)
         }
 
@@ -143,16 +243,112 @@ public struct LocalModelBridge: Sendable {
             let clipped = String(text.prefix(4000))
             guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             guard let obj = call(["op": "clip_text", "data": clipped], timeout: timeout),
-                  let dim = obj["dim"] as? Int, let vec = obj["vector"] as? [Double], vec.count == dim else { return nil }
-            var out = Data(capacity: dim*4); for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { out.append(contentsOf: $0) } }
+                  let dim = obj["dim"] as? Int, dim == LocalModelBridge.expectedDimension(.clipImage),
+                  let vec = obj["vector"] as? [Double],
+                  let out = LocalModelBridge.vectorData(vec, expectedDim: dim) else { return nil }
             return (dim, out)
         }
     }
 
-    /// Whether a specific model checkpoint is provisioned under any Models root.
+    private struct PinnedModelProvenance {
+        let hfID: String
+        let revision: String
+    }
+
+    private static func pinnedProvenance(for model: Model) -> PinnedModelProvenance {
+        switch model {
+        case .clipImage:
+            return PinnedModelProvenance(
+                hfID: "openai/clip-vit-base-patch32",
+                revision: "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268")
+        case .miniLMText:
+            return PinnedModelProvenance(
+                hfID: "sentence-transformers/all-MiniLM-L6-v2",
+                revision: "1110a243fdf4706b3f48f1d95db1a4f5529b4d41")
+        }
+    }
+
+    private static func modelHasArtifacts(_ directory: URL, model: Model) -> Bool {
+        let hasConfig = FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.json").path)
+        let hasWeights = ["pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack"].contains {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+        }
+        return hasConfig && hasWeights && hasTrustedProvenance(directory, model: model)
+    }
+
+    /// Pick the installed model root for the helper instead of assuming that
+    /// the current working directory is the repository. This is what makes a
+    /// packaged app's Application Support/Resources model installation work.
+    private static func modelsRoot(for args: [String]) -> URL? {
+        let roots = modelsRoots()
+        let requested = args.compactMap { Model(rawValue: $0) }
+        if let model = requested.first,
+           let root = roots.first(where: { modelHasArtifacts($0.appendingPathComponent(model.rawValue), model: model) }) {
+            return root
+        }
+        return roots.first(where: { root in
+            Model.allCases.allSatisfy { modelHasArtifacts(root.appendingPathComponent($0.rawValue), model: $0) }
+        }) ?? roots.first(where: { root in
+            Model.allCases.contains { modelHasArtifacts(root.appendingPathComponent($0.rawValue), model: $0) }
+        })
+    }
+
+    /// Check the non-network identity manifest produced by the provisioner.
+    /// File bytes are hashed by the provisioning/verification command; this
+    /// fast runtime gate verifies that every manifest entry is present, safe,
+    /// and tied to the pinned model identity before a helper can load it.
+    private static func hasTrustedProvenance(_ directory: URL, model: Model) -> Bool {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("provenance.json")),
+              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let modelName = record["model"] as? String,
+              modelName == model.rawValue,
+              let hfID = record["hf_id"] as? String,
+              let revision = record["revision"] as? String else { return false }
+        let pinned = pinnedProvenance(for: model)
+        guard hfID == pinned.hfID, revision == pinned.revision,
+              let expectedFiles = record["expected_files"] as? [String: Any],
+              !expectedFiles.isEmpty else { return false }
+        let weightNames = ["pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack"]
+        guard expectedFiles["config.json"] != nil,
+              weightNames.contains(where: { expectedFiles[$0] != nil }) else { return false }
+
+        let root = directory.resolvingSymlinksInPath().standardizedFileURL
+        for (relative, value) in expectedFiles {
+            guard let expected = value as? String,
+                  expected.count == 64,
+                  expected.allSatisfy({ $0.isHexDigit }) else { return false }
+            let path = directory.appendingPathComponent(relative)
+                .resolvingSymlinksInPath().standardizedFileURL
+            guard path.path == root.path || path.path.hasPrefix(root.path + "/"),
+                  let values = try? path.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true,
+                  sha256File(path) == expected.lowercased() else { return false }
+        }
+        return true
+    }
+
+    static func sha256File(_ path: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: path) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk: Data?
+            do {
+                chunk = try handle.read(upToCount: 1 << 20)
+            } catch {
+                return nil
+            }
+            guard let chunk, !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Whether a specific, pinned checkpoint is provisioned under any Models root.
     public static func isProvisioned(_ model: Model) -> Bool {
         for root in modelsRoots() {
-            if FileManager.default.fileExists(atPath: root.appendingPathComponent("\(model.rawValue)/config.json").path) {
+            let dir = root.appendingPathComponent(model.rawValue)
+            if modelHasArtifacts(dir, model: model) {
                 return true
             }
         }
@@ -166,22 +362,14 @@ public struct LocalModelBridge: Sendable {
         guard let scriptsDir = scriptsDir() else { return nil }
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-image", "--model", model.rawValue], input: bytes, timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        return parseEmbedding(from: result.stdout, expectedDim: expectedDimension(.clipImage))
     }
 
-    /// Embed an image file (bounded read via SourceBroker path) using local CLIP.
-    /// Returns normalized Float32 vector as Data (little-endian Float32) + dim, or nil.
-    /// Legacy path-based path — prefer embedImageBytes when already holding broker bytes.
+    /// Compatibility wrapper for existing path-based callers. SourceBroker
+    /// owns the path and the local helper receives complete bytes on stdin.
     public static func embedImage(at path: String, model: Model = .clipImage, timeout: TimeInterval = 20) -> (dim: Int, data: Data)? {
-        guard model == .clipImage, isProvisioned(model) else { return nil }
-        guard let scriptsDir = scriptsDir() else { return nil }
-        // Decode under broker-bounded semantics (caps come from caller-supplied maxVisionBytes),
-        // but helper input still goes through stdin so argv never leaks the path.
-        guard let data = try? SourceBroker().boundedRead(path, limit: Int64(VisionImageAnalyzer.maxVisionBytes)) else { return nil }
-        guard !data.isEmpty else { return nil }
-        let embed = scriptsDir.appendingPathComponent("embed.py").path
-        let result = runPython([embed, "--stdin-image", "--model", model.rawValue], input: data, timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        guard let bytes = try? SourceBroker().completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes) else { return nil }
+        return embedImageBytes(bytes, model: model, timeout: timeout)
     }
 
     /// Embed text using local MiniLM (mean-pooled, L2-normalized).
@@ -194,7 +382,7 @@ public struct LocalModelBridge: Sendable {
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-text", "--model", model.rawValue],
                                input: Data(clipped.utf8), timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        return parseEmbedding(from: result.stdout, expectedDim: expectedDimension(.miniLMText))
     }
 
     /// Embed natural-language text into the CLIP joint image-text space (512-d, L2-normalized).
@@ -206,7 +394,7 @@ public struct LocalModelBridge: Sendable {
         guard let scriptsDir = scriptsDir() else { return nil }
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-clip-text"], input: Data(clipped.utf8), timeout: timeout)
-        return parseEmbedding(from: result.stdout)
+        return parseEmbedding(from: result.stdout, expectedDim: expectedDimension(.clipImage))
     }
 
     // MARK: - Catalog helpers
@@ -220,27 +408,23 @@ public struct LocalModelBridge: Sendable {
         } catch { return false }
     }
 
-    /// Batch-embed images listed in `paths` via `embed.py --batch-images` (single warm process).
-    /// Bridges path-based callers that do not already hold broker bytes; stdin-bytes path
-    /// is preferred inside the indexer pipeline. Returns map path -> (dim, Data).
+    /// Compatibility batch wrapper. SourceBroker converts each source path to
+    /// a complete snapshot before the helper sees any bytes; the helper never
+    /// receives the caller's source paths.
     public static func embedImagesBatch(paths: [String], model: Model = .clipImage, timeout: TimeInterval = 60) -> [String: (dim: Int, data: Data)] {
         guard model == .clipImage, isProvisioned(model), !paths.isEmpty else { return [:] }
-        guard let scriptsDir = scriptsDir() else { return [:] }
-        let embed = scriptsDir.appendingPathComponent("embed.py").path
-        let listFile = FileManager.default.temporaryDirectory.appendingPathComponent("librarian-embed-\(UUID().uuidString).txt")
-        defer { try? FileManager.default.removeItem(at: listFile) }
-        let joined = paths.joined(separator: "\n")
-        guard (try? joined.write(to: listFile, atomically: true, encoding: .utf8)) != nil else { return [:] }
-        let result = runPython([embed, "--batch-images", listFile.path, "--model", model.rawValue], timeout: timeout)
-        var out: [String: (Int, Data)] = [:]
-        let lines = result.stdout.split(separator: "\n")
-        for (idx, line) in lines.enumerated() where idx < paths.count {
-            let p = paths[idx]
-            if let parsed = parseEmbedding(from: String(line)) {
-                out[p] = parsed
-            }
+        let broker = SourceBroker()
+        let items = paths.enumerated().compactMap { index, path -> (id: String, bytes: Data)? in
+            guard let bytes = try? broker.completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes) else { return nil }
+            return (String(index), bytes)
         }
-        return out
+        let embedded = embedImagesBatchBytes(items: items, model: model, timeout: timeout)
+        var result: [String: (dim: Int, data: Data)] = [:]
+        for (id, value) in embedded {
+            guard let index = Int(id), paths.indices.contains(index) else { continue }
+            result[paths[index]] = value
+        }
+        return result
     }
 
     /// Batch-embed raw images keyed by an opaque id (bytes provided by caller via stdin-batch).
@@ -249,32 +433,13 @@ public struct LocalModelBridge: Sendable {
         items: [(id: String, bytes: Data)], model: Model = .clipImage, timeout: TimeInterval = 60
     ) -> [String: (dim: Int, data: Data)] {
         guard model == .clipImage, isProvisioned(model), !items.isEmpty else { return [:] }
-        guard let scriptsDir = scriptsDir() else { return [:] }
-        let embed = scriptsDir.appendingPathComponent("embed.py").path
-        // One file per batch is still simpler than a custom wire format; bytes are small (bounded).
-        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("librarian-batch-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
-        let manifest = tmpDir.appendingPathComponent("manifest.txt")
-        var lines: [String] = []
-        for (idx, item) in items.enumerated() {
-            let f = tmpDir.appendingPathComponent("\(idx).bin")
-            try? item.bytes.write(to: f)
-            lines.append("\(item.id)\t\(f.path)")
-        }
-        guard (try? lines.joined(separator: "\n").write(to: manifest, atomically: true, encoding: .utf8)) != nil else { return [:] }
-        let result = runPython([embed, "--batch-images-manifest", manifest.path, "--model", model.rawValue], timeout: timeout)
         var out: [String: (Int, Data)] = [:]
-        for line in result.stdout.split(separator: "\n") {
-            guard let d = line.data(using: .utf8),
-                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  let id = o["id"] as? String,
-                  let dim = o["dim"] as? Int,
-                  let vec = o["vector"] as? [Double], vec.count == dim,
-                  id != "" else { continue }
-            var data = Data(capacity: dim * 4)
-            for v in vec { var f = Float(v); withUnsafeBytes(of: &f) { data.append(contentsOf: $0) } }
-            out[id] = (dim, data)
+        guard let worker = PersistentWorker(model: model) else { return [:] }
+        defer { worker.close() }
+        for item in items {
+            if let embedded = worker.embedImageBytes(item.bytes, timeout: timeout) {
+                out[item.id] = embedded
+            }
         }
         return out
     }
@@ -286,13 +451,23 @@ public struct LocalModelBridge: Sendable {
         guard !a.isEmpty, a.count == b.count, a.count % 4 == 0 else { return nil }
         let n = a.count / 4
         var dot: Float = 0
+        var finite = true
         a.withUnsafeBytes { ap in
             b.withUnsafeBytes { bp in
                 guard let pa = ap.baseAddress?.assumingMemoryBound(to: Float.self),
-                      let pb = bp.baseAddress?.assumingMemoryBound(to: Float.self) else { return }
+                      let pb = bp.baseAddress?.assumingMemoryBound(to: Float.self) else {
+                    finite = false
+                    return
+                }
+                for index in 0..<n where !pa[index].isFinite || !pb[index].isFinite {
+                    finite = false
+                    break
+                }
+                guard finite else { return }
                 vDSP_dotpr(pa, 1, pb, 1, &dot, vDSP_Length(n))
             }
         }
+        guard finite, dot.isFinite else { return nil }
         if dot == 0 {
             // Fallback if withUnsafeBytes leased a reallocated buffer — recompute scalar safely.
             var s: Double = 0
@@ -301,6 +476,7 @@ public struct LocalModelBridge: Sendable {
                 let fb = b.withUnsafeBytes { $0.load(fromByteOffset: i*4, as: Float.self) }
                 s += Double(fa * fb)
             }
+            guard s.isFinite else { return nil }
             return Float(max(-1, min(1, s)))
         }
         return Float(max(-1, min(1, Double(dot))))
@@ -328,17 +504,26 @@ public struct LocalModelBridge: Sendable {
 
     // MARK: - Internals
 
-    static func parseEmbedding(from json: String) -> (dim: Int, data: Data)? {
+    static func parseEmbedding(from json: String, expectedDim: Int? = nil) -> (dim: Int, data: Data)? {
         guard let raw = json.data(using: .utf8),
               let o = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
               let dim = o["dim"] as? Int,
-              let vec = o["vector"] as? [Double], vec.count == dim else { return nil }
-        var data = Data(capacity: dim * 4)
-        for v in vec {
-            var f = Float(v)
-            withUnsafeBytes(of: &f) { data.append(contentsOf: $0) }
-        }
+              let vec = o["vector"] as? [Double],
+              dim > 0, expectedDim == nil || expectedDim == dim,
+              let data = vectorData(vec, expectedDim: dim) else { return nil }
         return (dim, data)
+    }
+
+    private static func vectorData(_ vector: [Double], expectedDim: Int) -> Data? {
+        guard vector.count == expectedDim, expectedDim > 0 else { return nil }
+        var data = Data(capacity: expectedDim * 4)
+        for value in vector {
+            guard value.isFinite else { return nil }
+            var float = Float(value)
+            guard float.isFinite else { return nil }
+            withUnsafeBytes(of: &float) { data.append(contentsOf: $0) }
+        }
+        return data
     }
 
     struct RunResult { let stdout: String; let stderr: String; let exitCode: Int32 }
@@ -366,8 +551,9 @@ public struct LocalModelBridge: Sendable {
         env["HF_DATASETS_OFFLINE"] = "1"
         env["HF_HUB_DISABLE_TELEMETRY"] = "1"
         env["DO_NOT_TRACK"] = "1"
-        if let root = repoRoot() {
-            env["LIBRARIAN_MODELS_DIR"] = root.appendingPathComponent("Models").path
+        if env["LIBRARIAN_MODELS_DIR"] == nil,
+           let root = LocalModelBridge.modelsRoot(for: args) {
+            env["LIBRARIAN_MODELS_DIR"] = root.path
         }
         proc.environment = env
         // No shell, no PATH interpolation.
@@ -376,27 +562,73 @@ public struct LocalModelBridge: Sendable {
         proc.standardOutput = outPipe; proc.standardError = errPipe
         proc.standardInput = inPipe
         do { try proc.run() } catch { return RunResult(stdout: "", stderr: "\(error)", exitCode: 127) }
-        if let inPipe, let input {
-            inPipe.fileHandleForWriting.write(input)
-            // Close writer so helper sees EOF and doesn't block on stdin.
-            try? inPipe.fileHandleForWriting.close()
+        let outputDone = DispatchSemaphore(value: 0)
+        let errorDone = DispatchSemaphore(value: 0)
+        let outputBox = BoundedDataBox(limit: 16 * 1024 * 1024)
+        let errorBox = BoundedDataBox(limit: 1 * 1024 * 1024)
+        DispatchQueue.global(qos: .utility).async {
+            let handle = outPipe.fileHandleForReading
+            while true {
+                let chunk = handle.readData(ofLength: 64 * 1024)
+                if chunk.isEmpty { break }
+                outputBox.append(chunk)
+            }
+            outputDone.signal()
         }
-        let deadline = DispatchTime.now() + timeout
+        DispatchQueue.global(qos: .utility).async {
+            let handle = errPipe.fileHandleForReading
+            while true {
+                let chunk = handle.readData(ofLength: 64 * 1024)
+                if chunk.isEmpty { break }
+                errorBox.append(chunk)
+            }
+            errorDone.signal()
+        }
+        let inputDone = DispatchSemaphore(value: 0)
+        if let inPipe, let input {
+            DispatchQueue.global(qos: .utility).async {
+                let handle = inPipe.fileHandleForWriting
+                do {
+                    let chunkSize = 64 * 1024
+                    var offset = 0
+                    while offset < input.count {
+                        let end = min(offset + chunkSize, input.count)
+                        try handle.write(contentsOf: input[offset..<end])
+                        offset = end
+                    }
+                } catch {
+                    // The helper may exit early; the caller only needs the
+                    // process result and bounded diagnostics.
+                }
+                try? handle.close()
+                inputDone.signal()
+            }
+        } else {
+            inputDone.signal()
+        }
+
+        let deadline = Date().addingTimeInterval(max(0, timeout))
         var didTimeout = false
-        while proc.isRunning, DispatchTime.now() < deadline {
+        while proc.isRunning, Date() < deadline {
             usleep(30_000)
         }
         if proc.isRunning {
             didTimeout = true
+            try? inPipe?.fileHandleForWriting.close()
             proc.terminate()
-            usleep(200_000)
+            let firstDeadline = Date().addingTimeInterval(0.5)
+            while proc.isRunning && Date() < firstDeadline { usleep(20_000) }
             if proc.isRunning { proc.interrupt() }
+            let secondDeadline = Date().addingTimeInterval(0.5)
+            while proc.isRunning && Date() < secondDeadline { usleep(20_000) }
+            if proc.isRunning { _ = kill(proc.processIdentifier, SIGKILL) }
         }
-        // Drain pipes after wait — prevents pipe-buffer deadlock if helper wrote large JSON.
-        // We read *after* the process settles but hold pipes open the whole time so data
-        // stays available; concurrent draining beyond buffering is not needed at 512-float JSON size.
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        _ = inputDone.wait(timeout: .now() + 1)
+        _ = outputDone.wait(timeout: .now() + 1)
+        _ = errorDone.wait(timeout: .now() + 1)
+        let outData = outputBox.data()
+        let errData = errorBox.data()
         let out = String(data: outData, encoding: .utf8) ?? ""
         let err = String(data: errData, encoding: .utf8) ?? ""
         let code: Int32 = didTimeout ? 124 : proc.terminationStatus
@@ -426,7 +658,7 @@ public struct LocalModelBridge: Sendable {
     }
 
     /// Resolve Application Support + repo + bundled Resources Models roots; bundled .app uses Resources/Models.
-    static func modelsRoots() -> [URL] {
+    public static func modelsRoots() -> [URL] {
         var roots: [URL] = []
         if let env = ProcessInfo.processInfo.environment["LIBRARIAN_MODELS_DIR"] {
             roots.append(URL(fileURLWithPath: env))

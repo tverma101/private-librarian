@@ -1,5 +1,7 @@
 import Foundation
 import LibrarianCore
+import CoreGraphics
+import ImageIO
 
 /// librarian-cli — verification harness for the librarian core.
 /// Every subcommand is read-only with respect to source folders.
@@ -14,10 +16,13 @@ func printUsage() {
 
     USAGE:
       librarian-cli index <folder> --catalog <path>     Index a folder into an encrypted catalog
-      librarian-cli search <query> --catalog <path>     FTS5 search inside the encrypted catalog
+      librarian-cli search <query> --catalog <path> [--tier2] [--provider <kind>]
+                                                          Search inside the encrypted catalog
       librarian-cli status  --catalog <path>            Show catalog counts
-      librarian-cli dupes   --catalog <path>            Compute exact duplicate groups
-      librarian-cli tree    --catalog <path>            Print virtual category tree
+    librarian-cli dupes   --catalog <path>            Compute exact duplicate groups
+    librarian-cli graph-stats --catalog <path>         Measure virtual graph query size
+    librarian-cli tree    --catalog <path>            Print virtual category tree
+    librarian-cli provider-smoke [--samples <n>]      Measure genuine MobileCLIP image/text inference
 
     The catalog is SQLCipher-encrypted; its key lives in the macOS Keychain.
     Source folders are opened strictly O_RDONLY|O_NOFOLLOW. Nothing is ever
@@ -32,10 +37,93 @@ func argValue(_ name: String) -> String? {
     return args[i + 1]
 }
 
+func hasFlag(_ name: String) -> Bool {
+    CommandLine.arguments.contains(name)
+}
+
 func positional(_ index: Int) -> String? {
     // Drop program name AND the subcommand (args[1]); flags filtered out.
     let args = CommandLine.arguments.dropFirst(2).filter { !$0.hasPrefix("--") }
     return args.count > index ? args[index] : nil
+}
+
+func percentile(_ values: [Double], _ fraction: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let index = min(sorted.count - 1, max(0, Int(ceil(Double(sorted.count) * fraction)) - 1))
+    return sorted[index]
+}
+
+func deterministicPNG() -> Data? {
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    guard let context = CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: colorSpace,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    context.setFillColor(CGColor(red: 0.92, green: 0.08, blue: 0.08, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+    guard let image = context.makeImage() else { return nil }
+    let output = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(output, "public.png" as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return output as Data
+}
+
+func runProviderSmoke(samples: Int) throws {
+    let provider = CoreMLMobileCLIPProvider()
+    let preflight = provider.preflight
+    if !preflight.available {
+        print(String(data: try JSONSerialization.data(withJSONObject: [
+            "provider": provider.providerID,
+            "status": "unavailable",
+            "reason": preflight.reason,
+            "artifacts": preflight.artifacts,
+            "dependencies": preflight.dependencies,
+        ], options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
+        return
+    }
+    guard let imageBytes = deterministicPNG() else { throw NSError(domain: "provider-smoke", code: 1) }
+    let query = "a red square"
+    var imageLatencies: [Double] = []
+    var textLatencies: [Double] = []
+    var image: EmbeddingVector?
+    var text: EmbeddingVector?
+    let coldImageStart = Date().timeIntervalSinceReferenceDate
+    image = provider.embedImageBytes(imageBytes)
+    let coldImageLatency = (Date().timeIntervalSinceReferenceDate - coldImageStart) * 1000
+    let coldTextStart = Date().timeIntervalSinceReferenceDate
+    text = provider.embedJointText(query)
+    let coldTextLatency = (Date().timeIntervalSinceReferenceDate - coldTextStart) * 1000
+    for _ in 0..<max(1, samples) {
+        let imageStart = Date().timeIntervalSinceReferenceDate
+        image = provider.embedImageBytes(imageBytes)
+        imageLatencies.append((Date().timeIntervalSinceReferenceDate - imageStart) * 1000)
+        let textStart = Date().timeIntervalSinceReferenceDate
+        text = provider.embedJointText(query)
+        textLatencies.append((Date().timeIntervalSinceReferenceDate - textStart) * 1000)
+    }
+    guard let image, let text,
+          image.dim == CoreMLMobileCLIPProvider.dimension,
+          text.dim == CoreMLMobileCLIPProvider.dimension,
+          image.spaceID == text.spaceID,
+          let cosine = LocalModelBridge.cosineSimilarity(image.data, text.data) else {
+        throw NSError(domain: "provider-smoke", code: 2,
+                      userInfo: [NSLocalizedDescriptionKey: "MobileCLIP did not produce matching 512-D image/text vectors"])
+    }
+    let result: [String: Any] = [
+        "provider": provider.providerID,
+        "status": "measured",
+        "fixture": "deterministic-red-square-v1",
+        "space_id": image.spaceID,
+        "dimensions": ["image": image.dim, "text": text.dim],
+        "text_to_image_cosine": cosine,
+        "cold_image_latency_ms": coldImageLatency,
+        "cold_text_latency_ms": coldTextLatency,
+        "image_latency_ms": ["p50": percentile(imageLatencies, 0.50), "p95": percentile(imageLatencies, 0.95)],
+        "text_latency_ms": ["p50": percentile(textLatencies, 0.50), "p95": percentile(textLatencies, 0.95)],
+        "warm_calls": max(1, samples),
+    ]
+    print(String(data: try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
 }
 
 func openCatalog(_ catalogPath: String) throws -> Catalog {
@@ -80,11 +168,18 @@ do {
         }
         let catalog = try openCatalog(catalogPath)
         let broker = SourceBroker()
-        let indexer = Indexer(broker: broker, catalog: catalog, scheduler: Scheduler())
+        var options = Indexer.Options()
+        options.enableLocalEmbeddings = hasFlag("--tier2")
+        options.embeddingProviderKind = argValue("--provider")
+        let indexer = Indexer(broker: broker, catalog: catalog, scheduler: Scheduler(), options: options)
         let t0 = Date()
         let n = try indexer.indexRoot(url)
         let groups = try indexer.computeDuplicateGroups()
         print("indexed \(n) files in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+        let metrics = indexer.workMetrics
+        print("work-metrics visionCalls=\(metrics.visionCalls) ocrCalls=\(metrics.ocrCalls) clipCalls=\(metrics.clipCalls) textEmbedCalls=\(metrics.textEmbedCalls) decodeCalls=\(metrics.decodeCalls)")
+        let similarity = indexer.similarityMetrics
+        print("similarity-metrics seconds=\(String(format: "%.4f", similarity.seconds)) changedNodes=\(similarity.changedNodes) edges=\(similarity.edges) clusters=\(similarity.clusters)")
         print("duplicate groups: \(groups.count)")
         for g in groups.prefix(20) {
             print("  exact-dupes: \(g.joined(separator: ", "))")
@@ -94,7 +189,9 @@ do {
             printUsage(); exit(2)
         }
         let catalog = try openCatalog(catalogPath)
-        let svc = SearchService(catalog: catalog)
+        let provider = argValue("--provider").map { EmbeddingProviderFactory.make(kind: $0) }
+        let svc = SearchService(catalog: catalog, enableLocalEmbeddings: hasFlag("--tier2"),
+                                embeddingProvider: provider)
         for hit in try svc.search(q) {
             print("\(hit.fileID)  rank=\(hit.rank ?? 0)  \((hit.path as NSString).lastPathComponent)")
             if let snip = hit.snippet { print("    \(snip.replacingOccurrences(of: "\n", with: " "))") }
@@ -113,6 +210,11 @@ do {
         let groups = try indexer.computeDuplicateGroups()
         print("duplicate groups: \(groups.count)")
         for g in groups { print("  " + g.joined(separator: ", ")) }
+    case "graph-stats":
+        guard let catalogPath = argValue("--catalog") else { printUsage(); exit(2) }
+        let catalog = try openCatalog(catalogPath)
+        let graph = try catalog.organizationGraph()
+        print("graph-nodes=\(graph.nodes.count) graph-edges=\(graph.edges.count)")
     case "tree":
         guard let catalogPath = argValue("--catalog") else { printUsage(); exit(2) }
         let catalog = try openCatalog(catalogPath)
@@ -126,6 +228,9 @@ do {
             print(cat)
             for fid in byCat[cat]!.sorted() { print("  - \(fid)") }
         }
+    case "provider-smoke":
+        let samples = max(1, Int(argValue("--samples") ?? "5") ?? 5)
+        try runProviderSmoke(samples: samples)
     default:
         printUsage()
         exit(2)

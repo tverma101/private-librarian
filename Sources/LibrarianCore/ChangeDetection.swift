@@ -5,7 +5,7 @@ import Foundation
 public enum ChangeDetection {
 
     public static let extractorVersion = "extractors-1.0.0"
-    public static let classifierVersion = "rule-based-v1"
+    public static let classifierVersion = "rule-based-v2-screenshot-ocr"
 
     /// Decide whether a file needs (re)indexing given its stored record.
     /// `requiredExtractorVersion` is the complete processing-pipeline identity

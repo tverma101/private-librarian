@@ -11,7 +11,8 @@ public struct RuleBasedClassifier: Sendable {
     /// Multi-label classification (plan §26): kind / domain / course / purpose
     /// style labels derived only from evidence, bounded text, and optional Vision labels.
     public func classify(fileID: String, identity: FileIdentity, evidence: EvidenceExtractor.Evidence,
-                         textContent: String?, visionLabels: [(String, Float)] = []) -> Classification {
+                         textContent: String?, visionLabels: [(String, Float)] = [],
+                         screenshot: ScreenshotAssessment? = nil) -> Classification {
         var cats: [String] = []
         var reasons: [String] = []
 
@@ -85,6 +86,14 @@ public struct RuleBasedClassifier: Sendable {
         if tokens.contains(where: { $0.hasPrefix("csc") || $0.hasPrefix("mat") }) {
             cats.append("School")
             reasons.append("filename:course-like-token")
+        }
+
+        if let screenshot, screenshot.isScreenshot {
+            cats.append("Screenshots")
+            if screenshot.subtype != .unknown { cats.append("Screenshots/\(screenshot.subtype.rawValue)") }
+            if screenshot.isUncertain { cats.append("Review") }
+            reasons.append(contentsOf: screenshot.reasonCodes.map { "screenshot:\($0)" })
+            confidence = max(confidence, Double(screenshot.confidence))
         }
 
         // Dedupe while preserving order; cap categories via the contract.

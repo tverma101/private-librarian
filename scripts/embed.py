@@ -6,16 +6,17 @@ Uses downloaded HF checkpoints under Models/ via local_files_only=True.
 Called by LibrarianCore/LocalModelBridge.swift as a subprocess.
 
 Usage:
-  python3 scripts/embed.py --image /path/to/photo.jpg --model clip-vit-base-patch32
-  python3 scripts/embed.py --text "cats on a beach" --model all-MiniLM-L6-v2
+  python3 scripts/embed.py --stdin-image --model clip-vit-base-patch32
+  python3 scripts/embed.py --stdin-text --model all-MiniLM-L6-v2
   python3 scripts/embed.py --check  # exit 0 if runtime available, non-zero otherwise
-  python3 scripts/embed.py --batch-images /path/list.txt  # one path per line, JSONL output
+  python3 scripts/embed.py --worker  # JSONL bytes/text worker
 
 Output: JSON to stdout {"dim":512,"vector":[0.1, ...]} or {"error":"..."}.
 Never touches the network — verified by entitlement-audit and network_negative_probe.
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -31,11 +32,75 @@ MODEL_HANDLERS = {
     "clip-vit-base-patch32": "clip",
     "all-MiniLM-L6-v2": "minilm",
 }
+MODEL_DIMS = {"clip-vit-base-patch32": 512, "all-MiniLM-L6-v2": 384}
+MODEL_PROVENANCE = {
+    "clip-vit-base-patch32": {
+        "hf_id": "openai/clip-vit-base-patch32",
+        "revision": "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268",
+    },
+    "all-MiniLM-L6-v2": {
+        "hf_id": "sentence-transformers/all-MiniLM-L6-v2",
+        "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    },
+}
 
 # Lazy singletons — keep model warm within one process invocation (batch mode)
 _clip_model = None
 _clip_proc = None
 _minilm_model = None
+_trusted_models = set()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _provenance_valid(model: str, verify_hashes: bool = False) -> bool:
+    """Validate a provisioner's identity manifest before loading a checkpoint."""
+    spec = MODEL_PROVENANCE.get(model)
+    if spec is None:
+        return False
+    destination = MODELS_DIR / model
+    try:
+        record = json.loads((destination / "provenance.json").read_text())
+    except Exception:
+        return False
+    if record.get("model") != model or any(record.get(key) != value for key, value in spec.items()):
+        return False
+    expected_files = record.get("expected_files")
+    if not isinstance(expected_files, dict) or not expected_files:
+        return False
+    weights = ("pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack")
+    if "config.json" not in expected_files or not any(name in expected_files for name in weights):
+        return False
+    root = destination.resolve()
+    for relative, expected in expected_files.items():
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            return False
+        if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected.lower()):
+            return False
+        path = destination / relative
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            return False
+        if not path.is_file():
+            return False
+        if verify_hashes and _sha256_file(path) != expected.lower():
+            return False
+    return True
+
+
+def _require_model(model: str) -> bool:
+    if model not in _trusted_models:
+        if not _provenance_valid(model, verify_hashes=True):
+            return False
+        _trusted_models.add(model)
+    return True
 
 
 def _check_deps():
@@ -85,71 +150,14 @@ def _load_minilm():
     return _minilm_model
 
 
-def embed_image(path: str, model: str = "clip-vit-base-patch32"):
-    if model != "clip-vit-base-patch32":
-        return {"error": f"unknown image model {model!r}"}
-    p = Path(path)
-    if not p.exists():
-        return {"error": f"not found: {path}"}
-    dest = MODELS_DIR / model
-    if not (dest / "config.json").exists():
-        return {"error": f"model not provisioned: {model} — run provision_image_models.py --model {model}"}
-    try:
-        import torch
-        from PIL import Image
-
-        clip_model, clip_proc = _load_clip()
-        # Use SourceBroker boundedRead semantics: open via PIL, handles truncated gracefully
-        try:
-            img = Image.open(path).convert("RGB")
-        except Exception as e:
-            return {"error": f"cannot open image: {e}"}
-        with torch.no_grad():
-            inputs = clip_proc(images=img, return_tensors="pt")
-            # transformers 5.x returns BaseModelOutputWithPooling — pooler_output is the embedding
-            out = clip_model.get_image_features(pixel_values=inputs["pixel_values"])
-            # Handle both Tensor and wrapper return shapes
-            if hasattr(out, "pooler_output"):
-                vec = out.pooler_output[0]
-            elif hasattr(out, "image_embeds"):
-                vec = out.image_embeds[0]
-            else:
-                vec = out[0] if len(out.shape) == 2 else out
-            # L2-normalize for cosine search
-            vec = vec / vec.norm(p=2).clamp(min=1e-9)
-            arr = vec.cpu().tolist()
-            return {"dim": len(arr), "vector": arr, "model": model}
-    except Exception as e:
-        return {"error": f"clip inference failed: {e}"}
-
-
-def embed_text(text: str, model: str = "all-MiniLM-L6-v2"):
-    if model != "all-MiniLM-L6-v2":
-        return {"error": f"unknown text model {model!r}"}
-    dest = MODELS_DIR / model
-    if not (dest / "config.json").exists():
-        return {"error": f"model not provisioned: {model} — run provision_image_models.py --model {model}"}
-    if not text or not text.strip():
-        return {"error": "empty text"}
-    try:
-        mdl = _load_minilm()
-        # sentence_transformers handles tokenization + pooling internally, already normalized if configured
-        vec = mdl.encode(text.strip()[:4000], convert_to_tensor=False, normalize_embeddings=True)
-        arr = vec.tolist() if hasattr(vec, "tolist") else list(vec)
-        return {"dim": len(arr), "vector": arr, "model": model}
-    except Exception as e:
-        return {"error": f"minilm inference failed: {e}"}
-
-
 def _embed_image_bytes(data: bytes, model: str = "clip-vit-base-patch32"):
     """Embed raw image bytes from stdin (broker-only; path never exposed to helper)."""
     if model != "clip-vit-base-patch32":
         return {"error": f"unknown image model {model!r}"}
     if not data:
         return {"error": "empty stdin for image"}
-    dest = MODELS_DIR / model
-    if not (dest / "config.json").exists():
-        return {"error": f"model not provisioned: {model} — run provision_image_models.py --model {model}"}
+    if not _require_model(model):
+        return {"error": f"model is not provenance-verified: {model} — run provision_image_models.py --verify-only"}
     try:
         import io
         import torch
@@ -180,9 +188,8 @@ def _embed_text_bytes(data: bytes, model: str = "all-MiniLM-L6-v2"):
     """Embed text supplied on stdin (argv-safe)."""
     if model != "all-MiniLM-L6-v2":
         return {"error": f"unknown text model {model!r}"}
-    dest = MODELS_DIR / model
-    if not (dest / "config.json").exists():
-        return {"error": f"model not provisioned: {model} — run provision_image_models.py --model {model}"}
+    if not _require_model(model):
+        return {"error": f"model is not provenance-verified: {model} — run provision_image_models.py --verify-only"}
     text = data.decode("utf-8", errors="replace").strip()
     if not text:
         return {"error": "empty text on stdin"}
@@ -198,8 +205,8 @@ def _embed_text_bytes(data: bytes, model: str = "all-MiniLM-L6-v2"):
 def _embed_clip_text_bytes(data: bytes):
     """Natural-language text → CLIP joint space (512-d) for cross-modal image search."""
     dest = MODELS_DIR / "clip-vit-base-patch32"
-    if not (dest / "config.json").exists():
-        return {"error": "model not provisioned: clip-vit-base-patch32 — run provision_image_models.py --model clip-vit-base-patch32"}
+    if not _require_model("clip-vit-base-patch32"):
+        return {"error": "model is not provenance-verified: clip-vit-base-patch32 — run provision_image_models.py --verify-only"}
     text = data.decode("utf-8", errors="replace").strip()
     if not text:
         return {"error": "empty text on stdin"}
@@ -229,64 +236,23 @@ def _embed_clip_text_bytes(data: bytes):
 
 def main():
     ap = argparse.ArgumentParser(description="Offline embedding helper (no network)")
-    ap.add_argument("--image", type=str, help="Image path to embed (legacy)")
-    ap.add_argument("--text", type=str, help="Text to embed (legacy)")
     ap.add_argument("--stdin-image", action="store_true", help="Read raw image bytes from stdin (broker-only)")
     ap.add_argument("--stdin-text", action="store_true", help="Read UTF-8 text from stdin (argv-safe)")
     ap.add_argument("--stdin-clip-text", action="store_true", help="Read UTF-8 text from stdin and embed into CLIP joint space (512-d)")
     ap.add_argument("--worker", action="store_true", help="Persistent JSONL worker: {op,data} per line -> {dim,vector} per line (image_b64/text/clip_text)")
-    ap.add_argument("--model", type=str, default=None, help="Model name (default: clip for --image, minilm for --text)")
-    ap.add_argument("--batch-images", type=str, help="File with one image path per line; outputs JSONL (legacy)")
-    ap.add_argument("--batch-images-manifest", type=str, help="Manifest file with lines <id>\\t<path>; outputs JSONL with id field")
+    ap.add_argument("--model", type=str, default=None, help="Model name for the selected stdin operation")
     ap.add_argument("--check", action="store_true", help="Check runtime deps and exit 0/1")
     args = ap.parse_args()
 
     if args.check:
         ok = _check_deps()
-        # Also verify at least one model is provisioned
-        any_model = any((MODELS_DIR / m / "config.json").exists() for m in MODEL_HANDLERS)
-        if not any_model:
-            print(json.dumps({"error": "no models provisioned under Models/"}), file=sys.stderr)
+        trusted = [m for m in MODEL_HANDLERS if _provenance_valid(m, verify_hashes=True)]
+        if not trusted:
+            print(json.dumps({"error": "no provenance-verified models under Models/"}), file=sys.stderr)
             sys.exit(2)
+        print(json.dumps({"status": "ready", "models_dir": str(MODELS_DIR), "dimensions": MODEL_DIMS,
+                          "offline": True, "trusted_models": trusted}))
         sys.exit(0 if ok else 1)
-
-    if args.batch_images_manifest:
-        model = args.model or "clip-vit-base-patch32"
-        try:
-            lines = Path(args.batch_images_manifest).read_text().splitlines()
-        except Exception as e:
-            print(json.dumps({"error": str(e)}))
-            sys.exit(1)
-        for raw in lines:
-            raw = raw.strip()
-            if not raw:
-                continue
-            parts = raw.split("\t", 1)
-            if len(parts) != 2:
-                continue
-            opaque_id, p = parts[0].strip(), parts[1].strip()
-            res = embed_image(p, model=model)
-            if "vector" in res:
-                res["id"] = opaque_id
-            else:
-                res = {"id": opaque_id, **res}
-            print(json.dumps(res))
-        return
-
-    if args.batch_images:
-        model = args.model or "clip-vit-base-patch32"
-        try:
-            paths = Path(args.batch_images).read_text().splitlines()
-        except Exception as e:
-            print(json.dumps({"error": str(e)}))
-            sys.exit(1)
-        for p in paths:
-            p = p.strip()
-            if not p:
-                continue
-            res = embed_image(p, model=model)
-            print(json.dumps(res))
-        return
 
     if args.stdin_image:
         model = args.model or "clip-vit-base-patch32"
@@ -303,14 +269,14 @@ def main():
 
     if args.worker:
         import base64
-        # Pre-warm models so per-file latency is inference only
+        # Verify manifests and pre-warm models so per-file latency is inference only.
         try:
-            if (MODELS_DIR / "clip-vit-base-patch32" / "config.json").exists():
+            if _require_model("clip-vit-base-patch32"):
                 _load_clip()
         except Exception:
             pass
         try:
-            if (MODELS_DIR / "all-MiniLM-L6-v2" / "config.json").exists():
+            if _require_model("all-MiniLM-L6-v2"):
                 _load_minilm()
         except Exception:
             pass
@@ -348,18 +314,6 @@ def main():
         model = args.model or "all-MiniLM-L6-v2"
         data = sys.stdin.buffer.read()
         res = _embed_text_bytes(data, model=model)
-        print(json.dumps(res))
-        sys.exit(0 if "vector" in res else 1)
-
-    if args.image:
-        model = args.model or "clip-vit-base-patch32"
-        res = embed_image(args.image, model=model)
-        print(json.dumps(res))
-        sys.exit(0 if "vector" in res else 1)
-
-    if args.text is not None:
-        model = args.model or "all-MiniLM-L6-v2"
-        res = embed_text(args.text, model=model)
         print(json.dumps(res))
         sys.exit(0 if "vector" in res else 1)
 

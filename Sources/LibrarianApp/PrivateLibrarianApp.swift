@@ -11,7 +11,7 @@ struct PrivateLibrarianApp: App {
 
     var body: some Scene {
         WindowGroup("Private Librarian") {
-            ContentView()
+            MagicContentView()
                 .environmentObject(model)
                 .frame(minWidth: 900, minHeight: 560)
         }
@@ -27,9 +27,14 @@ struct PrivateLibrarianApp: App {
 @MainActor
 final class LibrarianModel: ObservableObject {
 
-    struct SourceFolder: Identifiable, Codable {
+    struct SourceFolder: Identifiable, Codable, Sendable {
         let id: UUID
         let path: String
+    }
+
+    struct PreviewRequest: Sendable, Equatable {
+        let path: String
+        let bookmarkData: Data?
     }
 
     @Published var sources: [SourceFolder] = []
@@ -37,17 +42,35 @@ final class LibrarianModel: ObservableObject {
     @Published var searchResults: [String] = []
     @Published var query: String = ""
     @Published var isIndexing = false
+    @Published var selectedSection: LibrarySection = .overview
+    @Published var excludedPaths: [String] = []
+    @Published var dashboard: CatalogDashboard = .empty
+    @Published var reviewItems: [ReviewItem] = []
+    @Published var learnedRules: [LearnedRule] = []
+    @Published var similarityClusters: [SimilarityCluster] = []
+    @Published var organizationGraph: OrganizationGraphSnapshot = .empty
+    @Published var coverage: OnboardingCoverage = .empty
+    @Published private(set) var pausedPaths: Set<String> = []
+    @Published private(set) var liveIndexRunning = false
+    @Published private(set) var livePendingEvents = 0
     @Published var localEmbeddingsEnabled: Bool {
-        didSet { UserDefaults.standard.set(localEmbeddingsEnabled, forKey: "tier2-enabled-v1") }
+        didSet {
+            UserDefaults.standard.set(localEmbeddingsEnabled, forKey: "tier2-enabled-v1")
+            restartLiveCoordinator()
+            refreshDashboard()
+        }
     }
     @Published var searchMode: String = "auto" // auto | exact | semantic | visual | clipText
 
     var isTier2Provisioned: Bool {
-        LocalModelBridge.isProvisioned(.clipImage) || LocalModelBridge.isProvisioned(.miniLMText)
+        CoreMLMobileCLIPProvider.isAvailable
+            || LocalModelBridge.isProvisioned(.clipImage)
+            || LocalModelBridge.isProvisioned(.miniLMText)
     }
 
     private var catalog: Catalog?
     private var bookmarkDataByPath: [String: Data] = [:]
+    private var liveCoordinator: LiveIndexCoordinator?
 
     static var appSupportDir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -60,6 +83,8 @@ final class LibrarianModel: ObservableObject {
         self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
         if let m = UserDefaults.standard.string(forKey: "tier2-search-mode-v1") { self.searchMode = m }
         loadBookmarks()
+        loadExclusions()
+        loadPausedPaths()
         openCatalogIfNeeded()
     }
 
@@ -72,6 +97,7 @@ final class LibrarianModel: ObservableObject {
             let dbPath = Self.appSupportDir.appendingPathComponent("catalog.db").path
             catalog = try Catalog(path: dbPath, key: key)
             log("catalog opened (encrypted)")
+            restartLiveCoordinator()
         } catch {
             log("catalog error: \(error)")
         }
@@ -88,20 +114,117 @@ final class LibrarianModel: ObservableObject {
         panel.begin { [weak self] resp in
             guard let self, resp == .OK else { return }
             for url in panel.urls {
-                let data = (try? url.bookmarkData(options: [.withSecurityScope],
-                                                  includingResourceValuesForKeys: nil,
-                                                  relativeTo: nil)) ?? Data()
+                guard let data = try? url.bookmarkData(
+                    options: [.withSecurityScope],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil), !data.isEmpty else {
+                    self.log("could not persist read-only bookmark: \(url.path)")
+                    continue
+                }
                 self.bookmarkDataByPath[url.path] = data
-                self.sources.append(SourceFolder(id: UUID(), path: url.path))
+                if !self.sources.contains(where: { $0.path == url.path }) {
+                    self.sources.append(SourceFolder(id: UUID(), path: url.path))
+                }
+                try? self.catalog?.restoreRootScope(root: url.path)
             }
             self.saveBookmarks()
+            self.restartLiveCoordinator()
         }
+    }
+
+    func isPaused(_ source: SourceFolder) -> Bool { pausedPaths.contains(source.path) }
+
+    func togglePaused(_ source: SourceFolder) {
+        if pausedPaths.contains(source.path) {
+            pausedPaths.remove(source.path)
+        } else {
+            pausedPaths.insert(source.path)
+        }
+        savePausedPaths()
+        restartLiveCoordinator()
+        refreshDashboard()
+    }
+
+    func removeSource(_ source: SourceFolder) {
+        try? catalog?.markRootUnscoped(root: source.path)
+        sources.removeAll { $0.id == source.id }
+        bookmarkDataByPath.removeValue(forKey: source.path)
+        pausedPaths.remove(source.path)
+        saveBookmarks()
+        savePausedPaths()
+        restartLiveCoordinator()
+        refreshDashboard()
+    }
+
+    func reauthorizeSource(_ source: SourceFolder) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose the replacement folder. Access remains READ-ONLY."
+        panel.begin { [weak self] response in
+            guard let self, response == .OK, let url = panel.url else { return }
+            guard let data = try? url.bookmarkData(
+                options: [.withSecurityScope],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil), !data.isEmpty else {
+                self.log("could not persist replacement bookmark: \(url.path)")
+                return
+            }
+            if url.path != source.path {
+                try? self.catalog?.markRootUnscoped(root: source.path)
+            }
+            self.bookmarkDataByPath.removeValue(forKey: source.path)
+            self.bookmarkDataByPath[url.path] = data
+            try? self.catalog?.restoreRootScope(root: url.path)
+            if let index = self.sources.firstIndex(where: { $0.id == source.id }) {
+                self.sources[index] = SourceFolder(id: source.id, path: url.path)
+            }
+            if self.pausedPaths.remove(source.path) != nil {
+                self.pausedPaths.insert(url.path)
+            }
+            self.saveBookmarks()
+            self.savePausedPaths()
+            self.restartLiveCoordinator()
+            self.refreshDashboard()
+        }
+    }
+
+    func addExclusionFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.message = "Choose folders to exclude from indexing. Originals remain untouched."
+        panel.begin { [weak self] resp in
+            guard let self, resp == .OK else { return }
+            let additions = panel.urls.map(\.path)
+            for path in additions where !self.excludedPaths.contains(path) {
+                self.excludedPaths.append(path)
+            }
+            self.saveExclusions()
+            self.restartLiveCoordinator()
+            self.refreshDashboard()
+        }
+    }
+
+    func removeExclusion(_ path: String) {
+        excludedPaths.removeAll { $0 == path }
+        saveExclusions()
+        restartLiveCoordinator()
+        refreshDashboard()
     }
 
     /// Resolve a stored read-only security-scoped bookmark and run `body`
     /// while access is active.
     func withSource<T>(_ source: SourceFolder, _ body: (URL) throws -> T) rethrows -> T? {
-        guard let data = bookmarkDataByPath[source.path] else {
+        try Self.accessSource(source, bookmarkData: bookmarkDataByPath[source.path], body)
+    }
+
+    private nonisolated static func accessSource<T>(_ source: SourceFolder,
+                                                    bookmarkData: Data?,
+                                                    _ body: (URL) throws -> T) rethrows -> T? {
+        guard let data = bookmarkData else {
             // CLI/test harness path without a bookmark — direct read-only use.
             return try? body(URL(fileURLWithPath: source.path))
         }
@@ -117,16 +240,58 @@ final class LibrarianModel: ObservableObject {
         return try body(resolved)
     }
 
-    func startIndexing() {
-        guard let catalog, !isIndexing else { return }
-        isIndexing = true
+    private var effectiveExcludedPaths: [String] {
+        let defaults = OnboardingExclusions.defaultPaths(
+            catalogPath: Self.appSupportDir.appendingPathComponent("catalog.db").path,
+            modelPaths: LocalModelBridge.modelsRoots().map(\.path))
+        return Array(Set(defaults + excludedPaths)).sorted()
+    }
+
+    private func makeIndexer() -> Indexer? {
+        guard let catalog else { return nil }
+        var options = Indexer.Options()
+        options.enableLocalEmbeddings = localEmbeddingsEnabled
+        options.embeddingProviderKind = CoreMLMobileCLIPProvider.isAvailable ? "coreml-mobileclip" : nil
+        options.excludedPaths = effectiveExcludedPaths
+        return Indexer(broker: SourceBroker(), catalog: catalog,
+                       scheduler: Scheduler(), options: options)
+    }
+
+    private func restartLiveCoordinator() {
+        liveCoordinator?.stop()
+        liveCoordinator = nil
+        liveIndexRunning = false
+        livePendingEvents = 0
+        guard let catalog, !sources.isEmpty else { return }
+        var options = LiveIndexCoordinator.Options()
+        options.excludedPaths = effectiveExcludedPaths
         let broker = SourceBroker()
-        var opts = Indexer.Options()
-        opts.enableLocalEmbeddings = localEmbeddingsEnabled
-        let indexer = Indexer(broker: broker, catalog: catalog, scheduler: Scheduler(), options: opts)
+        guard let indexer = makeIndexer() else { return }
+        let roots = sources.filter { !pausedPaths.contains($0.path) }
+            .map { URL(fileURLWithPath: $0.path) }
+        let coordinator = LiveIndexCoordinator(catalog: catalog, indexer: indexer,
+                                               broker: broker, scheduler: Scheduler(),
+                                               roots: roots, options: options)
+        coordinator.onStateChange = { [weak self, weak coordinator] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.livePendingEvents = coordinator?.pendingCount ?? 0
+                self.refreshDashboard()
+            }
+        }
+        liveCoordinator = coordinator
+        coordinator.start()
+        liveIndexRunning = coordinator.running
+    }
+
+    func startIndexing() {
+        guard let indexer = makeIndexer(), !isIndexing else { return }
+        isIndexing = true
+        let sourcesToIndex = sources.filter { !pausedPaths.contains($0.path) }
+        let bookmarksToUse = bookmarkDataByPath
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            for src in self?.sources ?? [] {
-                _ = self?.withSource(src) { url in
+            for src in sourcesToIndex {
+                _ = Self.accessSource(src, bookmarkData: bookmarksToUse[src.path]) { url in
                     _ = try? indexer.indexRoot(url) { p in
                         DispatchQueue.main.async {
                             self?.log("indexing… \(p.processed)/\(p.total)")
@@ -137,7 +302,120 @@ final class LibrarianModel: ObservableObject {
             DispatchQueue.main.async {
                 self?.isIndexing = false
                 self?.log("indexing complete")
+                self?.refreshDashboard()
             }
+        }
+    }
+
+    func refreshDashboard() {
+        guard let catalog else { return }
+        do {
+            // Indexing and live reconciliation persist the similarity graph
+            // incrementally. Do not rebuild the entire graph on the main
+            // actor every time a dashboard counter refreshes.
+            organizationGraph = try catalog.refreshOrganizationGraph()
+            dashboard = try catalog.dashboard()
+            reviewItems = try catalog.reviewItems()
+            learnedRules = try catalog.listRules()
+            similarityClusters = try catalog.similarityClusters()
+            coverage = try catalog.coverage(roots: sources.map(\.path),
+                                            excludedPaths: effectiveExcludedPaths)
+            liveIndexRunning = liveCoordinator?.running ?? false
+            livePendingEvents = liveCoordinator?.pendingCount ?? 0
+        } catch {
+            log("dashboard refresh error: \(error)")
+        }
+    }
+
+    func files(for section: LibrarySection) -> [Catalog.FileSummary] {
+        guard let catalog else { return [] }
+        switch section {
+        case .screenshots:
+            let plural = (try? catalog.fileSummaries(categoryPrefix: "Screenshots", limit: 200)) ?? []
+            let singular = (try? catalog.fileSummaries(categoryPrefix: "Screenshot", limit: 200)) ?? []
+            return Array(Dictionary(uniqueKeysWithValues: (plural + singular).map { ($0.id, $0) })
+                .values.sorted { $0.path < $1.path }.prefix(200))
+        case .school:
+            return (try? catalog.fileSummaries(categoryPrefix: "School", limit: 200)) ?? []
+        case .projects:
+            return (try? catalog.fileSummaries(categoryPrefix: "Projects", limit: 200)) ?? []
+        case .documents:
+            return (try? catalog.fileSummaries(categoryPrefix: "Documents", limit: 200)) ?? []
+        case .media:
+            let all = (try? catalog.fileSummaries(limit: Int.max)) ?? []
+            return Array(all.filter { $0.kind == FileKind.audio.rawValue || $0.kind == FileKind.video.rawValue }.prefix(200))
+        case .duplicates:
+            guard let duplicateIDs = try? catalog.duplicateFileIDs() else { return [] }
+            return (try? catalog.fileSummaries(limit: Int.max).filter { duplicateIDs.contains($0.id) }.prefix(200).map { $0 }) ?? []
+        case .missing:
+            return (try? catalog.fileSummaries(status: "missing", limit: 200)) ?? []
+        default:
+            return (try? catalog.fileSummaries(limit: 200)) ?? []
+        }
+    }
+
+    func filePath(for id: String) -> String {
+        guard let catalog else { return id }
+        do {
+            return try catalog.fileRow(id: id)?.path ?? id
+        } catch {
+            return id
+        }
+    }
+
+    func previewRequest(for id: String) -> PreviewRequest? {
+        guard let catalog,
+              let row = try? catalog.fileRow(id: id) else { return nil }
+        return PreviewRequest(path: row.path, bookmarkData: bookmarkDataByPath[row.path])
+    }
+
+    /// Load a bounded, read-only image snapshot for the similarity UI. This is
+    /// intentionally nonisolated so the caller can perform the broker read
+    /// away from the main actor; the source path is never passed to a model.
+    nonisolated static func previewData(_ request: PreviewRequest) -> Data? {
+        let source = SourceFolder(id: UUID(), path: request.path)
+        do {
+            return try accessSource(source, bookmarkData: request.bookmarkData) { url in
+                try SourceBroker().completeSnapshot(
+                    url.path, maxBytes: 16 * 1024 * 1024)
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    func applyReviewCorrection(item: ReviewItem, category: String, action: ReviewCorrectionAction) {
+        guard let catalog else { return }
+        do {
+            try catalog.applyReviewCorrection(fileID: item.fileID, category: category, action: action)
+            refreshDashboard()
+            log("review corrected: \((item.path as NSString).lastPathComponent)")
+        } catch {
+            log("review correction error: \(error)")
+        }
+    }
+
+    func toggleLearnedRule(_ rule: LearnedRule) {
+        guard let catalog else { return }
+        do {
+            try catalog.setRuleEnabled(id: rule.id, enabled: !rule.enabled)
+            learnedRules = try catalog.listRules()
+            refreshDashboard()
+            startIndexing()
+        } catch {
+            log("learned rule update error: \(error)")
+        }
+    }
+
+    func deleteLearnedRule(_ rule: LearnedRule) {
+        guard let catalog else { return }
+        do {
+            try catalog.deleteRule(id: rule.id)
+            learnedRules = try catalog.listRules()
+            refreshDashboard()
+            startIndexing()
+        } catch {
+            log("learned rule delete error: \(error)")
         }
     }
 
@@ -148,21 +426,35 @@ final class LibrarianModel: ObservableObject {
         var lines: [String] = []
         switch mode {
         case "exact":
-            lines = ((try? svc.search(query)) ?? []).map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent)" }
+            lines = ((try? svc.search(query)) ?? []).map { h in
+                let evidence = h.snippet.map { "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))" } ?? ""
+                return "\(h.fileID) — \((h.path as NSString).lastPathComponent)\(evidence)"
+            }
         case "semantic":
-            lines = ((try? svc.semanticSearch(query: query)) ?? []).map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent) [\(String(format:"%.2f", h.score))]" }
+            lines = ((try? svc.semanticSearch(query: query)) ?? []).map { h in
+                "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format:"%.2f", h.score))"
+            }
         case "clipText":
-            lines = ((try? svc.clipTextToImageSearch(query: query)) ?? []).map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent) [clip \(String(format:"%.2f", h.score))]" }
+            lines = ((try? svc.clipTextToImageSearch(query: query)) ?? []).map { h in
+                "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format:"%.2f", h.score))"
+            }
         default:
             let sem = (try? svc.semanticSearch(query: query)) ?? []
             if !sem.isEmpty {
-                lines = sem.map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent) [\(String(format:"%.2f", h.score))]" }
+                lines = sem.map { h in
+                    "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format:"%.2f", h.score))"
+                }
             } else {
                 let clip = (try? svc.clipTextToImageSearch(query: query)) ?? []
                 if !clip.isEmpty {
-                    lines = clip.map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent) [clip \(String(format:"%.2f", h.score))]" }
+                    lines = clip.map { h in
+                        "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format:"%.2f", h.score))"
+                    }
                 } else {
-                    lines = ((try? svc.search(query)) ?? []).map { h in "\(h.fileID) — \((h.path as NSString).lastPathComponent)" }
+                    lines = ((try? svc.search(query)) ?? []).map { h in
+                        let evidence = h.snippet.map { "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))" } ?? ""
+                        return "\(h.fileID) — \((h.path as NSString).lastPathComponent)\(evidence)"
+                    }
                 }
             }
         }
@@ -172,9 +464,7 @@ final class LibrarianModel: ObservableObject {
 
     /// Privacy indicators derived from ACTUAL state where possible (plan §45).
     func privacyIndicators() -> [(String, Bool)] {
-        let sandboxed = ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil
-            || Bundle.main.object(forInfoDictionaryKey: "NSAppleEventsUsageDescription") != nil
-            || amISandboxed()
+        let sandboxed = amISandboxed()
         return [
             ("App Sandbox enabled", sandboxed),
             ("Sources read-only", true),   // enforced by SourceBroker O_RDONLY|O_NOFOLLOW + entitlements
@@ -201,7 +491,7 @@ final class LibrarianModel: ObservableObject {
 
     private func catalogOnDiskEncrypted() -> Bool {
         let p = Self.appSupportDir.appendingPathComponent("catalog.db").path
-        return FileManager.default.fileExists(atPath: p)
+        return catalog != nil && FileManager.default.fileExists(atPath: p)
             && !Catalog.onDiskHeaderIsPlaintextSQLite(path: p)
     }
 
@@ -213,93 +503,38 @@ final class LibrarianModel: ObservableObject {
     // MARK: - Bookmark persistence
 
     private func saveBookmarks() {
-        let payload = sources.compactMap { src -> Data? in bookmarkDataByPath[src.path] }
-        let wrapped = try? JSONEncoder().encode(payload.map { $0.base64EncodedString() })
-        UserDefaults.standard.set(wrapped, forKey: "source-bookmarks-v1")
+        // Keep one entry per source. Compacting missing bookmarks would shift
+        // every later bookmark onto the wrong root after a restart.
+        let payload = sources.map { bookmarkDataByPath[$0.path]?.base64EncodedString() ?? "" }
+        UserDefaults.standard.set(payload, forKey: "source-bookmarks-v1")
         UserDefaults.standard.set(sources.map(\.path), forKey: "source-paths-v1")
     }
 
     private func loadBookmarks() {
         guard let b64 = UserDefaults.standard.stringArray(forKey: "source-bookmarks-v1"),
               let paths = UserDefaults.standard.stringArray(forKey: "source-paths-v1") else { return }
-        let datas = b64.compactMap { Data(base64Encoded: $0) }
-        for (i, path) in paths.enumerated() where i < datas.count {
+        let aligned = b64.count == paths.count
+        for (i, path) in paths.enumerated() {
             sources.append(SourceFolder(id: UUID(), path: path))
-            bookmarkDataByPath[path] = datas[i]
-        }
-    }
-}
-
-struct ContentView: View {
-    @EnvironmentObject var model: LibrarianModel
-
-    var body: some View {
-        NavigationSplitView {
-            List {
-                Section("Categories") {
-                    Label("School", systemImage: "graduationcap")
-                    Label("Screenshots", systemImage: "camera.viewfinder")
-                    Label("Documents", systemImage: "doc")
-                    Label("Audio", systemImage: "waveform")
-                    Label("Videos", systemImage: "film")
-                    Label("Duplicates", systemImage: "square.on.square")
-                    Label("Review", systemImage: "questionmark.folder")
-                    Label("Missing", systemImage: "exclamationmark.triangle")
-                }
-                Section("Settings") {
-                    Toggle("Local embeddings (CLIP + MiniLM)", isOn: $model.localEmbeddingsEnabled)
-                        .help(model.isTier2Provisioned ? "On-device only — no network" : "Provision Models/ first: scripts/provision_image_models.py --all")
-                        .disabled(!model.isTier2Provisioned)
-                    Picker("Search mode", selection: $model.searchMode) {
-                        Text("Auto").tag("auto")
-                        Text("Exact (FTS)").tag("exact")
-                        Text("Semantic").tag("semantic")
-                        Text("CLIP text→image").tag("clipText")
-                    }.pickerStyle(.segmented)
-                    .onChange(of: model.searchMode) { _, v in UserDefaults.standard.set(v, forKey: "tier2-search-mode-v1") }
-                    Text(model.isTier2Provisioned ? "Tier-2 ready" : "Tier-2 not provisioned — Vision fallback only").font(.caption).foregroundStyle(.secondary)
-                }
-                Section("Sources (read-only)") {
-                    ForEach(model.sources) { src in
-                        Text((src.path as NSString).lastPathComponent)
-                    }
-                    Button("Add Folder…") { model.addSourceFolder() }
-                    Button(model.isIndexing ? "Indexing…" : "Index Now") { model.startIndexing() }
-                        .disabled(model.isIndexing || model.sources.isEmpty)
-                }
-            }
-            .listStyle(.sidebar)
-        } detail: {
-            VStack(spacing: 0) {
-                HStack {
-                    TextField("Search everything…", text: $model.query)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { model.runSearch() }
-                    Button("Search") { model.runSearch() }
-                }.padding(8)
-                List(model.searchResults, id: \.self) { r in Text(r) }
-                Divider()
-                PrivacyBar(indicators: model.privacyIndicators())
-                    .padding(8)
+            if aligned, let data = Data(base64Encoded: b64[i]), !data.isEmpty {
+                bookmarkDataByPath[path] = data
             }
         }
     }
-}
 
-struct PrivacyBar: View {
-    let indicators: [(String, Bool)]
+    private func saveExclusions() {
+        UserDefaults.standard.set(excludedPaths, forKey: "excluded-paths-v1")
+    }
 
-    var body: some View {
-        HStack(spacing: 12) {
-            ForEach(indicators, id: \.0) { item in
-                HStack(spacing: 3) {
-                    Image(systemName: item.1 ? "checkmark.seal.fill" : "xmark.seal.fill")
-                        .foregroundStyle(item.1 ? .green : .red)
-                    Text(item.0).font(.caption)
-                }
-            }
-            Spacer()
-            Text("READ ONLY · OFFLINE · ENCRYPTED").font(.caption2).foregroundStyle(.secondary)
-        }
+    private func loadExclusions() {
+        excludedPaths = UserDefaults.standard.stringArray(forKey: "excluded-paths-v1") ?? []
+    }
+
+    private func savePausedPaths() {
+        UserDefaults.standard.set(Array(pausedPaths), forKey: "paused-source-paths-v1")
+    }
+
+    private func loadPausedPaths() {
+        pausedPaths = Set(UserDefaults.standard.stringArray(forKey: "paused-source-paths-v1") ?? [])
     }
 }

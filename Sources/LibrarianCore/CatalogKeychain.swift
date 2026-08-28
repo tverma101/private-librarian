@@ -35,7 +35,7 @@ public enum CatalogKeychain {
     }
 
     public static func load() throws -> Data? {
-        var query: [String: Any] = [
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
@@ -46,7 +46,9 @@ public enum CatalogKeychain {
         let status = SecItemCopyMatching(query as CFDictionary, &out)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess else { throw KeyError.osStatus(status) }
-        guard let data = out as? Data else { throw KeyError.unexpectedFormat }
+        guard let data = out as? Data, data.count == 32 else {
+            throw KeyError.unexpectedFormat
+        }
         return data
     }
 

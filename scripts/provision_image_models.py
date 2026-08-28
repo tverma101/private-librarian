@@ -29,7 +29,8 @@ ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "Models"
 
 # Pinned immutable revisions — fetched via HF API on 2026-08-22. Do not float.
-# Use --verify-only to enforce; update SHAs deliberately after reviewing weight changes.
+# Download records the Git-LFS SHA-256 manifest for the pinned revision;
+# --verify-only rechecks those bytes without contacting the network.
 MODELS = {
     "clip-vit-base-patch32": {
         "hf_id": "openai/clip-vit-base-patch32",
@@ -83,59 +84,152 @@ def ensure_hf():
         print("huggingface_hub not installed. Run: pip install -U huggingface_hub", file=sys.stderr)
         sys.exit(1)
 
+def expected_lfs_files(hf, spec):
+    """Return immutable Git-LFS content digests for a pinned revision."""
+    try:
+        info = hf.HfApi().model_info(spec["hf_id"], revision=spec["revision"])
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot resolve the pinned revision manifest for {spec['hf_id']}: {exc}"
+        ) from exc
+    expected = {}
+    for sibling in getattr(info, "siblings", []) or []:
+        lfs = getattr(sibling, "lfs", None)
+        if isinstance(lfs, dict):
+            oid = lfs.get("oid")
+        else:
+            oid = getattr(lfs, "oid", None) if lfs is not None else None
+        name = getattr(sibling, "rfilename", None)
+        if isinstance(name, str) and isinstance(oid, str) and len(oid) == 64:
+            expected[name] = oid
+    if not expected:
+        raise RuntimeError(
+            f"pinned revision {spec['revision'][:12]} for {spec['hf_id']} "
+            "did not expose a Git-LFS SHA-256 manifest"
+        )
+    return expected
+
 def download_one(name: str, verify_only: bool = False):
     spec = MODELS[name]
     hf = ensure_hf()
     dest = MODELS_DIR / name
     print(f"[{name}] {spec['hf_id']} ({spec['size']}) — {spec['note']}")
     print(f"  license: {spec['license']}, revision: {spec['revision']}")
-    # Immutable pinned digest registry — add SHAs when pinning revision off main.
-    # Until then, provenance after download pins whatever was resolved from main.
+    # Optional config digest can provide an additional local policy check.
     expected = spec.get("expected_sha256")
     if verify_only:
         if not dest.exists():
             print(f"  not present — run without --verify-only to download", file=sys.stderr)
             return False
+        prov = dest / "provenance.json"
+        try:
+            rec = json.loads(prov.read_text())
+        except Exception as exc:
+            print(f"  missing or invalid provenance manifest: {exc}", file=sys.stderr)
+            return False
+        if rec.get("model") != name or rec.get("hf_id") != spec["hf_id"] or rec.get("revision") != spec["revision"]:
+            print("  provenance model identity does not match the pinned specification", file=sys.stderr)
+            return False
+        expected_files = rec.get("expected_files", {})
+        if not isinstance(expected_files, dict) or not expected_files:
+            print("  provenance has no trusted file SHA-256 manifest", file=sys.stderr)
+            return False
+        weights = ("pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack")
+        if "config.json" not in expected_files or not any(name in expected_files for name in weights):
+            print("  provenance does not cover config.json and a model weight", file=sys.stderr)
+            return False
+        root = dest.resolve()
+        for relative, expected_file_sha in expected_files.items():
+            file_path = dest / relative
+            if (
+                not isinstance(relative, str)
+                or not isinstance(expected_file_sha, str)
+                or len(expected_file_sha) != 64
+                or any(char not in "0123456789abcdef" for char in expected_file_sha.lower())
+            ):
+                print(f"  invalid manifest entry: {relative}", file=sys.stderr)
+                return False
+            try:
+                file_path.resolve().relative_to(root)
+            except ValueError:
+                print(f"  manifest escapes model root: {relative}", file=sys.stderr)
+                return False
+            if not file_path.is_file():
+                print(f"  missing manifest file: {relative}", file=sys.stderr)
+                return False
+            actual_file_sha = sha256_file(file_path)
+            if actual_file_sha != expected_file_sha.lower():
+                print(
+                    f"  SHA mismatch for {relative}: expected "
+                    f"{expected_file_sha[:12]}…, got {actual_file_sha[:12]}…",
+                    file=sys.stderr,
+                )
+                return False
         if expected:
-            # Verify against the pinned provenance's config.json hash when available.
-            prov = dest / "provenance.json"
-            if prov.exists():
-                try:
-                    rec = json.loads(prov.read_text())
-                    actual = rec.get("config_sha256")
-                    if actual and expected and actual != expected:
-                        print(f"  SHA mismatch: expected {expected[:12]}… actual {actual[:12]}…", file=sys.stderr)
-                        return False
-                except Exception:
-                    pass
-            # Also compare live config.json digest if present.
             cfg = dest / "config.json"
-            if cfg.exists():
-                live = sha256_file(cfg)
-                if live != expected:
-                    print(f"  live config SHA mismatch: expected {expected[:12]}…, got {live[:12]}…", file=sys.stderr)
-                    return False
+            if cfg.exists() and sha256_file(cfg) != expected:
+                print(f"  config SHA mismatch: expected {expected[:12]}…", file=sys.stderr)
+                return False
         print(f"  present at {dest}")
         return True
     dest.mkdir(parents=True, exist_ok=True)
+    try:
+        expected_lfs = expected_lfs_files(hf, spec)
+    except RuntimeError as exc:
+        print(f"  {exc}", file=sys.stderr)
+        return False
     hf.snapshot_download(
         repo_id=spec["hf_id"],
         revision=spec["revision"],
         local_dir=str(dest),
         local_dir_use_symlinks=False,
     )
+    expected_files = {}
+    mismatches = []
+    for relative, expected_file_sha in expected_lfs.items():
+        file_path = dest / relative
+        if not file_path.is_file() or sha256_file(file_path) != expected_file_sha.lower():
+            mismatches.append(relative)
+        else:
+            expected_files[relative] = expected_file_sha.lower()
+
+    # HF's small metadata files (notably config.json) are often not Git-LFS
+    # siblings. Hash every downloaded regular file so the runtime manifest
+    # covers both the model weights and the files that configure them.
+    for file_path in sorted(dest.rglob("*")):
+        if not file_path.is_file() or file_path.name == "provenance.json" or ".cache" in file_path.parts:
+            continue
+        if file_path.is_symlink():
+            mismatches.append(str(file_path.relative_to(dest)))
+            continue
+        relative = str(file_path.relative_to(dest))
+        actual = sha256_file(file_path)
+        pinned = expected_files.get(relative)
+        if pinned is not None and pinned != actual:
+            mismatches.append(relative)
+        expected_files[relative] = actual
+
+    weights = ("pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack")
+    if "config.json" not in expected_files or not any(name in expected_files for name in weights):
+        print("  downloaded snapshot lacks config.json or a root model weight", file=sys.stderr)
+        return False
+
     prov_data = {
         "model": name,
         "hf_id": spec["hf_id"],
         "revision": spec["revision"],
         "license": spec["license"],
         "path": str(dest),
+        "expected_files": expected_files,
     }
     cfg = dest / "config.json"
     if cfg.exists():
         prov_data["config_sha256"] = sha256_file(cfg)
     if expected and prov_data.get("config_sha256") and prov_data["config_sha256"] != expected:
         print(f"  !! downloaded config SHA {prov_data['config_sha256'][:12]}… != expected {expected[:12]}… (network/main moved)", file=sys.stderr)
+    if mismatches:
+        print(f"  !! downloaded files failed pinned SHA-256 verification: {mismatches}", file=sys.stderr)
+        return False
     (dest / "provenance.json").write_text(json.dumps(prov_data, indent=2))
     print(f"  downloaded to {dest}")
     return True

@@ -153,13 +153,12 @@ final class BehaviorTests: XCTestCase {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for _ in 0..<12 {
                 group.addTask {
-                    let now = try await s.performAsync(as: .heavy) {
-                        tracker.enter()
+                    try await s.performAsync(as: .heavy) {
+                        _ = tracker.enter()
                         Thread.sleep(forTimeInterval: 0.02)
                         tracker.exit()
                         return ()
                     }
-                    _ = now
                 }
             }
             try await group.waitForAll()

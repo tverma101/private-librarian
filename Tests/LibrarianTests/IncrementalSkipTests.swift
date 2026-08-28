@@ -15,9 +15,12 @@ final class IncrementalSkipTests: XCTestCase {
         let first = try indexer.indexRoot(root)
         XCTAssertGreaterThan(first, 0, "first scan must actually process fixture entries")
 
+        indexer.resetWorkMetrics()
         let second = try indexer.indexRoot(root)
         XCTAssertEqual(second, 0,
                        "unchanged second scan must skip before extraction/Vision/Tier-2 work")
+        XCTAssertEqual(indexer.workMetrics, Indexer.WorkMetrics(),
+                       "unchanged scan must make zero expensive extractor/provider calls")
     }
 
     func testExactlyOneModifiedFileIsReprocessed() throws {
@@ -64,5 +67,23 @@ final class IncrementalSkipTests: XCTestCase {
         let retried = try indexer.indexRoot(root)
         XCTAssertEqual(retried, 1,
                        "pending work must be retried even if size/mtime are unchanged")
+    }
+
+    func testMissingSweepMarksRemovedFilesAfterNoFollowValidation() throws {
+        let root = try TestSupport.makeFixtureTree()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+
+        let catalog = try TestSupport.makeCatalog()
+        let indexer = Indexer(broker: SourceBroker(), catalog: catalog, scheduler: Scheduler())
+        _ = try indexer.indexRoot(root)
+
+        let target = root.appendingPathComponent("School/csc151-ch4.txt")
+        guard let row = try catalog.allFiles().first(where: { $0.path == target.path }) else {
+            return XCTFail("fixture source missing from catalog")
+        }
+        try FileManager.default.removeItem(at: target)
+
+        XCTAssertEqual(try indexer.indexRoot(root), 0)
+        XCTAssertEqual(try catalog.allFiles().first(where: { $0.id == row.id })?.status, "missing")
     }
 }

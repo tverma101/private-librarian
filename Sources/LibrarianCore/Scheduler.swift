@@ -21,7 +21,7 @@ public final class Scheduler: @unchecked Sendable {
 
     private let lock = NSLock()
     private var running: [JobClass: Int] = [.light: 0, .medium: 0, .heavy: 0]
-    private var waiters: [(JobClass, () throws -> Void)] = []
+    private var waiters: [(JobClass, @Sendable () throws -> Void)] = []
     private var pressureLevel: Int = 0 // 0 normal, 1 warning, 2 critical
 
     /// Base parallelism from active core count.
@@ -65,7 +65,7 @@ public final class Scheduler: @unchecked Sendable {
         return try body()
     }
 
-    public func performAsync<T>(as cls: JobClass, _ body: @escaping () throws -> T) async throws -> T {
+    public func performAsync<T: Sendable>(as cls: JobClass, _ body: @escaping @Sendable () throws -> T) async throws -> T {
         return try await withCheckedThrowingContinuation { cont in
             enqueue(cls) {
                 do { cont.resume(returning: try body()) }
@@ -74,7 +74,7 @@ public final class Scheduler: @unchecked Sendable {
         }
     }
 
-    private func enqueue(_ cls: JobClass, _ body: @escaping () throws -> Void) {
+    private func enqueue(_ cls: JobClass, _ body: @escaping @Sendable () throws -> Void) {
         lock.lock()
         waiters.append((cls, body))
         lock.unlock()
@@ -104,7 +104,7 @@ public final class Scheduler: @unchecked Sendable {
         lock.lock()
         guard !waiters.isEmpty else { lock.unlock(); return }
         // Start every waiter whose class now has capacity.
-        var remaining: [(JobClass, () throws -> Void)] = []
+        var remaining: [(JobClass, @Sendable () throws -> Void)] = []
         for (cls, body) in waiters {
             if running[cls]! < allowedConcurrent(for: cls) {
                 running[cls]! += 1
