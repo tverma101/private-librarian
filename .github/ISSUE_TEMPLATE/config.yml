@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/tverma101/private-librarian/blob/main/SECURITY.md
+    about: Read the private security-reporting instructions before sharing vulnerability details.
