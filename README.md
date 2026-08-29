@@ -54,7 +54,7 @@ modifying the originals**. Organization lives in a separate encrypted catalog.
 
 ```bash
 swift build                      # all targets
-swift test                       # mandatory security suite (19 tests)
+swift test                       # mandatory security suite
 scripts/gen_fixtures.py /tmp/fl  # synthetic fixture tree (never your real Desktop)
 scripts/audit_entitlements.py dist/PrivateLibrarian.app
 scripts/network_negative_probe.py
@@ -76,3 +76,7 @@ SQLCipher-encrypted catalog (key in Keychain) with FTS5
         +
 virtual organization only — never real moves/renames/deletes
 ```
+
+## License
+
+Private Librarian is licensed under the [Apache License 2.0](LICENSE). Third-party components retain their own notices under `ThirdParty/`.
