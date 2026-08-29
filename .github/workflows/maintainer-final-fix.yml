@@ -6,7 +6,7 @@ on:
     paths:
       - scripts/apply_final_release_fix.py
       - scripts/fix_final_release_patch_typing.py
-      - scripts/fix_swift6_manifest.py
+      - scripts/fix_asr_state_regression_test.py
       - .github/workflows/maintainer-final-fix.yml
 
 permissions:
@@ -29,7 +29,7 @@ jobs:
         run: |
           python3 scripts/apply_final_release_fix.py
           python3 scripts/fix_final_release_patch_typing.py
-          python3 scripts/fix_swift6_manifest.py
+          python3 scripts/fix_asr_state_regression_test.py
 
       - name: Check patch formatting
         run: git diff --check
@@ -39,8 +39,8 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
-      - name: Swift 6 language check
-        run: swift build -Xswiftc -swift-version -Xswiftc 6
+      - name: Strict concurrency warnings are errors
+        run: swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
@@ -70,10 +70,10 @@ jobs:
 
       - name: Commit verified source patch
         run: |
-          git add Package.swift \
-                  Sources/LibrarianCore/Indexer.swift \
+          git add Sources/LibrarianCore/Indexer.swift \
                   Sources/LibrarianApp/PrivateLibrarianApp.swift \
-                  Sources/LibrarianApp/MagicViews.swift
+                  Sources/LibrarianApp/MagicViews.swift \
+                  Tests/LibrarianTests/ASRStateRegressionTests.swift
           if git diff --cached --quiet; then
             echo "No source changes to commit"
             exit 0
