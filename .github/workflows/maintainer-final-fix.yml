@@ -6,6 +6,7 @@ on:
     paths:
       - scripts/apply_final_release_fix.py
       - scripts/fix_final_release_patch_typing.py
+      - scripts/fix_swift6_manifest.py
       - .github/workflows/maintainer-final-fix.yml
 
 permissions:
@@ -28,6 +29,7 @@ jobs:
         run: |
           python3 scripts/apply_final_release_fix.py
           python3 scripts/fix_final_release_patch_typing.py
+          python3 scripts/fix_swift6_manifest.py
 
       - name: Check patch formatting
         run: git diff --check
@@ -68,7 +70,8 @@ jobs:
 
       - name: Commit verified source patch
         run: |
-          git add Sources/LibrarianCore/Indexer.swift \
+          git add Package.swift \
+                  Sources/LibrarianCore/Indexer.swift \
                   Sources/LibrarianApp/PrivateLibrarianApp.swift \
                   Sources/LibrarianApp/MagicViews.swift
           if git diff --cached --quiet; then
