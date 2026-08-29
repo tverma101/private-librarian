@@ -135,6 +135,7 @@ public final class Indexer: @unchecked Sendable {
         let learnedRules = (try? catalog.listRules()) ?? []
         self.processingVersion = Self.makeProcessingVersion(
             options: options, providerID: self.embeddingProvider.providerID,
+            asrProviderIdentity: TranscriptionProviderState.processingIdentity(transcriptionProvider),
             learnedRules: learnedRules)
         self.transcriptionProvider = transcriptionProvider
         self.pcmDecoder = pcmDecoder ?? BrokerPCMDecoder(maxSnapshotBytes: options.maxMediaSnapshotBytes)
@@ -157,6 +158,7 @@ public final class Indexer: @unchecked Sendable {
     /// Includes embedding-space identity when Tier 2 is enabled so a model change
     /// forces at least one re-index of every file that carries an embedding.
     private static func makeProcessingVersion(options: Options, providerID: String? = nil,
+                                              asrProviderIdentity: String? = nil,
                                               learnedRules: [LearnedRule] = []) -> String {
         var parts = [
             ChangeDetection.extractorVersion,
@@ -174,13 +176,14 @@ public final class Indexer: @unchecked Sendable {
         } else {
             parts.append("tier2:off")
         }
-        // ASR participation must invalidate incremental state: flipping the
-        // opt-in forces one honest re-index instead of serving stale derived
-        // media. (Provider identity is not encoded here — swapping providers
-        // under the same opt-in state intentionally reuses the existing
-        // transcript until content changes; encode providerID here if that
-        // policy ever changes.)
-        parts.append("asr:\(options.enableLocalASR ? "on" : "off")")
+        // ASR output is generation-scoped just like embeddings. Enabling
+        // ASR or changing the provider/binary/model identity forces exactly
+        // one honest re-index; the same identity returns to zero-work skips.
+        if options.enableLocalASR {
+            parts.append("asr:on,provider:\(asrProviderIdentity ?? "unknown")")
+        } else {
+            parts.append("asr:off")
+        }
         // A rule can already be enabled when the app starts, so queue-based
         // invalidation alone is insufficient across restarts. Include the
         // complete deterministic rule state in the generation contract; a
@@ -588,8 +591,9 @@ public final class Indexer: @unchecked Sendable {
             }
         }
 
-        // Audio/speech gating: probe -> gate -> transcribe (provider returns nil when disabled)
+        // Audio/speech gating: probe -> gate -> explicit transcription outcome.
         var stagedTranscript: (provider: String, segments: [TranscriptSegment])? = nil
+        var transcriptionFailure: String? = nil
         if ident.kind == .audio || ident.kind == .video {
             let ext = (ident.path as NSString).pathExtension
             // Complete broker snapshot for probe — never reopens path inside AudioProbe.
@@ -603,7 +607,7 @@ public final class Indexer: @unchecked Sendable {
             }
             let decision = AudioProbe.probe(bytes: mBytes, fileExtension: ext.isEmpty ? nil : ext, tagHint: nil)
             if decision.shouldTranscribe, options.enableLocalASR {
-                // Only run when not Disabled — cheap check before any PCM work
+                // Only run when not Disabled — cheap check before any PCM work.
                 if !(transcriptionProvider is DisabledSpeechTranscriptionProvider) {
                     var pcmChunks: [PCMChunk] = []
                     do {
@@ -614,21 +618,42 @@ public final class Indexer: @unchecked Sendable {
                             }
                         }
                     } catch {
-                        // Decode failure must never abort indexing (resilience),
-                        // but it is recorded — and partial PCM from a decoder
-                        // that threw mid-stream must not be transcribed either:
-                        // a prefix of a corrupt file is still a lie.
+                        // A definitive decode failure means this readable
+                        // generation produced no transcript; commit-time
+                        // generation cleanup below will remove stale speech.
                         pcmChunks = []
                         try? catalog.recordError(opaqueRef: id, stage: "media-decode",
                                                  message: String(describing: error).prefix(200).description)
                     }
-                    if !pcmChunks.isEmpty,
-                       let segs = scheduler.perform(as: .heavy, { transcriptionProvider.transcribe(pcmChunks) }),
-                       !segs.isEmpty {
-                        stagedTranscript = (transcriptionProvider.providerID, segs)
+                    if !pcmChunks.isEmpty {
+                        switch scheduler.perform(as: .heavy, {
+                            TranscriptionProviderState.transcribe(transcriptionProvider, chunks: pcmChunks)
+                        }) {
+                        case .success(let segments) where !segments.isEmpty:
+                            stagedTranscript = (transcriptionProvider.providerID, segments)
+                        case .success, .noTranscript:
+                            stagedTranscript = nil
+                        case .failure(let message):
+                            transcriptionFailure = message
+                        }
                     }
                 }
             }
+        }
+
+        // A provider execution/parsing failure is not a successful empty
+        // transcript. Keep the new file generation pending, retain the old
+        // derived rows for retry bookkeeping, and rely on status-filtered
+        // search to keep that old transcript out of current results.
+        if let transcriptionFailure {
+            guard let now = try? broker.identity(at: path), ident.stillMatches(now) else {
+                try catalog.setStatus(fileID: id, status: "changed-during-index")
+                return true
+            }
+            try? catalog.recordError(opaqueRef: id, stage: "media-asr",
+                                     message: transcriptionFailure.prefix(200).description)
+            try catalog.setStatus(fileID: id, status: "pending")
+            return true
         }
 
         // Stage Tier-2 embeddings without touching the catalog yet.

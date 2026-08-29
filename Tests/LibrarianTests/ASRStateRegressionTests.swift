@@ -118,7 +118,7 @@ final class ASRStateRegressionTests: XCTestCase {
         XCTAssertTrue(try catalog.searchExact("retained").contains { $0.fileID == row.id })
 
         // Change the source so the same provider identity gets another attempt.
-        try makeWAV(seconds: 3, amplitude: 7_000).write(to: fixture.file, options: .atomic)
+        try Self.makeWAV(seconds: 3, amplitude: 7_000).write(to: fixture.file, options: .atomic)
         let failing = ScriptedProvider(
             identity: "fixture:model-stable",
             attempts: [.failure("fixture transient failure")])
@@ -146,7 +146,7 @@ final class ASRStateRegressionTests: XCTestCase {
         XCTAssertEqual(try catalog.transcripts(forFile: row.id).map(\.text), ["new retry transcript"])
         XCTAssertTrue(try catalog.searchExact("retry").contains { $0.fileID == row.id })
 
-        try makeWAV(seconds: 4, amplitude: 5_000).write(to: fixture.file, options: .atomic)
+        try Self.makeWAV(seconds: 4, amplitude: 5_000).write(to: fixture.file, options: .atomic)
         let definitiveEmpty = ScriptedProvider(
             identity: "fixture:model-stable",
             attempts: [.noTranscript])

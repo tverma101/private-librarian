@@ -84,7 +84,10 @@ struct MagicContentView: View {
                                         .accessibilityLabel("Remove source from catalog")
                                 }
                                 Text(source.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                if model.isPaused(source) {
+                                if model.needsReauthorization(source) {
+                                    Text("Needs reauthorization — indexing is paused for this folder")
+                                        .font(.caption2).foregroundStyle(.orange)
+                                } else if model.isPaused(source) {
                                     Text("Paused — originals remain untouched")
                                         .font(.caption2).foregroundStyle(.orange)
                                 }
@@ -111,6 +114,12 @@ struct MagicContentView: View {
                     Toggle("Local embeddings", isOn: $model.localEmbeddingsEnabled)
                         .help(model.isTier2Provisioned ? "On-device only — no network" : "Provision Models/ first")
                         .disabled(!model.isTier2Provisioned)
+                    Toggle("Local transcription", isOn: $model.localTranscriptionEnabled)
+                        .help("Opt-in whisper.cpp transcription. Nothing is downloaded automatically.")
+                        .disabled(!model.isLocalTranscriptionAvailable)
+                    Text(model.localTranscriptionStatus)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     Picker("Search", selection: $model.searchMode) {
                         Text("Auto").tag("auto")
                         Text("Exact").tag("exact")

@@ -34,6 +34,7 @@ final class LibrarianModel: ObservableObject {
 
     struct PreviewRequest: Sendable, Equatable {
         let path: String
+        let sourceRoot: String
         let bookmarkData: Data?
     }
 
@@ -53,6 +54,15 @@ final class LibrarianModel: ObservableObject {
     @Published private(set) var pausedPaths: Set<String> = []
     @Published private(set) var liveIndexRunning = false
     @Published private(set) var livePendingEvents = 0
+    @Published private(set) var sourcesNeedingReauthorization: Set<String> = []
+    @Published var localTranscriptionEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(localTranscriptionEnabled, forKey: AppLocalTranscription.enabledDefaultsKey)
+            restartLiveCoordinator()
+            refreshDashboard()
+            startIndexing()
+        }
+    }
     @Published var localEmbeddingsEnabled: Bool {
         didSet {
             UserDefaults.standard.set(localEmbeddingsEnabled, forKey: "tier2-enabled-v1")
@@ -68,9 +78,13 @@ final class LibrarianModel: ObservableObject {
             || LocalModelBridge.isProvisioned(.miniLMText)
     }
 
+    var isLocalTranscriptionAvailable: Bool { AppLocalTranscription.isAvailable }
+    var localTranscriptionStatus: String { AppLocalTranscription.statusText }
+
     private var catalog: Catalog?
     private var bookmarkDataByPath: [String: Data] = [:]
     private var liveCoordinator: LiveIndexCoordinator?
+    private var liveAccessLeases: [String: SecurityScopedBookmarkLease] = [:]
 
     static var appSupportDir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -80,6 +94,8 @@ final class LibrarianModel: ObservableObject {
     }
 
     init() {
+        self.localTranscriptionEnabled = UserDefaults.standard.bool(forKey: AppLocalTranscription.enabledDefaultsKey)
+            && AppLocalTranscription.isAvailable
         self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
         if let m = UserDefaults.standard.string(forKey: "tier2-search-mode-v1") { self.searchMode = m }
         loadBookmarks()
@@ -150,6 +166,7 @@ final class LibrarianModel: ObservableObject {
         sources.removeAll { $0.id == source.id }
         bookmarkDataByPath.removeValue(forKey: source.path)
         pausedPaths.remove(source.path)
+        sourcesNeedingReauthorization.remove(source.path)
         saveBookmarks()
         savePausedPaths()
         restartLiveCoordinator()
@@ -176,6 +193,8 @@ final class LibrarianModel: ObservableObject {
             }
             self.bookmarkDataByPath.removeValue(forKey: source.path)
             self.bookmarkDataByPath[url.path] = data
+            self.sourcesNeedingReauthorization.remove(source.path)
+            self.sourcesNeedingReauthorization.remove(url.path)
             try? self.catalog?.restoreRootScope(root: url.path)
             if let index = self.sources.firstIndex(where: { $0.id == source.id }) {
                 self.sources[index] = SourceFolder(id: source.id, path: url.path)
@@ -215,29 +234,28 @@ final class LibrarianModel: ObservableObject {
         refreshDashboard()
     }
 
-    /// Resolve a stored read-only security-scoped bookmark and run `body`
-    /// while access is active.
-    func withSource<T>(_ source: SourceFolder, _ body: (URL) throws -> T) rethrows -> T? {
-        try Self.accessSource(source, bookmarkData: bookmarkDataByPath[source.path], body)
+    func needsReauthorization(_ source: SourceFolder) -> Bool {
+        sourcesNeedingReauthorization.contains(source.path)
     }
 
-    private nonisolated static func accessSource<T>(_ source: SourceFolder,
-                                                    bookmarkData: Data?,
-                                                    _ body: (URL) throws -> T) rethrows -> T? {
-        guard let data = bookmarkData else {
-            // CLI/test harness path without a bookmark — direct read-only use.
-            return try? body(URL(fileURLWithPath: source.path))
+    /// Resolve a stored read-only security-scoped bookmark and run `body`
+    /// while access is active. Production app access never falls back to a raw
+    /// path: missing, stale, and corrupt bookmarks require reauthorization.
+    func withSource<T>(_ source: SourceFolder, _ body: (URL) throws -> T) rethrows -> T? {
+        guard let lease = sourceLease(for: source) else { return nil }
+        return try body(lease.url)
+    }
+
+    private func sourceLease(for source: SourceFolder) -> SecurityScopedBookmarkLease? {
+        do {
+            let lease = try SecurityScopedBookmarkLease(bookmarkData: bookmarkDataByPath[source.path])
+            sourcesNeedingReauthorization.remove(source.path)
+            return lease
+        } catch {
+            sourcesNeedingReauthorization.insert(source.path)
+            log("folder needs reauthorization: \(source.path)")
+            return nil
         }
-        var isStale = false
-        guard let resolved = try? URL(resolvingBookmarkData: data,
-                                      options: [.withSecurityScope],
-                                      relativeTo: nil,
-                                      bookmarkDataIsStale: &isStale) else {
-            return try? body(URL(fileURLWithPath: source.path))
-        }
-        let started = resolved.startAccessingSecurityScopedResource()
-        defer { if started { resolved.stopAccessingSecurityScopedResource() } }
-        return try body(resolved)
     }
 
     private var effectiveExcludedPaths: [String] {
@@ -253,27 +271,52 @@ final class LibrarianModel: ObservableObject {
         options.enableLocalEmbeddings = localEmbeddingsEnabled
         options.embeddingProviderKind = CoreMLMobileCLIPProvider.isAvailable ? "coreml-mobileclip" : nil
         options.excludedPaths = effectiveExcludedPaths
+
+        let transcriptionProvider: any SpeechTranscriptionProvider
+        if localTranscriptionEnabled, let provider = AppLocalTranscription.providerIfAvailable() {
+            options.enableLocalASR = true
+            transcriptionProvider = provider
+        } else {
+            options.enableLocalASR = false
+            transcriptionProvider = DisabledSpeechTranscriptionProvider()
+        }
+
         return Indexer(broker: SourceBroker(), catalog: catalog,
-                       scheduler: Scheduler(), options: options)
+                       scheduler: Scheduler(), options: options,
+                       transcriptionProvider: transcriptionProvider)
     }
 
     private func restartLiveCoordinator() {
         liveCoordinator?.stop()
         liveCoordinator = nil
+        // Dropping the leases balances every successful startAccessing call.
+        liveAccessLeases.removeAll()
         liveIndexRunning = false
         livePendingEvents = 0
         guard let catalog, !sources.isEmpty else { return }
+
+        var roots: [URL] = []
+        var leases: [String: SecurityScopedBookmarkLease] = [:]
+        for source in sources where !pausedPaths.contains(source.path) {
+            guard let lease = sourceLease(for: source) else { continue }
+            roots.append(lease.url)
+            leases[source.path] = lease
+        }
+        guard !roots.isEmpty else { return }
+        liveAccessLeases = leases
+
         var options = LiveIndexCoordinator.Options()
         options.excludedPaths = effectiveExcludedPaths
         let broker = SourceBroker()
-        guard let indexer = makeIndexer() else { return }
-        let roots = sources.filter { !pausedPaths.contains($0.path) }
-            .map { URL(fileURLWithPath: $0.path) }
+        guard let indexer = makeIndexer() else {
+            liveAccessLeases.removeAll()
+            return
+        }
         let coordinator = LiveIndexCoordinator(catalog: catalog, indexer: indexer,
                                                broker: broker, scheduler: Scheduler(),
                                                roots: roots, options: options)
         coordinator.onStateChange = { [weak self, weak coordinator] in
-            DispatchQueue.main.async {
+            Task { @MainActor [weak self, weak coordinator] in
                 guard let self else { return }
                 self.livePendingEvents = coordinator?.pendingCount ?? 0
                 self.refreshDashboard()
@@ -287,19 +330,24 @@ final class LibrarianModel: ObservableObject {
     func startIndexing() {
         guard let indexer = makeIndexer(), !isIndexing else { return }
         isIndexing = true
-        let sourcesToIndex = sources.filter { !pausedPaths.contains($0.path) }
-        let bookmarksToUse = bookmarkDataByPath
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            for src in sourcesToIndex {
-                _ = Self.accessSource(src, bookmarkData: bookmarksToUse[src.path]) { url in
-                    _ = try? indexer.indexRoot(url) { p in
-                        DispatchQueue.main.async {
-                            self?.log("indexing… \(p.processed)/\(p.total)")
-                        }
+        let jobs: [(SourceFolder, SecurityScopedBookmarkLease)] = sources
+            .filter { !pausedPaths.contains($0.path) }
+            .compactMap { source in sourceLease(for: source).map { (source, $0) } }
+        guard !jobs.isEmpty else {
+            isIndexing = false
+            log("no authorized source folders available for indexing")
+            return
+        }
+
+        Task.detached(priority: .userInitiated) { [weak self, jobs, indexer] in
+            for (_, lease) in jobs {
+                _ = try? indexer.indexRoot(lease.url) { progress in
+                    Task { @MainActor [weak self] in
+                        self?.log("indexing… \(progress.processed)/\(progress.total)")
                     }
                 }
             }
-            DispatchQueue.main.async {
+            await MainActor.run { [weak self] in
                 self?.isIndexing = false
                 self?.log("indexing complete")
                 self?.refreshDashboard()
@@ -365,23 +413,24 @@ final class LibrarianModel: ObservableObject {
 
     func previewRequest(for id: String) -> PreviewRequest? {
         guard let catalog,
-              let row = try? catalog.fileRow(id: id) else { return nil }
-        return PreviewRequest(path: row.path, bookmarkData: bookmarkDataByPath[row.path])
+              let row = try? catalog.fileRow(id: id),
+              let source = sources
+                .filter({ SourceBroker.isPath(row.path, under: $0.path) })
+                .max(by: { $0.path.count < $1.path.count }) else { return nil }
+        return PreviewRequest(path: row.path, sourceRoot: source.path,
+                              bookmarkData: bookmarkDataByPath[source.path])
     }
 
     /// Load a bounded, read-only image snapshot for the similarity UI. This is
     /// intentionally nonisolated so the caller can perform the broker read
     /// away from the main actor; the source path is never passed to a model.
     nonisolated static func previewData(_ request: PreviewRequest) -> Data? {
-        let source = SourceFolder(id: UUID(), path: request.path)
-        do {
-            return try accessSource(source, bookmarkData: request.bookmarkData) { url in
-                try SourceBroker().completeSnapshot(
-                    url.path, maxBytes: 16 * 1024 * 1024)
-            }
-        } catch {
+        guard let lease = try? SecurityScopedBookmarkLease(bookmarkData: request.bookmarkData),
+              let target = lease.targetURL(for: request.path, originalRootPath: request.sourceRoot) else {
             return nil
         }
+        return try? SourceBroker().completeSnapshot(
+            target.path, maxBytes: 16 * 1024 * 1024)
     }
 
     func applyReviewCorrection(item: ReviewItem, category: String, action: ReviewCorrectionAction) {
