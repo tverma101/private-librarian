@@ -5,6 +5,7 @@ on:
     branches: [fix/tier2-incremental-ci]
     paths:
       - scripts/apply_final_release_fix.py
+      - scripts/fix_final_release_patch_typing.py
       - .github/workflows/maintainer-final-fix.yml
 
 permissions:
@@ -24,7 +25,9 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
       - name: Apply exact-match patch
-        run: python3 scripts/apply_final_release_fix.py
+        run: |
+          python3 scripts/apply_final_release_fix.py
+          python3 scripts/fix_final_release_patch_typing.py
 
       - name: Check patch formatting
         run: git diff --check
