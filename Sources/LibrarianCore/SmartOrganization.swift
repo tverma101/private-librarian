@@ -184,7 +184,7 @@ public struct SmartOrganizationPlanner: Sendable {
             .map { word in
                 let lower = word.lowercased()
                 if ["lms", "pdf", "ui"].contains(lower) { return lower.uppercased() }
-                return lower.prefix(1).uppercased() + lower.dropFirst()
+                return lower.prefix(1).uppercased() + String(lower.dropFirst())
             }
             .joined(separator: " ")
     }

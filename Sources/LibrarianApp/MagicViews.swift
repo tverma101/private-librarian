@@ -4,6 +4,7 @@ import LibrarianCore
 
 enum LibrarySection: String, CaseIterable, Identifiable {
     case overview
+    case smart
     case screenshots
     case school
     case projects
@@ -18,6 +19,7 @@ enum LibrarySection: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .overview: return "Overview"
+        case .smart: return "Smart Groups"
         case .screenshots: return "Screenshots"
         case .school: return "School"
         case .projects: return "Projects"
@@ -32,6 +34,7 @@ enum LibrarySection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .overview: return "sparkles"
+        case .smart: return "sparkles.rectangle.stack"
         case .screenshots: return "camera.viewfinder"
         case .school: return "graduationcap"
         case .projects: return "folder.badge.gearshape"
@@ -174,6 +177,8 @@ struct MagicContentView: View {
         switch model.selectedSection {
         case .overview:
             OverviewView()
+        case .smart:
+            SmartGroupsView()
         case .screenshots:
             FileExplorerView(title: "Screenshot explorer", subtitle: "Images stay in place; these are catalog memberships.", files: model.files(for: .screenshots))
         case .school:
@@ -211,6 +216,7 @@ private struct OverviewView: View {
                 MetricCard(title: "Missing", value: model.dashboard.missing, icon: "exclamationmark.triangle")
                 MetricCard(title: "Duplicate groups", value: model.dashboard.duplicateGroups, icon: "square.on.square")
                 MetricCard(title: "Graph links", value: model.dashboard.graphEdges, icon: "point.3.connected.trianglepath.dotted")
+                MetricCard(title: "Smart groups", value: model.smartGroups.count, icon: "sparkles.rectangle.stack")
             }
             HStack(spacing: 8) {
                 Image(systemName: model.liveIndexRunning ? "dot.radiowaves.left.and.right" : "pause.circle")
@@ -310,6 +316,71 @@ private struct FileExplorerView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         } label: {
             Label(title, systemImage: "square.grid.2x2")
+        }
+    }
+}
+
+private struct SmartGroupsView: View {
+    @EnvironmentObject private var model: LibrarianModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("A small set of useful virtual groups. Singleton model labels are hidden, related items are consolidated, and originals stay exactly where they are.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if model.smartGroups.isEmpty {
+                ContentUnavailableView(
+                    "No smart groups yet",
+                    systemImage: "sparkles.rectangle.stack",
+                    description: Text("Index a folder first. Groups appear only when there is enough evidence to be useful."))
+            } else {
+                ForEach(model.smartGroups) { group in
+                    GroupBox {
+                        VStack(alignment: .leading, spacing: 7) {
+                            HStack {
+                                Label(group.title, systemImage: icon(for: group.kind))
+                                    .font(.headline)
+                                Spacer()
+                                Text("\(group.fileIDs.count) items")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(group.subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if group.kind != .category {
+                                Text("confidence \(String(format: "%.0f%%", group.confidence * 100))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            ForEach(Array(group.fileIDs.prefix(6)), id: \.self) { id in
+                                HStack(spacing: 8) {
+                                    Image(systemName: "doc")
+                                        .foregroundStyle(.secondary)
+                                    Text((model.filePath(for: id) as NSString).lastPathComponent)
+                                        .lineLimit(1)
+                                }
+                                .font(.caption)
+                            }
+                            if group.fileIDs.count > 6 {
+                                Text("+ \(group.fileIDs.count - 6) more")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+    }
+
+    private func icon(for kind: SmartOrganizationGroupKind) -> String {
+        switch kind {
+        case .category: return "folder.badge.sparkles"
+        case .nearDuplicate: return "square.on.square"
+        case .semantic: return "point.3.connected.trianglepath.dotted"
         }
     }
 }

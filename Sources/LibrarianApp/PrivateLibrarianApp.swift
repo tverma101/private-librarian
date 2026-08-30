@@ -50,6 +50,7 @@ final class LibrarianModel: ObservableObject {
     @Published var learnedRules: [LearnedRule] = []
     @Published var similarityClusters: [SimilarityCluster] = []
     @Published var organizationGraph: OrganizationGraphSnapshot = .empty
+    @Published var smartGroups: [SmartOrganizationGroup] = []
     @Published var coverage: OnboardingCoverage = .empty
     @Published private(set) var pausedPaths: Set<String> = []
     @Published private(set) var liveIndexRunning = false
@@ -366,6 +367,7 @@ final class LibrarianModel: ObservableObject {
             reviewItems = try catalog.reviewItems()
             learnedRules = try catalog.listRules()
             similarityClusters = try catalog.similarityClusters()
+            smartGroups = try catalog.smartOrganizationGroups()
             coverage = try catalog.coverage(roots: sources.map(\.path),
                                             excludedPaths: effectiveExcludedPaths)
             liveIndexRunning = liveCoordinator?.running ?? false
