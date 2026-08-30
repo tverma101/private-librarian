@@ -109,16 +109,56 @@ public struct SmartOrganizationPlanner: Sendable {
             }
         }
 
-        // A stable sort makes the home screen predictable: high-value groups
-        // first, then larger groups, then a deterministic title/id tie-breaker.
-        return candidates.sorted {
+        // A stable sort makes the home screen predictable. Per-lane limits then
+        // prevent a noisy signal (for example dozens of duplicate families) from
+        // consuming every visible smart group.
+        let sorted = candidates.sorted {
             if $0.priority != $1.priority { return $0.priority > $1.priority }
             if $0.group.fileIDs.count != $1.group.fileIDs.count {
                 return $0.group.fileIDs.count > $1.group.fileIDs.count
             }
             if $0.group.title != $1.group.title { return $0.group.title < $1.group.title }
             return $0.group.id < $1.group.id
-        }.prefix(maxGroups).map(\.group)
+        }
+        var selected: [SmartOrganizationGroup] = []
+        var laneCounts: [String: Int] = [:]
+        for candidate in sorted {
+            let lane = Self.lane(for: candidate.group)
+            guard laneCounts[lane, default: 0] < Self.laneLimit(lane, maxGroups: maxGroups) else {
+                continue
+            }
+            selected.append(candidate.group)
+            laneCounts[lane, default: 0] += 1
+            if selected.count == maxGroups { break }
+        }
+        return selected
+    }
+
+    private static func lane(for group: SmartOrganizationGroup) -> String {
+        switch group.kind {
+        case .nearDuplicate:
+            return "duplicates"
+        case .semantic:
+            return "semantic"
+        case .category:
+            if group.id.hasPrefix("category:Screenshots/") { return "screenshots" }
+            if group.id.hasPrefix("category:School/") { return "school" }
+            if group.id.hasPrefix("category:Projects/") { return "projects" }
+            return "general"
+        }
+    }
+
+    private static func laneLimit(_ lane: String, maxGroups: Int) -> Int {
+        let preferred: Int
+        switch lane {
+        case "duplicates": preferred = 3
+        case "screenshots": preferred = 4
+        case "school": preferred = 4
+        case "projects": preferred = 2
+        case "semantic": preferred = 5
+        default: preferred = 4
+        }
+        return min(maxGroups, preferred)
     }
 
     private static func semanticTitle(
