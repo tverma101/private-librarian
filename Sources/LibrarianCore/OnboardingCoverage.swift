@@ -11,6 +11,20 @@ public enum OnboardingExclusions {
         ".Trash"
     ]
 
+    /// Files that are implementation noise rather than stable user content.
+    /// Browser partial downloads are ignored until the browser atomically
+    /// renames them to their completed filename; Finder metadata and Office
+    /// lock files should never become Review/Smart Group clutter.
+    public static func isTransientOrSystemFile(path: String) -> Bool {
+        let name = (path as NSString).lastPathComponent
+        let lower = name.lowercased()
+        if name == ".DS_Store" || name == ".localized" { return true }
+        if name.hasPrefix("._") || name.hasPrefix("~$") { return true }
+        return [".crdownload", ".download", ".part", ".partial"].contains {
+            lower.hasSuffix($0)
+        }
+    }
+
     public static func defaultPaths(catalogPath: String? = nil,
                                     modelPaths: [String] = []) -> [String] {
         var paths: [String] = []
