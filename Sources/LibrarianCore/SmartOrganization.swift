@@ -197,4 +197,22 @@ public extension Catalog {
             similarityClusters: try similarityClusters()
         )
     }
+
+    /// Remove category rows that no longer lead to any membership. This is
+    /// catalog-only cleanup: source files are never touched. Ancestors of an
+    /// active category are retained so hierarchical paths remain intact.
+    func pruneUnusedVirtualCategories() throws {
+        try run("""
+            WITH RECURSIVE used(id) AS (
+                SELECT DISTINCT category_id FROM category_membership
+                UNION
+                SELECT c.parent_id
+                FROM virtual_categories c
+                JOIN used u ON c.id = u.id
+                WHERE c.parent_id IS NOT NULL
+            )
+            DELETE FROM virtual_categories
+            WHERE id NOT IN (SELECT id FROM used)
+            """)
+    }
 }
