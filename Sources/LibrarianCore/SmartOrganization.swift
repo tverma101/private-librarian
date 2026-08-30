@@ -38,6 +38,16 @@ public struct SmartOrganizationPlanner: Sendable {
     public let minimumGroupSize: Int
     public let minimumSemanticConfidence: Float
 
+    private static let allowedCourseDepartments: Set<String> = [
+        "ART", "BIO", "BUS", "CHM", "COM", "CSC", "ECO", "ENG",
+        "FRE", "HIS", "MAT", "PHY", "PSY", "SOC", "SPA"
+    ]
+
+    private static let allowedScreenshotSubtypes: Set<String> = [
+        "code", "school", "lms", "receipt", "error", "conversation",
+        "social", "map", "meme", "reference"
+    ]
+
     public init(maxGroups: Int = 18, minimumGroupSize: Int = 2,
                 minimumSemanticConfidence: Float = 0.72) {
         self.maxGroups = max(1, maxGroups)
@@ -190,16 +200,22 @@ public struct SmartOrganizationPlanner: Sendable {
             .joined(separator: "/")
     }
 
+    /// Presentation-layer taxonomy firewall. Catalog rows can come from old
+    /// classifiers, imports, learned rules, or future model providers, so the
+    /// dashboard must never assume that a repeated category string is safe or
+    /// useful merely because more than one file has it.
     private static func categorySpec(_ path: String) ->
         (title: String, subtitle: String, priority: Int)? {
-        let parts = path.split(separator: "/").map(String.init)
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard let root = parts.first else { return nil }
 
-        if root == "Screenshots", parts.count == 2 {
-            return ("\(humanize(parts[1])) screenshots", "Screenshots", 112)
+        if root == "Screenshots", parts.count == 2,
+           let subtype = canonicalScreenshotSubtype(parts[1]) {
+            return ("\(humanize(subtype)) screenshots", "Screenshots", 112)
         }
-        if root == "School", parts.count == 2 {
-            return (parts[1], "School", 110)
+        if root == "School", parts.count == 2,
+           let course = canonicalCourse(parts[1]) {
+            return (course, "School", 110)
         }
         if path == "Projects/Code" {
             return ("Code projects", "Projects", 106)
@@ -215,6 +231,28 @@ public struct SmartOrganizationPlanner: Sendable {
         if path == "Documents/PDF" { return ("PDFs", "Documents", 72) }
         if path == "Documents/Office" { return ("Office documents", "Documents", 72) }
         return nil
+    }
+
+    private static func canonicalScreenshotSubtype(_ value: String) -> String? {
+        guard value == value.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        let canonical = value.lowercased()
+        guard value == canonical, allowedScreenshotSubtypes.contains(canonical) else { return nil }
+        return canonical
+    }
+
+    private static func canonicalCourse(_ value: String) -> String? {
+        guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              value == value.uppercased() else { return nil }
+        let pieces = value.split(separator: "-", omittingEmptySubsequences: false)
+        guard pieces.count == 2 else { return nil }
+        let department = String(pieces[0])
+        let number = String(pieces[1])
+        guard allowedCourseDepartments.contains(department),
+              (3...4).contains(number.count),
+              number.unicodeScalars.allSatisfy({ (48...57).contains($0.value) }) else {
+            return nil
+        }
+        return "\(department)-\(number)"
     }
 
     private static func humanize(_ value: String) -> String {
