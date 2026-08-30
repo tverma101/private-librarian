@@ -63,6 +63,13 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
+      - name: Local specialist runtime and memory contract
+        run: |
+          python3 -m py_compile scripts/specialist.py scripts/provision_specialist_models.py
+          python3 scripts/specialist.py --syntax-check | tee specialist-contract.json
+          grep -q 'warm-encoders-only; transient-exclusive; disk-offload-available' specialist-contract.json
+          python3 scripts/provision_specialist_models.py --list >/dev/null
+
       - name: Vendored SQLCipher provenance
         run: |
           test -f ThirdParty/sqlcipher/sqlite3.c
