@@ -9,6 +9,7 @@ public struct SearchService: Sendable {
     let catalog: Catalog
     private let enableLocalEmbeddings: Bool
     public let embeddingProvider: any EmbeddingProvider
+    private static let vectorBatchSize: Int64 = 512
 
     public init(catalog: Catalog, enableLocalEmbeddings: Bool? = nil, embeddingProvider: (any EmbeddingProvider)? = nil) {
         self.catalog = catalog
@@ -71,56 +72,138 @@ public struct SearchService: Sendable {
         return hits
     }
 
+    /// Keep only the best `limit` scores seen so far. This is deliberately a
+    /// tiny dictionary rather than an array proportional to the catalog size.
+    private static func considerHighest(
+        fileID: String, path: String, score: Float,
+        limit: Int, best: inout [String: (score: Float, path: String)]
+    ) {
+        if let current = best[fileID] {
+            if score > current.score { best[fileID] = (score, path) }
+            return
+        }
+        if best.count < limit {
+            best[fileID] = (score, path)
+            return
+        }
+        guard let weakest = best.min(by: { $0.value.score < $1.value.score }),
+              score > weakest.value.score else { return }
+        best.removeValue(forKey: weakest.key)
+        best[fileID] = (score, path)
+    }
+
+    private static func considerLowest(
+        fileID: String, path: String, distance: Float,
+        limit: Int, best: inout [String: (distance: Float, path: String)]
+    ) {
+        if let current = best[fileID] {
+            if distance < current.distance { best[fileID] = (distance, path) }
+            return
+        }
+        if best.count < limit {
+            best[fileID] = (distance, path)
+            return
+        }
+        guard let worst = best.max(by: { $0.value.distance < $1.value.distance }),
+              distance < worst.value.distance else { return }
+        best.removeValue(forKey: worst.key)
+        best[fileID] = (distance, path)
+    }
+
     /// Visual similarity: rank indexed images by Vision feature-print distance to the query image.
-    /// Uses the on-device VNGenerateImageFeaturePrint embedding stored in visual_features.
+    /// Rows are read from SQLCipher in fixed batches and only top-K candidates
+    /// are retained, so query memory does not scale with the number of images.
     public func visualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20, threshold: Float = 0.5) throws -> [(fileID: String, path: String, distance: Float)] {
         guard limit > 0 else { return [] }
         guard let data = try? broker.completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes), !data.isEmpty,
               let fp = VisionImageAnalyzer.featurePrint(data: data) else { return [] }
         let qData = fp.data
-        var scored: [(String, String, Float)] = []
-        for (fid, blob) in try catalog.allVisualFeatures() {
-            guard let row = try catalog.fileRow(id: fid) else { continue }
-            guard let dist = VisionImageAnalyzer.distance(qData, blob) else { continue }
-            if dist <= threshold { scored.append((fid, row.path, dist)) }
+        var best: [String: (distance: Float, path: String)] = [:]
+        var lastRowID: Int64 = 0
+        while true {
+            let rows = try catalog.query("""
+                SELECT CAST(v.rowid AS TEXT), v.file_id, v.featureprint, f.path
+                FROM visual_features v JOIN files f ON f.id=v.file_id
+                WHERE f.status='indexed' AND v.rowid>?
+                ORDER BY v.rowid LIMIT ?
+                """, binds: [.int(lastRowID), .int(Self.vectorBatchSize)]) { row in
+                    (Int64(row.text(0) ?? "0") ?? 0,
+                     row.text(1) ?? "", row.blob(2) ?? Data(), row.text(3) ?? "")
+                }
+            guard !rows.isEmpty else { break }
+            for (rowID, fid, blob, candidatePath) in rows {
+                lastRowID = max(lastRowID, rowID)
+                guard let dist = VisionImageAnalyzer.distance(qData, blob), dist <= threshold else { continue }
+                Self.considerLowest(fileID: fid, path: candidatePath, distance: dist,
+                                    limit: limit, best: &best)
+            }
+            if rows.count < Int(Self.vectorBatchSize) { break }
         }
-        scored.sort { $0.2 < $1.2 }
-        return Array(scored.prefix(limit))
+        return best.map { ($0.key, $0.value.path, $0.value.distance) }
+            .sorted { $0.2 < $1.2 }
     }
 
     // MARK: - Tier-2 local embeddings (CLIP / MiniLM, still offline — no network)
 
+    private func scoreEmbeddingTable(
+        table: String, alias: String, modelID: String, query: Data,
+        threshold: Float, limit: Int,
+        best: inout [String: (score: Float, path: String)]
+    ) throws {
+        precondition(table == "embeddings" || table == "embedding_chunks")
+        precondition(alias == "e" || alias == "c")
+        var lastRowID: Int64 = 0
+        while true {
+            let rows = try catalog.query("""
+                SELECT CAST(\(alias).rowid AS TEXT), \(alias).file_id, \(alias).vector, f.path
+                FROM \(table) \(alias) JOIN files f ON f.id=\(alias).file_id
+                WHERE f.status='indexed' AND \(alias).model=? AND \(alias).rowid>?
+                ORDER BY \(alias).rowid LIMIT ?
+                """, binds: [.text(modelID), .int(lastRowID), .int(Self.vectorBatchSize)]) { row in
+                    (Int64(row.text(0) ?? "0") ?? 0,
+                     row.text(1) ?? "", row.blob(2) ?? Data(), row.text(3) ?? "")
+                }
+            guard !rows.isEmpty else { break }
+            for (rowID, fid, blob, candidatePath) in rows {
+                lastRowID = max(lastRowID, rowID)
+                guard let sim = LocalModelBridge.cosineSimilarity(query, blob), sim >= threshold else { continue }
+                Self.considerHighest(fileID: fid, path: candidatePath, score: sim,
+                                     limit: limit, best: &best)
+            }
+            if rows.count < Int(Self.vectorBatchSize) { break }
+        }
+    }
+
     /// Semantic text search over local MiniLM embeddings (384-d, cosine).
-    /// Chunk-aware: text can span chunks (score = max over chunks). Requires provisioned model; otherwise [].
+    /// Chunk-aware: text can span chunks (score = max over chunks). Both tables
+    /// are scanned in fixed batches while only the best K file IDs stay live.
     public func semanticSearch(query text: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
         guard limit > 0 else { return [] }
         guard enableLocalEmbeddings else { return [] }
         guard embeddingProvider.preflight.available,
               let q = embeddingProvider.embedText(text), !q.data.isEmpty else { return [] }
-        let embedRows = try catalog.query(
-            "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE f.status='indexed' AND e.model=?",
-            binds: [.text(embeddingProvider.textModelID)]
-        ) { r in (r.text(0) ?? "", r.blob(1) ?? Data(), r.text(2) ?? "") }
-        let chunkRows = try catalog.query(
-            "SELECT c.file_id, c.vector, f.path FROM embedding_chunks c JOIN files f ON f.id=c.file_id WHERE f.status='indexed' AND c.model=?",
-            binds: [.text(embeddingProvider.textModelID)]
-        ) { r in (r.text(0) ?? "", r.blob(1) ?? Data(), r.text(2) ?? "") }
         var best: [String: (score: Float, path: String)] = [:]
-        for (fid, blob, path) in embedRows {
-            guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
-            if sim < threshold { continue }
-            if let cur = best[fid], cur.score >= sim { continue }
-            best[fid] = (sim, path)
-        }
-        for (fid, blob, path) in chunkRows {
-            guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
-            if sim < threshold { continue }
-            if let cur = best[fid], cur.score >= sim { continue }
-            best[fid] = (sim, path)
-        }
-        var scored: [(String, String, Float)] = best.map { ($0.key, $0.value.path, $0.value.score) }
-        scored.sort { $0.2 > $1.2 }
-        return Array(scored.prefix(limit))
+        try scoreEmbeddingTable(table: "embeddings", alias: "e",
+                                modelID: embeddingProvider.textModelID,
+                                query: q.data, threshold: threshold,
+                                limit: limit, best: &best)
+        try scoreEmbeddingTable(table: "embedding_chunks", alias: "c",
+                                modelID: embeddingProvider.textModelID,
+                                query: q.data, threshold: threshold,
+                                limit: limit, best: &best)
+        return best.map { ($0.key, $0.value.path, $0.value.score) }
+            .sorted { $0.2 > $1.2 }
+    }
+
+    private func scoreImageEmbeddingTable(
+        query: Data, modelID: String, threshold: Float, limit: Int
+    ) throws -> [(fileID: String, path: String, score: Float)] {
+        var best: [String: (score: Float, path: String)] = [:]
+        try scoreEmbeddingTable(table: "embeddings", alias: "e", modelID: modelID,
+                                query: query, threshold: threshold,
+                                limit: limit, best: &best)
+        return best.map { ($0.key, $0.value.path, $0.value.score) }
+            .sorted { $0.2 > $1.2 }
     }
 
     /// Visual similarity via local CLIP embeddings (512-d, cosine) — higher quality than Vision feature-print.
@@ -131,17 +214,8 @@ public struct SearchService: Sendable {
         guard let bytes = try? broker.completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes),
               embeddingProvider.preflight.available,
               let q = embeddingProvider.embedImageBytes(bytes), !q.data.isEmpty else { return [] }
-        let rows = try catalog.query(
-            "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE f.status='indexed' AND e.model=?",
-            binds: [.text(embeddingProvider.imageModelID)]
-        ) { r in (r.text(0) ?? "", r.blob(1) ?? Data(), r.text(2) ?? "") }
-        var scored: [(String, String, Float)] = []
-        for (fid, blob, path) in rows {
-            guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
-            if sim >= threshold { scored.append((fid, path, sim)) }
-        }
-        scored.sort { $0.2 > $1.2 }
-        return Array(scored.prefix(limit))
+        return try scoreImageEmbeddingTable(query: q.data, modelID: embeddingProvider.imageModelID,
+                                            threshold: threshold, limit: limit)
     }
 
     /// Compatibility wrapper for callers that do not provide a broker.
@@ -151,24 +225,14 @@ public struct SearchService: Sendable {
     }
 
     /// Cross-modal text → image search: encode the text query with CLIP's text encoder
-    /// (same 512-d joint space as image CLIP) and rank indexed CLIP image embeddings by cosine.
-    /// Requires Models/clip-vit-base-patch32 provisioned; otherwise returns [].
+    /// (same 512-d joint space as image vectors) and rank indexed CLIP image embeddings by cosine.
     public func clipTextToImageSearch(query text: String, limit: Int = 20, threshold: Float = 0.22) throws -> [(fileID: String, path: String, score: Float)] {
         guard limit > 0 else { return [] }
         guard enableLocalEmbeddings else { return [] }
         guard embeddingProvider.preflight.available,
               let q = embeddingProvider.embedJointText(text), !q.data.isEmpty else { return [] }
-        let rows = try catalog.query(
-            "SELECT e.file_id, e.vector, f.path FROM embeddings e JOIN files f ON f.id = e.file_id WHERE f.status='indexed' AND e.model=?",
-            binds: [.text(embeddingProvider.imageModelID)]
-        ) { r in (r.text(0) ?? "", r.blob(1) ?? Data(), r.text(2) ?? "") }
-        var scored: [(String, String, Float)] = []
-        for (fid, blob, path) in rows {
-            guard let sim = LocalModelBridge.cosineSimilarity(q.data, blob) else { continue }
-            if sim >= threshold { scored.append((fid, path, sim)) }
-        }
-        scored.sort { $0.2 > $1.2 }
-        return Array(scored.prefix(limit))
+        return try scoreImageEmbeddingTable(query: q.data, modelID: embeddingProvider.imageModelID,
+                                            threshold: threshold, limit: limit)
     }
 
     /// Unified visual search: prefers CLIP when provisioned, falls back to Vision feature-print.
