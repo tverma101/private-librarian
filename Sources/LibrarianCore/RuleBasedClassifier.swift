@@ -56,6 +56,7 @@ public struct RuleBasedClassifier: Sendable {
         }
 
         var confidence = 0.55 // base for kind-only classification
+        let isCodeProject = Self.looksLikeCodeProject(identity: identity)
 
         // Content-aware labels from bounded text (deterministic keyword rules).
         if let text = textContent?.lowercased() {
@@ -65,17 +66,27 @@ public struct RuleBasedClassifier: Sendable {
                 reasons.append("text:\(course)")
             }
             if !courseHits.isEmpty { confidence += 0.2 }
-            if text.contains("blackboard") || text.contains("canvas") || text.contains("moodle") {
-                cats.append("School")
-                reasons.append("text:lms-mention")
-            }
-            if text.contains("worksheet") || text.contains("assignment") || text.contains("homework") {
-                cats.append("Assignment")
-                reasons.append("text:assignment-word")
-            }
-            if text.contains("screenshot") {
-                cats.append("Screenshot")
-                reasons.append("text:screenshot-word")
+
+            // Generic LMS/purpose words are deliberately disabled for source
+            // code: "canvas", "assignment", and "screenshot" are ordinary
+            // programming vocabulary and caused random school/work labels.
+            if !isCodeProject {
+                let strongLMS = text.contains("blackboard")
+                    || text.contains("moodle")
+                    || text.contains("instructure")
+                let contextualCanvas = text.contains("canvas")
+                    && (text.contains("course")
+                        || text.contains("module")
+                        || text.contains("assignment")
+                        || text.contains("instructure"))
+                if strongLMS || contextualCanvas {
+                    cats.append("School")
+                    reasons.append("text:lms-context")
+                }
+                if text.contains("worksheet") || text.contains("assignment") || text.contains("homework") {
+                    cats.append("Assignment")
+                    reasons.append("text:assignment-word")
+                }
             }
         }
 
@@ -90,7 +101,7 @@ public struct RuleBasedClassifier: Sendable {
         // Source files and well-known project manifests get one broad project
         // bucket. We deliberately do not invent a folder from every repository,
         // framework, language, or package name.
-        if Self.looksLikeCodeProject(identity: identity) {
+        if isCodeProject {
             cats.append("Projects/Code")
             reasons.append("project:code")
             confidence += 0.15
@@ -109,16 +120,13 @@ public struct RuleBasedClassifier: Sendable {
             }
         }
 
-        // Filename tokens as weak signals.
+        // A screenshot-looking filename is only a weak image hint. Text files
+        // named things like screenshot-notes.md must not enter screenshot views.
         let tokens = Set(evidence.filenameTokens)
-        if tokens.contains("screenshot") {
+        if identity.kind == .image, tokens.contains("screenshot") {
             cats.append("Screenshot")
             reasons.append("filename:screenshot")
             confidence += 0.1
-        }
-        if tokens.contains(where: { $0.hasPrefix("csc") || $0.hasPrefix("mat") }) {
-            cats.append("School")
-            reasons.append("filename:course-like-token")
         }
 
         if let screenshot, screenshot.isScreenshot {
@@ -148,11 +156,12 @@ public struct RuleBasedClassifier: Sendable {
     }
 
     static func courseTokens(in lowercasedText: String) -> [String] {
-        // Common college course codes. Keeping the department prefix bounded
-        // avoids treating arbitrary product/version numbers as courses.
+        // Common college course codes. Explicit alphanumeric boundaries avoid
+        // treating words like "material" as MAT while still accepting useful
+        // filename spellings such as MAT171_final and mat_171-notes.
         var found: [String] = []
         let pattern = try! NSRegularExpression(
-            pattern: #"\b(art|bio|bus|chm|com|csc|eco|eng|fre|his|mat|phy|psy|soc|spa)[ -]?(\d{3,4})\b"#)
+            pattern: #"(?<![a-z0-9])(art|bio|bus|chm|com|csc|eco|eng|fre|his|mat|phy|psy|soc|spa)[ _-]?(\d{3,4})(?![a-z0-9])"#)
         let ns = lowercasedText as NSString
         for m in pattern.matches(in: lowercasedText, range: NSRange(location: 0, length: ns.length)) {
             let dept = ns.substring(with: m.range(at: 1)).uppercased()
