@@ -107,6 +107,7 @@ final class SmartOrganizationTests: XCTestCase {
     func testNoSingleSignalCanMonopolizeSmartGroups() {
         var memberships: [(categoryPath: String, fileID: String)] = [
             ("School/MAT-171", "math-1"), ("School/MAT-171", "math-2"),
+            ("School/MAT-171", "math-3"),
             ("Screenshots/code", "shot-1"), ("Screenshots/code", "shot-2"),
             ("Projects/Code", "code-1"), ("Projects/Code", "code-2")
         ]
@@ -135,7 +136,7 @@ final class SmartOrganizationTests: XCTestCase {
         XCTAssertEqual(groups.count, 12)
         XCTAssertLessThanOrEqual(groups.filter { $0.kind == .nearDuplicate }.count, 3)
         XCTAssertLessThanOrEqual(groups.filter { $0.kind == .semantic }.count, 5)
-        XCTAssertTrue(groups.contains(where: { $0.title == "MAT-171" }), "course group was crowded out: \(groups.map(\.title))")
+        XCTAssertTrue(groups.contains(where: { $0.title == "MAT-171" }), "better-supported course was crowded out: \(groups.map(\.title))")
         XCTAssertTrue(groups.contains(where: { $0.title == "Code screenshots" }), "screenshot group was crowded out: \(groups.map(\.title))")
         XCTAssertTrue(groups.contains(where: { $0.title == "Code projects" }), "project group was crowded out: \(groups.map(\.title))")
     }
