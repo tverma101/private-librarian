@@ -359,14 +359,13 @@ final class LibrarianModel: ObservableObject {
     func refreshDashboard() {
         guard let catalog else { return }
         do {
-            // Indexing and live reconciliation persist the similarity graph
-            // incrementally. Do not rebuild the entire graph on the main
-            // actor every time a dashboard counter refreshes.
-            organizationGraph = try catalog.refreshOrganizationGraph()
+            // The dashboard only needs aggregate graph counts. Do not load the
+            // full organization graph or every similarity family onto the main
+            // actor just to refresh counters on a huge catalog.
             dashboard = try catalog.dashboard()
-            reviewItems = try catalog.reviewItems()
+            reviewItems = try catalog.reviewItems(limit: 200)
             learnedRules = try catalog.listRules()
-            similarityClusters = try catalog.similarityClusters()
+            similarityClusters = try catalog.boundedSimilarityClusters(limit: 200)
             smartGroups = try catalog.smartOrganizationGroups()
             coverage = try catalog.coverage(roots: sources.map(\.path),
                                             excludedPaths: effectiveExcludedPaths)
@@ -381,26 +380,24 @@ final class LibrarianModel: ObservableObject {
         guard let catalog else { return [] }
         switch section {
         case .screenshots:
-            let plural = (try? catalog.fileSummaries(categoryPrefix: "Screenshots", limit: 200)) ?? []
-            let singular = (try? catalog.fileSummaries(categoryPrefix: "Screenshot", limit: 200)) ?? []
+            let plural = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshots", limit: 200)) ?? []
+            let singular = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshot", limit: 200)) ?? []
             return Array(Dictionary(uniqueKeysWithValues: (plural + singular).map { ($0.id, $0) })
                 .values.sorted { $0.path < $1.path }.prefix(200))
         case .school:
-            return (try? catalog.fileSummaries(categoryPrefix: "School", limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(categoryPrefix: "School", limit: 200)) ?? []
         case .projects:
-            return (try? catalog.fileSummaries(categoryPrefix: "Projects", limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(categoryPrefix: "Projects", limit: 200)) ?? []
         case .documents:
-            return (try? catalog.fileSummaries(categoryPrefix: "Documents", limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(categoryPrefix: "Documents", limit: 200)) ?? []
         case .media:
-            let all = (try? catalog.fileSummaries(limit: Int.max)) ?? []
-            return Array(all.filter { $0.kind == FileKind.audio.rawValue || $0.kind == FileKind.video.rawValue }.prefix(200))
+            return (try? catalog.boundedFileSummaries(kinds: [.audio, .video], limit: 200)) ?? []
         case .duplicates:
-            guard let duplicateIDs = try? catalog.duplicateFileIDs() else { return [] }
-            return (try? catalog.fileSummaries(limit: Int.max).filter { duplicateIDs.contains($0.id) }.prefix(200).map { $0 }) ?? []
+            return (try? catalog.boundedFileSummaries(duplicateOnly: true, limit: 200)) ?? []
         case .missing:
-            return (try? catalog.fileSummaries(status: "missing", limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(status: "missing", limit: 200)) ?? []
         default:
-            return (try? catalog.fileSummaries(limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(limit: 200)) ?? []
         }
     }
 
