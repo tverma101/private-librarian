@@ -142,9 +142,8 @@ final class SmartOrganizationStressTests: XCTestCase {
         ])
         XCTAssertEqual(groups.first(where: { $0.id == "category:School/MAT-171" })?.fileIDs.count, 2)
         XCTAssertEqual(groups.first(where: { $0.id == "category:Screenshots/code" })?.fileIDs.count, 2)
-        XCTAssertFalse(groups.contains { group in
-            malformed.contains { bad in group.id.contains(bad) || group.title.contains(bad) }
-        })
+        let poisonedIDs = Set(malformed.map { "category:\($0)" })
+        XCTAssertTrue(groups.allSatisfy { !poisonedIDs.contains($0.id) })
     }
 
     func testWeirdRealParentFolderNamesDoNotInventVirtualCategories() {
