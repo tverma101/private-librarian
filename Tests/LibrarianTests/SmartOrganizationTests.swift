@@ -128,4 +128,40 @@ final class SmartOrganizationTests: XCTestCase {
         XCTAssertFalse(names.contains("Image"), "unused legacy parent should be removed: \(names)")
         XCTAssertFalse(names.contains("obsolete-one-off-label"), "unused legacy leaf should be removed: \(names)")
     }
+
+    func testReindexReplacesOldMembershipAndPrunesRetiredTaxonomy() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("smart-upgrade-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = root.appendingPathComponent("main.swift")
+        try "import Foundation\nfunc run() {}\n".write(to: source, atomically: true, encoding: .utf8)
+
+        let catalog = try TestSupport.makeCatalog()
+        let indexer = Indexer(broker: SourceBroker(), catalog: catalog, scheduler: Scheduler())
+        XCTAssertEqual(try indexer.indexRoot(root), 1)
+
+        guard let file = try catalog.allFiles().first(where: { $0.path == source.path }) else {
+            return XCTFail("indexed file missing from catalog")
+        }
+        let obsolete = try catalog.ensureCategory(named: "Image/obsolete-one-off-label")
+        try catalog.run(
+            "INSERT OR IGNORE INTO category_membership(category_id, file_id, source) VALUES(?,?,'classifier')",
+            binds: [.int(obsolete), .text(file.id)])
+        try catalog.run("UPDATE files SET last_extractor='legacy-taxonomy' WHERE id=?",
+                        binds: [.text(file.id)])
+
+        XCTAssertEqual(try indexer.indexRoot(root), 1, "old processing identity must force one refresh")
+        let memberships = try catalog.categoryMemberships()
+            .filter { $0.fileID == file.id }
+            .map(\.categoryPath)
+        XCTAssertTrue(memberships.contains("Projects/Code"), "new broad project bucket missing: \(memberships)")
+        XCTAssertFalse(memberships.contains("Image/obsolete-one-off-label"), "old membership survived: \(memberships)")
+
+        let names = try catalog.query("SELECT name FROM virtual_categories ORDER BY name") {
+            $0.text(0) ?? ""
+        }
+        XCTAssertFalse(names.contains("obsolete-one-off-label"), "orphan taxonomy row survived: \(names)")
+    }
 }
