@@ -109,8 +109,10 @@ struct MagicContentView: View {
                                 .accessibilityLabel("Remove exclusion")
                         }
                     }
-                    Button(model.isIndexing ? "Indexing…" : "Index Now") { model.startIndexing() }
-                        .disabled(model.isIndexing || model.sources.isEmpty || model.sources.allSatisfy { model.isPaused($0) })
+                    Button(model.isIndexing ? "Stop Cleanup" : "Clean Up My Mac") {
+                        if model.isIndexing { model.cancelIndexing() } else { model.startIndexing() }
+                    }
+                    .disabled(!model.isIndexing && (model.sources.isEmpty || model.sources.allSatisfy { model.isPaused($0) }))
                 }
 
                 Section("Settings") {

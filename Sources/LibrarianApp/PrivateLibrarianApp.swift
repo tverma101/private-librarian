@@ -86,6 +86,7 @@ final class LibrarianModel: ObservableObject {
     private var bookmarkDataByPath: [String: Data] = [:]
     private var liveCoordinator: LiveIndexCoordinator?
     private var liveAccessLeases: [String: SecurityScopedBookmarkLease] = [:]
+    private var activeIndexCancellation: IndexCancellationToken?
 
     static var appSupportDir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -152,10 +153,17 @@ final class LibrarianModel: ObservableObject {
     func isPaused(_ source: SourceFolder) -> Bool { pausedPaths.contains(source.path) }
 
     func togglePaused(_ source: SourceFolder) {
+        let isPausing: Bool
         if pausedPaths.contains(source.path) {
             pausedPaths.remove(source.path)
+            isPausing = false
         } else {
             pausedPaths.insert(source.path)
+            isPausing = true
+        }
+        if isPausing, isIndexing {
+            activeIndexCancellation?.cancel()
+            log("stopping current cleanup after this file…")
         }
         savePausedPaths()
         restartLiveCoordinator()
@@ -163,6 +171,7 @@ final class LibrarianModel: ObservableObject {
     }
 
     func removeSource(_ source: SourceFolder) {
+        if isIndexing { activeIndexCancellation?.cancel() }
         try? catalog?.markRootUnscoped(root: source.path)
         sources.removeAll { $0.id == source.id }
         bookmarkDataByPath.removeValue(forKey: source.path)
@@ -328,30 +337,49 @@ final class LibrarianModel: ObservableObject {
         liveIndexRunning = coordinator.running
     }
 
+    func cancelIndexing() {
+        guard isIndexing else { return }
+        activeIndexCancellation?.cancel()
+        log("stopping cleanup after the current file…")
+    }
+
     func startIndexing() {
-        guard let indexer = makeIndexer(), !isIndexing else { return }
-        isIndexing = true
+        guard let indexer = makeIndexer(), let catalog, !isIndexing else { return }
         let jobs: [(SourceFolder, SecurityScopedBookmarkLease)] = sources
             .filter { !pausedPaths.contains($0.path) }
             .compactMap { source in sourceLease(for: source).map { (source, $0) } }
         guard !jobs.isEmpty else {
-            isIndexing = false
-            log("no authorized source folders available for indexing")
+            log("no authorized source folders available for cleanup")
             return
         }
 
-        Task.detached(priority: .userInitiated) { [weak self, jobs, indexer] in
+        var sessionOptions = ScalableIndexSession.Options()
+        sessionOptions.excludedPaths = effectiveExcludedPaths
+        sessionOptions.excludedDirectoryNames = OnboardingExclusions.defaultDirectoryNames
+        sessionOptions.enablePersistentEmbeddingWorker = localEmbeddingsEnabled
+        sessionOptions.respectAccessBackoff = false // explicit user cleanup retries permission state
+        let session = ScalableIndexSession(
+            broker: SourceBroker(), catalog: catalog, indexer: indexer, options: sessionOptions)
+        let token = IndexCancellationToken()
+        activeIndexCancellation = token
+        isIndexing = true
+        log("cleanup started")
+
+        Task.detached(priority: .userInitiated) { [weak self, jobs, session, token] in
             for (_, lease) in jobs {
-                _ = try? indexer.indexRoot(lease.url) { progress in
+                if token.isCancelled { break }
+                _ = try? session.indexRoot(lease.url, cancellation: token) { progress in
                     Task { @MainActor [weak self] in
-                        self?.log("indexing… \(progress.processed)/\(progress.total)")
+                        self?.log("cleanup… \(progress.scanned) files scanned")
                     }
                 }
             }
             await MainActor.run { [weak self] in
-                self?.isIndexing = false
-                self?.log("indexing complete")
-                self?.refreshDashboard()
+                guard let self else { return }
+                self.activeIndexCancellation = nil
+                self.isIndexing = false
+                self.log(token.isCancelled ? "cleanup stopped" : "cleanup complete")
+                self.refreshDashboard()
             }
         }
     }

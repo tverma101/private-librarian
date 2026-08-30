@@ -481,6 +481,15 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         onStateChange?()
     }
 
+    private func automaticRootSession() -> ScalableIndexSession {
+        var sessionOptions = ScalableIndexSession.Options()
+        sessionOptions.excludedPaths = options.excludedPaths
+        sessionOptions.excludedDirectoryNames = options.excludedDirectoryNames
+        sessionOptions.respectAccessBackoff = true
+        return ScalableIndexSession(
+            broker: broker, catalog: catalog, indexer: indexer, options: sessionOptions)
+    }
+
     private func processSinglePath(_ path: String) throws -> (changedID: String?, removedID: String?) {
         let previousID = try? catalog.fileID(forPath: path)
         do {
@@ -499,7 +508,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
             indexed = try handler(path)
         } else {
             if broker.isDirectory(at: path) {
-                _ = try indexer.indexRoot(URL(fileURLWithPath: path))
+                _ = try automaticRootSession().indexRoot(URL(fileURLWithPath: path))
                 return (nil, nil)
             }
             indexed = (try? indexer.indexOne(path: path, updateSimilarity: false)) ?? false
@@ -572,7 +581,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         let snapshot = roots
         lock.unlock()
         for root in snapshot where FileManager.default.fileExists(atPath: root.path) {
-            _ = try? indexer.indexRoot(root)
+            _ = try? automaticRootSession().indexRoot(root)
         }
     }
 

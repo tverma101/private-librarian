@@ -173,9 +173,13 @@ do {
         options.embeddingProviderKind = argValue("--provider")
         let indexer = Indexer(broker: broker, catalog: catalog, scheduler: Scheduler(), options: options)
         let t0 = Date()
-        let n = try indexer.indexRoot(url)
+        var sessionOptions = ScalableIndexSession.Options()
+        sessionOptions.enablePersistentEmbeddingWorker = hasFlag("--tier2")
+        let session = ScalableIndexSession(
+            broker: broker, catalog: catalog, indexer: indexer, options: sessionOptions)
+        let result = try session.indexRoot(url)
         let groups = try indexer.computeDuplicateGroups()
-        print("indexed \(n) files in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+        print("indexed \(result.processed) files (\(result.scanned) scanned) in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
         let metrics = indexer.workMetrics
         print("work-metrics visionCalls=\(metrics.visionCalls) ocrCalls=\(metrics.ocrCalls) clipCalls=\(metrics.clipCalls) textEmbedCalls=\(metrics.textEmbedCalls) decodeCalls=\(metrics.decodeCalls)")
         let similarity = indexer.similarityMetrics
