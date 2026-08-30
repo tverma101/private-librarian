@@ -18,8 +18,10 @@ jobs:
           fetch-depth: 0
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
-      - name: Apply exact patch
-        run: python3 scripts/apply_scale_wiring.py
+      - name: Apply exact patches
+        run: |
+          python3 scripts/apply_scale_wiring.py
+          python3 scripts/apply_folder_cleanup_scope.py
       - name: Check diff
         id: diff
         shell: bash
