@@ -35,7 +35,7 @@ public final class SecurityScopedBookmarkLease: @unchecked Sendable {
     public convenience init(bookmarkData: Data?) throws {
         try self.init(
             bookmarkData: bookmarkData,
-            resolver: Self.systemResolver,
+            resolver: { data in try Self.resolveSystemBookmark(data) },
             beginAccess: { $0.startAccessingSecurityScopedResource() },
             endAccess: { $0.stopAccessingSecurityScopedResource() }
         )
@@ -76,7 +76,7 @@ public final class SecurityScopedBookmarkLease: @unchecked Sendable {
         return url.appendingPathComponent(String(requestedPath.dropFirst(prefix.count)))
     }
 
-    private static func systemResolver(_ data: Data) throws -> ResolvedBookmark {
+    private static func resolveSystemBookmark(_ data: Data) throws -> ResolvedBookmark {
         var stale = false
         let resolved: URL
         do {
