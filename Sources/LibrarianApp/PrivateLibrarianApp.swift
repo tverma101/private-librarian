@@ -71,12 +71,20 @@ final class LibrarianModel: ObservableObject {
             refreshDashboard()
         }
     }
+    @Published var localModelProfile: LocalModelProfile {
+        didSet {
+            UserDefaults.standard.set(localModelProfile.rawValue, forKey: "local-model-profile-v1")
+            restartLiveCoordinator()
+            refreshDashboard()
+        }
+    }
     @Published var searchMode: String = "auto" // auto | exact | semantic | visual | clipText
 
     var isTier2Provisioned: Bool {
         CoreMLMobileCLIPProvider.isAvailable
             || LocalModelBridge.isProvisioned(.clipImage)
             || LocalModelBridge.isProvisioned(.miniLMText)
+            || !SpecialistModelBridge.availableModelIDs().isEmpty
     }
 
     var isLocalTranscriptionAvailable: Bool { AppLocalTranscription.isAvailable }
@@ -99,6 +107,8 @@ final class LibrarianModel: ObservableObject {
         self.localTranscriptionEnabled = UserDefaults.standard.bool(forKey: AppLocalTranscription.enabledDefaultsKey)
             && AppLocalTranscription.isAvailable
         self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
+        self.localModelProfile = LocalModelProfile(
+            rawValue: UserDefaults.standard.string(forKey: "local-model-profile-v1") ?? "fast") ?? .fast
         if let m = UserDefaults.standard.string(forKey: "tier2-search-mode-v1") { self.searchMode = m }
         loadBookmarks()
         loadExclusions()
@@ -280,6 +290,7 @@ final class LibrarianModel: ObservableObject {
         var options = Indexer.Options()
         options.enableLocalEmbeddings = localEmbeddingsEnabled
         options.embeddingProviderKind = CoreMLMobileCLIPProvider.isAvailable ? "coreml-mobileclip" : nil
+        options.localModelProfile = localModelProfile
         options.excludedPaths = effectiveExcludedPaths
 
         let transcriptionProvider: any SpeechTranscriptionProvider

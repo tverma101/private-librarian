@@ -130,6 +130,13 @@ struct MagicContentView: View {
                     Toggle("Local embeddings", isOn: $model.localEmbeddingsEnabled)
                         .help(model.isTier2Provisioned ? "On-device only — no network" : "Provision Models/ first")
                         .disabled(!model.isTier2Provisioned)
+                    Picker("Model profile", selection: $model.localModelProfile) {
+                        Text("Fast · embeddings only").tag(LocalModelProfile.fast)
+                        Text("Balanced · specialist fallback").tag(LocalModelProfile.balanced)
+                        Text("Quality · heavy fallback allowed").tag(LocalModelProfile.quality)
+                    }
+                    .pickerStyle(.menu)
+                    .help("Models are local-only and never downloaded automatically. Heavy models run only on ambiguous files.")
                     Toggle("Local transcription", isOn: $model.localTranscriptionEnabled)
                         .help("Opt-in whisper.cpp transcription. Nothing is downloaded automatically.")
                         .disabled(!model.isLocalTranscriptionAvailable)
