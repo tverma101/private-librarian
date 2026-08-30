@@ -17,10 +17,27 @@ public struct LiveRawEvent: Sendable, Equatable {
 }
 public final class LiveCoalescingQueue: @unchecked Sendable {
     private let lock=NSLock(); private var pending:[String:LiveRawEvent]=[:]; private var needsFullRescan=false
-    public let debounceInterval:TimeInterval
+    public let debounceInterval:TimeInterval; public let maxPendingPaths:Int
     public struct CoalescedBatch:Sendable{public let paths:[String]; public let needsFullRescan:Bool; public let rawEvents:[LiveRawEvent]}
-    public init(debounceInterval:TimeInterval=0.8){self.debounceInterval=debounceInterval}
-    public func ingest(_ evs:[LiveRawEvent]){guard !evs.isEmpty else{return}; lock.lock(); for ev in evs{if LiveCoalescingQueue.isDroppedEvent(flags:ev.flags){needsFullRescan=true}; pending[LiveCoalescingQueue.normalizedPath(ev.path)]=ev}; lock.unlock()}
+    public init(debounceInterval:TimeInterval=0.8,maxPendingPaths:Int=4_096){self.debounceInterval=debounceInterval;self.maxPendingPaths=max(1,maxPendingPaths)}
+    public func ingest(_ evs:[LiveRawEvent]){
+        guard !evs.isEmpty else{return}
+        lock.lock(); defer{lock.unlock()}
+        for ev in evs{
+            if LiveCoalescingQueue.isDroppedEvent(flags:ev.flags){
+                needsFullRescan=true; pending.removeAll(keepingCapacity:false); continue
+            }
+            // Once a storm has collapsed to reconciliation, retaining more
+            // individual compiler-output paths only wastes memory. The later
+            // full scan is the source of truth.
+            if needsFullRescan{continue}
+            let key=LiveCoalescingQueue.normalizedPath(ev.path)
+            if pending[key] == nil && pending.count >= maxPendingPaths{
+                needsFullRescan=true; pending.removeAll(keepingCapacity:false); continue
+            }
+            pending[key]=ev
+        }
+    }
     public static func isDroppedEvent(flags:UInt32)->Bool{let m=LiveRawEvent.mustScanSubDirs|LiveRawEvent.userDropped|LiveRawEvent.kernelDropped|LiveRawEvent.historyDone|LiveRawEvent.rootChanged; return (flags & m) != 0}
     public static func normalizedPath(_ p:String)->String{if p.count>1 && p.hasSuffix("/"){return String(p.dropLast())}; return p}
     public func drain()->CoalescedBatch?{lock.lock(); defer{lock.unlock()}; guard !pending.isEmpty || needsFullRescan else{return nil}; let b=CoalescedBatch(paths:Array(pending.keys).sorted(),needsFullRescan:needsFullRescan,rawEvents:Array(pending.values)); pending.removeAll(); needsFullRescan=false; return b}
@@ -38,13 +55,17 @@ public enum LiveExclusions{
                                   directoryNames: Set<String> = OnboardingExclusions.defaultDirectoryNames)->Bool{
         let n=LiveCoalescingQueue.normalizedPath(path)
         for p in prefixes{if SourceBroker.isPath(n,under:p){return true}}
-        return n.split(separator: "/").contains { directoryNames.contains(String($0)) }
+        if OnboardingExclusions.isTransientOrSystemFile(path:n){return true}
+        return n.split(separator: "/").contains {
+            OnboardingExclusions.isExcludedDirectoryName(String($0),configured:directoryNames)
+        }
     }
 }
 public final class LiveIndexCoordinator: @unchecked Sendable{
     public struct Options:Sendable{
         public var debounceInterval:TimeInterval=0.8
         public var maxCoalescedPaths:Int=2_000
+        public var maxPendingPaths:Int=4_096
         public var excludedPaths:[String]=[]
         public var excludedDirectoryNames: Set<String> = OnboardingExclusions.defaultDirectoryNames
         public init(){}
@@ -62,7 +83,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable{
     private var wakeObserver:NSObjectProtocol?
     public init(catalog:Catalog,indexer:Indexer,broker:SourceBroker,scheduler:Scheduler,roots:[URL],options:Options=Options()){
         self.catalog=catalog; self.indexer=indexer; self.broker=broker; self.scheduler=scheduler; self.roots=roots; self.options=options
-        self.queue=LiveCoalescingQueue(debounceInterval:options.debounceInterval)
+        self.queue=LiveCoalescingQueue(debounceInterval:options.debounceInterval,maxPendingPaths:options.maxPendingPaths)
         self.exclusionPrefixes=LiveExclusions.prefixes(catalogPath:catalog.path)
         self.exclusionPrefixes.append(contentsOf: options.excludedPaths)
     }
