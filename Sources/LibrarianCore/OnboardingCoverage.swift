@@ -121,6 +121,12 @@ public struct OnboardingCoverage: Codable, Sendable, Equatable {
         self.excludedCatalogRows = excludedCatalogRows
         self.roots = roots
     }
+
+    public static let empty = OnboardingCoverage(
+        authorizedRoots: 0, excludedRoots: 0, catalogedFiles: 0,
+        indexedFiles: 0, reviewFiles: 0, missingFiles: 0, excludedCatalogRows: 0,
+        roots: []
+    )
 }
 
 public struct CatalogDashboard: Codable, Sendable, Equatable {
