@@ -75,9 +75,11 @@ jobs:
           scripts/package_app.sh .build/release
           python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
 
-      - name: Commit verified integration if needed
+      - name: Commit verified production integration if needed
         run: |
-          git add Sources/LibrarianCore/Indexer.swift Sources/LibrarianApp/PrivateLibrarianApp.swift Sources/LibrarianApp/MagicViews.swift .github/workflows/ci.yml
+          # Normal CI workflow changes are written by the GitHub connector separately;
+          # the Actions token intentionally cannot mutate workflow files.
+          git add Sources/LibrarianCore/Indexer.swift Sources/LibrarianApp/PrivateLibrarianApp.swift Sources/LibrarianApp/MagicViews.swift
           if git diff --cached --quiet; then
             echo 'no production patch to commit'
             exit 0
