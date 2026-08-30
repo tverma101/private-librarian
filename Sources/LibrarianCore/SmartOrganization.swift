@@ -85,6 +85,41 @@ public struct SmartOrganizationPlanner: Sendable {
             ))
         }
 
+        // Downloads/Desktop chaos is usually useful at a *concept* level, not
+        // one pseudo-folder per extension. Merge installer-ish source kinds and
+        // media kinds into two broad human buckets while keeping their lower-
+        // level catalog evidence intact.
+        let installerMembers = Self.unionMembers(
+            ["Applications", "DiskImages", "Packages", "Archives"],
+            from: membersByCategory
+        )
+        if installerMembers.count >= minimumGroupSize {
+            candidates.append((
+                96,
+                SmartOrganizationGroup(
+                    id: "composite:installers-archives",
+                    title: "Installers & archives",
+                    subtitle: "\(installerMembers.count) items · apps, disk images & archives",
+                    kind: .category,
+                    fileIDs: installerMembers.sorted()
+                )
+            ))
+        }
+
+        let mediaMembers = Self.unionMembers(["Audio", "Video"], from: membersByCategory)
+        if mediaMembers.count >= minimumGroupSize {
+            candidates.append((
+                92,
+                SmartOrganizationGroup(
+                    id: "composite:media",
+                    title: "Recordings & media",
+                    subtitle: "\(mediaMembers.count) items · audio & video",
+                    kind: .category,
+                    fileIDs: mediaMembers.sorted()
+                )
+            ))
+        }
+
         for cluster in similarityClusters {
             let members = Array(Set(cluster.members)).sorted()
             guard members.count >= 2 else { continue }
@@ -144,6 +179,15 @@ public struct SmartOrganizationPlanner: Sendable {
         return selected
     }
 
+    private static func unionMembers(
+        _ paths: [String],
+        from membersByCategory: [String: Set<String>]
+    ) -> Set<String> {
+        paths.reduce(into: Set<String>()) { result, path in
+            result.formUnion(membersByCategory[path] ?? [])
+        }
+    }
+
     private static func lane(for group: SmartOrganizationGroup) -> String {
         switch group.kind {
         case .nearDuplicate:
@@ -151,6 +195,8 @@ public struct SmartOrganizationPlanner: Sendable {
         case .semantic:
             return "semantic"
         case .category:
+            if group.id == "composite:installers-archives" { return "downloads" }
+            if group.id == "composite:media" { return "media" }
             if group.id.hasPrefix("category:Screenshots/") { return "screenshots" }
             if group.id.hasPrefix("category:School/") { return "school" }
             if group.id.hasPrefix("category:Projects/") { return "projects" }
@@ -166,6 +212,7 @@ public struct SmartOrganizationPlanner: Sendable {
         case "school": preferred = 4
         case "projects": preferred = 2
         case "semantic": preferred = 5
+        case "downloads", "media": preferred = 1
         default: preferred = 4
         }
         return min(maxGroups, preferred)
