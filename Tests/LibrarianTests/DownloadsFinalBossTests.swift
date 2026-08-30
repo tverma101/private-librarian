@@ -2,7 +2,7 @@ import XCTest
 @testable import LibrarianCore
 
 final class DownloadsFinalBossTests: XCTestCase {
-    func testChaoticDownloadsCollapseIntoFewUsefulHumanGroups() {
+    func testChaoticDownloadsCollapseIntoFewUsefulHumanGroups() throws {
         var memberships: [(categoryPath: String, fileID: String)] = []
 
         func add(_ category: String, prefix: String, count: Int) {
