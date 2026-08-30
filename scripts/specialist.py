@@ -61,6 +61,97 @@ ALLOWED_CATEGORIES = {
 _CACHE = {}
 _TRUSTED = set()
 
+# Keep only the cheap image encoders warm. OCR/reasoners/VLMs are transient and
+# must never overlap each other or the warm encoder set on a memory-constrained Mac.
+WARM_MODELS = {
+    "siglip2-so400m-naflex",
+    "dinov3-vitb16-lvd1689m",
+}
+TRANSIENT_MODELS = {
+    "paddleocr-vl-1.6",
+    "minicpm-v-4.6",
+    "ling-3.0-tiny",
+    "lfm2.5-vl-3b",
+    "internvl3.5-4b",
+    "mimo-vl-7b-rl-2508",
+}
+OFFLOADABLE_MODELS = {
+    "minicpm-v-4.6",
+    "ling-3.0-tiny",
+    "lfm2.5-vl-3b",
+    "internvl3.5-4b",
+    "mimo-vl-7b-rl-2508",
+}
+OFFLOAD_ROOT = Path(os.environ.get(
+    "LIBRARIAN_SPECIALIST_OFFLOAD_DIR",
+    str(Path(tempfile.gettempdir()) / "private-librarian-model-offload"),
+))
+
+
+def _clear_accelerator_cache() -> None:
+    gc.collect()
+    try:
+        import torch
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _drop_cached_models(keep: set[str] | None = None) -> None:
+    keep = keep or set()
+    for model_id in list(_CACHE):
+        if model_id not in keep:
+            _CACHE.pop(model_id, None)
+    _clear_accelerator_cache()
+
+
+def _prepare_for_model(model_id: str) -> None:
+    if model_id in TRANSIENT_MODELS:
+        # A transient specialist gets the machine to itself. This is the key RAM invariant:
+        # SigLIP/DINO/Paddle/LLMs/VLMs never stack during an escalation batch.
+        _drop_cached_models()
+        return
+    # Warm embedding models may coexist with one another, but never with a leaked transient model.
+    leaked = set(_CACHE) - WARM_MODELS
+    if leaked:
+        _drop_cached_models(keep=set(_CACHE) & WARM_MODELS)
+
+
+def _large_model_load_kwargs(model_id: str) -> dict:
+    kwargs = {"low_cpu_mem_usage": True}
+    if model_id not in OFFLOADABLE_MODELS:
+        return kwargs
+    offload = OFFLOAD_ROOT / model_id
+    offload.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Apple Silicon uses unified memory, so CPU layer offload does not create a second RAM pool.
+    # We still provide a disk-offload folder for oversized quality-tier checkpoints and let
+    # Transformers/Accelerate choose it when the device map requires disk placement.
+    kwargs.update({
+        "device_map": "auto",
+        "offload_folder": str(offload),
+        "offload_state_dict": True,
+    })
+    return kwargs
+
+
+def _memory_policy_self_test() -> None:
+    # Dependency-free invariant test used by CI. Dummy objects prove transient escalation evicts
+    # warm encoders, while warm-to-warm transitions are allowed to retain both encoders.
+    _CACHE.clear()
+    _CACHE["siglip2-so400m-naflex"] = object()
+    _CACHE["dinov3-vitb16-lvd1689m"] = object()
+    _prepare_for_model("minicpm-v-4.6")
+    if _CACHE:
+        raise RuntimeError("transient model did not evict warm model cache")
+    _CACHE["siglip2-so400m-naflex"] = object()
+    _prepare_for_model("dinov3-vitb16-lvd1689m")
+    if set(_CACHE) != {"siglip2-so400m-naflex"}:
+        raise RuntimeError("warm model policy evicted compatible encoder")
+    _CACHE.clear()
+
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -148,10 +239,12 @@ def _load_siglip():
         return _CACHE[key]
     if not _verify_snapshot(key):
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
+    _prepare_for_model(key)
     from transformers import AutoModel, AutoProcessor
     path = str(_model_dir(key))
     processor = AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
-    model = AutoModel.from_pretrained(path, local_files_only=True, trust_remote_code=False)
+    model = AutoModel.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False, low_cpu_mem_usage=True)
     model.eval()
     _CACHE[key] = (model, processor)
     return model, processor
@@ -195,10 +288,12 @@ def _load_dino():
         return _CACHE[key]
     if not _verify_snapshot(key):
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
+    _prepare_for_model(key)
     from transformers import AutoImageProcessor, AutoModel
     path = str(_model_dir(key))
     processor = AutoImageProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
-    model = AutoModel.from_pretrained(path, local_files_only=True, trust_remote_code=False)
+    model = AutoModel.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False, low_cpu_mem_usage=True)
     model.eval()
     _CACHE[key] = (model, processor)
     return model, processor
@@ -223,6 +318,7 @@ def _paddle_ocr(raw: bytes, suffix: str = ".png") -> dict:
     key = "paddleocr-vl-1.6"
     if not _verify_snapshot(key):
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
+    _prepare_for_model(key)
     from paddleocr import PaddleOCRVL
     pipeline = _CACHE.get(key)
     if pipeline is None:
@@ -304,10 +400,12 @@ def _load_text_generator(model_id: str):
         return _CACHE[model_id]
     if not _verify_snapshot(model_id):
         raise RuntimeError(f"untrusted/unprovisioned model: {model_id}")
+    _prepare_for_model(model_id)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     path = str(_model_dir(model_id))
     tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=False)
-    model = AutoModelForCausalLM.from_pretrained(path, local_files_only=True, trust_remote_code=False, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False, **_large_model_load_kwargs(model_id))
     model.eval()
     _CACHE[model_id] = (model, tokenizer)
     return model, tokenizer
@@ -330,6 +428,7 @@ def _ling_classify(existing: dict) -> dict:
 def _vlm_classify(model_id: str, image, existing: dict) -> dict:
     if not _verify_snapshot(model_id):
         raise RuntimeError(f"untrusted/unprovisioned model: {model_id}")
+    _prepare_for_model(model_id)
     prompt = _classification_prompt(existing)
     path = str(_model_dir(model_id))
     if model_id in {"minicpm-v-4.6", "internvl3.5-4b"}:
@@ -337,7 +436,9 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
         cached = _CACHE.get(model_id)
         if cached is None:
             tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=True)
-            model = AutoModel.from_pretrained(path, local_files_only=True, trust_remote_code=True, device_map="auto")
+            model = AutoModel.from_pretrained(
+                path, local_files_only=True, trust_remote_code=True,
+                **_large_model_load_kwargs(model_id))
             model.eval()
             cached = (model, tokenizer)
             _CACHE[model_id] = cached
@@ -354,7 +455,8 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
         trust = model_id == "lfm2.5-vl-3b"
         processor = AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=trust)
         model = AutoModelForImageTextToText.from_pretrained(
-            path, local_files_only=True, trust_remote_code=trust, device_map="auto")
+            path, local_files_only=True, trust_remote_code=trust,
+            **_large_model_load_kwargs(model_id))
         model.eval()
         cached = (model, processor)
         _CACHE[model_id] = cached
@@ -374,25 +476,22 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
 def _release(model_id: str | None) -> dict:
     if model_id:
         _CACHE.pop(model_id, None)
+        _clear_accelerator_cache()
     else:
-        _CACHE.clear()
-    gc.collect()
-    try:
-        import torch
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-    return {"released": model_id or "all"}
+        _drop_cached_models()
+    return {"released": model_id or "all", "resident": sorted(_CACHE)}
 
 
 def _handle(request: dict) -> dict:
     op = request.get("op")
     if op == "status":
         ids = request.get("models") or list(MODEL_SPECS)
-        return {"offline": True, "available": {mid: _verify_snapshot(mid, verify_hashes=False) for mid in ids if mid in MODEL_SPECS}}
+        return {
+            "offline": True,
+            "available": {mid: _verify_snapshot(mid, verify_hashes=False) for mid in ids if mid in MODEL_SPECS},
+            "resident": sorted(_CACHE),
+            "memory_policy": "warm-encoders-only; transient-exclusive; disk-offload-available",
+        }
     if op == "release":
         model_id = request.get("model")
         return _release(str(model_id) if model_id else None)
@@ -426,7 +525,13 @@ def main() -> int:
     parser.add_argument("--syntax-check", action="store_true")
     args = parser.parse_args()
     if args.syntax_check:
-        print(json.dumps({"status": "ok", "offline": True, "models": sorted(MODEL_SPECS)}))
+        _memory_policy_self_test()
+        print(json.dumps({
+            "status": "ok",
+            "offline": True,
+            "models": sorted(MODEL_SPECS),
+            "memory_policy": "warm-encoders-only; transient-exclusive; disk-offload-available",
+        }))
         return 0
     if args.check:
         print(json.dumps({"offline": True, "available": {mid: _verify_snapshot(mid, verify_hashes=False) for mid in MODEL_SPECS}}))
