@@ -20,10 +20,10 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      - name: Apply exact integration patch once
+      - name: Apply exact integration patches once
         run: |
           if grep -q 'public var localModelProfile: LocalModelProfile = .fast' Sources/LibrarianCore/Indexer.swift; then
-            echo 'integration already applied'
+            echo 'specialist integration already applied'
           else
             python3 - <<'PY'
           from pathlib import Path
@@ -43,6 +43,7 @@ jobs:
           PY
             python3 scripts/apply_specialist_router_integration.py
           fi
+          python3 scripts/apply_model_memory_policy.py
 
       - name: Validate diff
         run: git diff --check
@@ -77,14 +78,14 @@ jobs:
 
       - name: Commit verified production integration if needed
         run: |
-          # Normal CI workflow changes are written by the GitHub connector separately;
-          # the Actions token intentionally cannot mutate workflow files.
-          git add Sources/LibrarianCore/Indexer.swift Sources/LibrarianApp/PrivateLibrarianApp.swift Sources/LibrarianApp/MagicViews.swift
+          # Workflow changes are written by the GitHub connector separately; the Actions token
+          # only commits production files that have passed every gate above.
+          git add Sources/LibrarianCore/Indexer.swift Sources/LibrarianApp/PrivateLibrarianApp.swift Sources/LibrarianApp/MagicViews.swift scripts/specialist.py
           if git diff --cached --quiet; then
             echo 'no production patch to commit'
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "feat: wire specialist models into cleanup"
+          git commit -m "perf: unload and offload specialist models"
           git push origin HEAD:feat/final-local-model-router
