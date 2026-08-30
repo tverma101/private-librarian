@@ -5,11 +5,37 @@ import Foundation
 /// user-prefix exclusions remain separately visible in coverage reporting.
 public enum OnboardingExclusions {
     public static let defaultDirectoryNames: Set<String> = [
+        // Version-control and dependency trees.
         ".git", ".hg", ".svn", ".bzr",
-        "node_modules", "DerivedData", "build", ".build", "dist",
-        "Pods", "Carthage", ".swiftpm", ".cache", "Caches", "__pycache__",
-        ".Trash"
+        "node_modules", "Pods", "Carthage", ".swiftpm",
+
+        // General build output and compiler caches.
+        "DerivedData", "build", ".build", "dist", "out", "obj", "target",
+        "WebKitBuild", "buck-out", ".cxx", ".ccache", ".sccache",
+
+        // Package-manager/framework caches that can contain enormous trees of
+        // third-party/generated files on developer machines.
+        ".gradle", ".m2", ".npm", ".yarn", ".pnpm-store", ".cargo", ".rustup",
+        ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite",
+        "coverage",
+
+        // Generic caches/runtime noise.
+        ".cache", "Caches", "__pycache__", ".Trash"
     ]
+
+    /// Some build systems create configuration-specific directory names rather
+    /// than one stable basename (for example Firefox `obj-*`, CMake
+    /// `cmake-build-*`, and Bazel's `bazel-*` symlink/output trees).
+    public static func isExcludedDirectoryName(
+        _ name: String,
+        configured: Set<String> = defaultDirectoryNames
+    ) -> Bool {
+        if configured.contains(name) { return true }
+        let lower = name.lowercased()
+        return lower.hasPrefix("obj-")
+            || lower.hasPrefix("cmake-build-")
+            || lower.hasPrefix("bazel-")
+    }
 
     /// Files that are implementation noise rather than stable user content.
     /// Browser partial downloads are ignored until the browser atomically
