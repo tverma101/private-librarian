@@ -5,6 +5,8 @@ on:
     branches: [fix/tier2-incremental-ci]
     paths:
       - scripts/apply_smart_groups_ui.py
+      - Tests/LibrarianTests/SmartOrganizationTests.swift
+      - Tests/LibrarianTests/VisionImageTests.swift
       - .github/workflows/smart-groups-verify.yml
 
 permissions:
