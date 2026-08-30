@@ -28,6 +28,7 @@ public final class IndexCancellationToken: @unchecked Sendable {
 /// - streaming discovery in bounded batches
 /// - disk-backed scan generations instead of a full in-memory seen set
 /// - cooperative cancellation
+/// - bounded inaccessible-prefix backoff
 /// - bounded per-batch similarity invalidation
 public final class ScalableIndexSession: @unchecked Sendable {
     public struct Options: Sendable {
@@ -38,6 +39,10 @@ public final class ScalableIndexSession: @unchecked Sendable {
         public var excludedDirectoryNames: Set<String> = OnboardingExclusions.defaultDirectoryNames
         public var enablePersistentEmbeddingWorker = false
         public var updateSimilarity = true
+        /// Automatic live reconciliation respects catalog backoff. A manual
+        /// cleanup/reauthorization sets this false so inaccessible roots are
+        /// retried immediately and fresh failures replace the old state.
+        public var respectAccessBackoff = false
         public init() {}
     }
 
@@ -80,6 +85,16 @@ public final class ScalableIndexSession: @unchecked Sendable {
         var missingMarked = 0
         var unreadableDirectories = 0
 
+        let activeBackoff: [String]
+        if options.respectAccessBackoff {
+            activeBackoff = (try? catalog.activeAccessBackoffEntries())?.map(\.prefix) ?? []
+        } else {
+            // A user-triggered cleanup or reauthorization is an explicit retry.
+            try? catalog.clearAccessBackoff(atOrUnder: root.path)
+            activeBackoff = []
+        }
+        let effectiveExcludedPrefixes = Array(Set(options.excludedPaths + activeBackoff)).sorted()
+
         let worker: LocalModelBridge.PersistentWorker? = {
             guard options.enablePersistentEmbeddingWorker,
                   indexer.embeddingProvider is LocalModelEmbeddingProvider,
@@ -92,11 +107,14 @@ public final class ScalableIndexSession: @unchecked Sendable {
         let discovered = try SourceBroker.enumerateBatches(
             root: root,
             maxDepth: options.maxDepth,
-            excludedPrefixes: options.excludedPaths,
+            excludedPrefixes: effectiveExcludedPrefixes,
             excludedDirectoryNames: options.excludedDirectoryNames,
             maxItems: options.maxFiles,
             batchSize: options.batchSize,
-            onUnreadableDirectory: { _ in unreadableDirectories += 1 }
+            onUnreadableDirectory: { [catalog] prefix, reason in
+                unreadableDirectories += 1
+                try? catalog.recordAccessBackoff(prefix: prefix, reason: reason)
+            }
         ) { [self] batch in
             guard cancellation?.isCancelled != true else { return false }
             var changedIDs = Set<String>()
@@ -157,7 +175,7 @@ public final class ScalableIndexSession: @unchecked Sendable {
                 for candidate in page {
                     cursor = candidate.path
                     if cancellation?.isCancelled == true { break missingSweep }
-                    if options.excludedPaths.contains(where: {
+                    if effectiveExcludedPrefixes.contains(where: {
                         SourceBroker.isPath(candidate.path, under: $0)
                     }) { continue }
                     if candidate.path.split(separator: "/").contains(where: {
@@ -172,9 +190,14 @@ public final class ScalableIndexSession: @unchecked Sendable {
                         try catalog.markMissing(path: candidate.path)
                         missingMarked += 1
                         removedIDs.insert(candidate.id)
+                    } catch BrokerError.statFailed(let error)
+                        where error == EACCES || error == EPERM {
+                        try? catalog.recordAccessBackoff(
+                            prefix: candidate.path, reason: "permission-denied")
+                        continue
                     } catch {
-                        // Permission denial, a symlink refusal, or a transient
-                        // filesystem error is not proof that the source vanished.
+                        // A symlink refusal or transient filesystem error is
+                        // not proof that the source vanished.
                         continue
                     }
                 }
