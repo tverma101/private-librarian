@@ -6,10 +6,25 @@ import Foundation
 /// the same strict output schema an LLM would be held to later.
 public struct RuleBasedClassifier: Sendable {
 
+    private static let sourceCodeExtensions: Set<String> = [
+        "c", "cc", "cpp", "cs", "go", "h", "hpp", "java", "js", "jsx",
+        "kt", "m", "mm", "php", "py", "rb", "rs", "sh", "swift", "ts", "tsx"
+    ]
+
+    private static let projectManifestNames: Set<String> = [
+        "cargo.toml", "dockerfile", "go.mod", "makefile", "package.json",
+        "package.swift", "pom.xml", "pyproject.toml", "requirements.txt"
+    ]
+
     public init() {}
 
     /// Multi-label classification (plan §26): kind / domain / course / purpose
     /// style labels derived only from evidence, bounded text, and optional Vision labels.
+    ///
+    /// Automatic categories intentionally use a bounded taxonomy. Raw Vision
+    /// labels stay as evidence/reason codes instead of becoming one-off virtual
+    /// folders. That keeps the organizer useful on a huge photo/screenshot
+    /// library instead of creating thousands of singleton categories.
     public func classify(fileID: String, identity: FileIdentity, evidence: EvidenceExtractor.Evidence,
                          textContent: String?, visionLabels: [(String, Float)] = [],
                          screenshot: ScreenshotAssessment? = nil) -> Classification {
@@ -50,7 +65,7 @@ public struct RuleBasedClassifier: Sendable {
                 reasons.append("text:\(course)")
             }
             if !courseHits.isEmpty { confidence += 0.2 }
-            if text.contains("blackboard") || text.contains("canvas") {
+            if text.contains("blackboard") || text.contains("canvas") || text.contains("moodle") {
                 cats.append("School")
                 reasons.append("text:lms-mention")
             }
@@ -64,16 +79,34 @@ public struct RuleBasedClassifier: Sendable {
             }
         }
 
-        // Vision labels for images (on-device VNClassifyImageRequest).
+        // Course codes in the filename are stronger than generic filename tokens.
+        let filename = (identity.path as NSString).lastPathComponent
+        for course in Self.courseTokens(in: filename.lowercased()) {
+            cats.append("School/\(course)")
+            reasons.append("filename:\(course)")
+            confidence += 0.1
+        }
+
+        // Source files and well-known project manifests get one broad project
+        // bucket. We deliberately do not invent a folder from every repository,
+        // framework, language, or package name.
+        if Self.looksLikeCodeProject(identity: identity) {
+            cats.append("Projects/Code")
+            reasons.append("project:code")
+            confidence += 0.15
+        }
+
+        // Vision labels for images (on-device VNClassifyImageRequest). Unknown
+        // labels are evidence only; only a small curated set becomes taxonomy.
         for (label, conf) in visionLabels.prefix(6) where conf >= 0.15 {
             let normalized = label.split(separator: ",").first.map(String.init) ?? label
-            let trimmed = normalized.trimmingCharacters(in: .whitespaces).prefix(32)
+            let trimmed = String(normalized.trimmingCharacters(in: .whitespaces).prefix(32))
             guard !trimmed.isEmpty else { continue }
-            // Map common Vision labels to readable categories; keep raw label too for search.
-            let cat = Self.visionCategory(for: String(trimmed))
-            cats.append(cat)
             reasons.append("vision:\(trimmed.lowercased().replacingOccurrences(of: " ", with: "-"))")
-            if conf >= 0.5 { confidence += 0.05 }
+            if let category = Self.visionCategory(for: trimmed) {
+                cats.append(category)
+                if conf >= 0.5 { confidence += 0.05 }
+            }
         }
 
         // Filename tokens as weak signals.
@@ -115,9 +148,11 @@ public struct RuleBasedClassifier: Sendable {
     }
 
     static func courseTokens(in lowercasedText: String) -> [String] {
-        // CSC-151 / MAT-171 style course codes.
+        // Common college course codes. Keeping the department prefix bounded
+        // avoids treating arbitrary product/version numbers as courses.
         var found: [String] = []
-        let pattern = try! NSRegularExpression(pattern: #"\b(csc|mat|bio|chm|phy|eng|his)[ -]?(\d{3})\b"#)
+        let pattern = try! NSRegularExpression(
+            pattern: #"\b(art|bio|bus|chm|com|csc|eco|eng|fre|his|mat|phy|psy|soc|spa)[ -]?(\d{3,4})\b"#)
         let ns = lowercasedText as NSString
         for m in pattern.matches(in: lowercasedText, range: NSRange(location: 0, length: ns.length)) {
             let dept = ns.substring(with: m.range(at: 1)).uppercased()
@@ -127,19 +162,36 @@ public struct RuleBasedClassifier: Sendable {
         return Array(Set(found)).sorted()
     }
 
+    static func looksLikeCodeProject(identity: FileIdentity) -> Bool {
+        let filename = (identity.path as NSString).lastPathComponent.lowercased()
+        if projectManifestNames.contains(filename) { return true }
+        let ext = (filename as NSString).pathExtension.lowercased()
+        return sourceCodeExtensions.contains(ext)
+    }
+
     static func describe(identity: FileIdentity, evidence: EvidenceExtractor.Evidence) -> String {
         let name = (identity.path as NSString).lastPathComponent
         return "\(identity.kind.rawValue) · \(evidence.sizeClass) · \(name)"
     }
 
-    static func visionCategory(for label: String) -> String {
+    /// Return only curated, stable image buckets. The raw Vision label remains
+    /// in reasonCodes for inspection, but it never becomes `Image/<random>`.
+    static func visionCategory(for label: String) -> String? {
         let l = label.lowercased()
-        if ["cat", "dog", "bird", "horse", "elephant", "bear"].contains(where: { l.contains($0) }) { return "Image/Animals/\(label)" }
-        if ["car", "truck", "bus", "bicycle", "airplane", "boat"].contains(where: { l.contains($0) }) { return "Image/Vehicles/\(label)" }
-        if ["beach", "mountain", "forest", "desert", "sky", "sunset"].contains(where: { l.contains($0) }) { return "Image/Scenery/\(label)" }
-        if ["food", "pizza", "cake", "fruit", "vegetable"].contains(where: { l.contains($0) }) { return "Image/Food/\(label)" }
-        if l.contains("screenshot") || l.contains("screen") { return "Image/Screenshots" }
-        if l.contains("text") || l.contains("document") || l.contains("paper") { return "Image/Documents/\(label)" }
-        return "Image/\(label)"
+        if ["cat", "dog", "bird", "horse", "elephant", "bear", "animal"].contains(where: { l.contains($0) }) {
+            return "Image/Animals"
+        }
+        if ["car", "truck", "bus", "bicycle", "airplane", "boat", "vehicle"].contains(where: { l.contains($0) }) {
+            return "Image/Vehicles"
+        }
+        if ["beach", "mountain", "forest", "desert", "sky", "sunset", "landscape"].contains(where: { l.contains($0) }) {
+            return "Image/Scenery"
+        }
+        if ["food", "pizza", "cake", "fruit", "vegetable", "meal"].contains(where: { l.contains($0) }) {
+            return "Image/Food"
+        }
+        if l.contains("screenshot") || l.contains("screen") { return "Screenshots" }
+        if l.contains("text") || l.contains("document") || l.contains("paper") { return "Image/Documents" }
+        return nil
     }
 }
