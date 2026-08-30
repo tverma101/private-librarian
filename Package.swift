@@ -22,6 +22,17 @@ let sqlcipherLinker: [LinkerSetting] = [
     .linkedFramework("CoreFoundation"),
 ]
 
+// Swift 6 makes strict concurrency part of the language. Older compilers need
+// the upcoming-feature switch. Keeping this conditional lets CI also compile
+// the package explicitly in Swift 6 language mode.
+#if compiler(<6.0)
+let strictConcurrencySettings: [SwiftSetting] = [
+    .enableUpcomingFeature("StrictConcurrency"),
+]
+#else
+let strictConcurrencySettings: [SwiftSetting] = []
+#endif
+
 let package = Package(
     name: "PrivateLibrarian",
     platforms: [.macOS(.v14)],
@@ -46,9 +57,13 @@ let package = Package(
             name: "LibrarianCore",
             dependencies: ["SQLCipher"],
             path: "Sources/LibrarianCore",
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency"),
-            ]
+            swiftSettings: strictConcurrencySettings
+        ),
+        .target(
+            name: "LibrarianAppSupport",
+            dependencies: ["LibrarianCore"],
+            path: "Sources/LibrarianAppSupport",
+            swiftSettings: strictConcurrencySettings
         ),
         .executableTarget(
             name: "librarian-cli",
@@ -57,7 +72,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "LibrarianApp",
-            dependencies: ["LibrarianCore"],
+            dependencies: ["LibrarianCore", "LibrarianAppSupport"],
             path: "Sources/LibrarianApp",
             resources: [
                 .process("Assets.xcassets"),
@@ -67,7 +82,7 @@ let package = Package(
         ),
         .testTarget(
             name: "LibrarianTests",
-            dependencies: ["LibrarianCore"],
+            dependencies: ["LibrarianCore", "LibrarianAppSupport"],
             path: "Tests/LibrarianTests"
         ),
     ]
