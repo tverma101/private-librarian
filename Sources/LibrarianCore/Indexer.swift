@@ -296,6 +296,10 @@ public final class Indexer: @unchecked Sendable {
             try? rebuildSimilarityGraph(changedFileIDs: similarityChangedIDs,
                                         removedFileIDs: similarityRemovedIDs)
         }
+        // Classification revisions can retire old taxonomy leaves. Once all
+        // memberships for this pass are current, remove catalog-only category
+        // nodes that no longer lead to any file. Originals are never touched.
+        try? catalog.pruneUnusedVirtualCategories()
         return actuallyProcessed
     }
 
