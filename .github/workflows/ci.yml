@@ -45,6 +45,11 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
+      - name: Build in Swift 6 language mode
+        run: swift build -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -warnings-as-errors
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
       - name: Test (mandatory security suite)
         run: swift test 2>&1 | tee test.log; exit ${PIPESTATUS[0]}
         env:
