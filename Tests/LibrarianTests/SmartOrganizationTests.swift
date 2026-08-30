@@ -104,6 +104,42 @@ final class SmartOrganizationTests: XCTestCase {
         XCTAssertFalse(groups.contains(where: { $0.id == "semantic:family-weak" }))
     }
 
+    func testNoSingleSignalCanMonopolizeSmartGroups() {
+        var memberships: [(categoryPath: String, fileID: String)] = [
+            ("School/MAT-171", "math-1"), ("School/MAT-171", "math-2"),
+            ("Screenshots/code", "shot-1"), ("Screenshots/code", "shot-2"),
+            ("Projects/Code", "code-1"), ("Projects/Code", "code-2")
+        ]
+        for index in 0..<5 {
+            memberships.append(("School/CSC-15\(index)", "course-\(index)-a"))
+            memberships.append(("School/CSC-15\(index)", "course-\(index)-b"))
+        }
+
+        var clusters: [SimilarityCluster] = []
+        for index in 0..<12 {
+            clusters.append(SimilarityCluster(
+                id: "dup-\(index)", members: ["dup-\(index)-a", "dup-\(index)-b"],
+                representative: "dup-\(index)-a", relation: .nearDuplicate,
+                familyID: "dup-family-\(index)", confidence: 0.99, reason: "near duplicate"))
+        }
+        for index in 0..<8 {
+            clusters.append(SimilarityCluster(
+                id: "sem-\(index)", members: ["sem-\(index)-a", "sem-\(index)-b", "sem-\(index)-c"],
+                representative: "sem-\(index)-a", relation: .semantic,
+                familyID: "sem-family-\(index)", confidence: 0.9, reason: "semantic"))
+        }
+
+        let groups = SmartOrganizationPlanner(maxGroups: 12).build(
+            memberships: memberships, similarityClusters: clusters)
+
+        XCTAssertEqual(groups.count, 12)
+        XCTAssertLessThanOrEqual(groups.filter { $0.kind == .nearDuplicate }.count, 3)
+        XCTAssertLessThanOrEqual(groups.filter { $0.kind == .semantic }.count, 5)
+        XCTAssertTrue(groups.contains(where: { $0.title == "MAT-171" }), "course group was crowded out: \(groups.map(\.title))")
+        XCTAssertTrue(groups.contains(where: { $0.title == "Code screenshots" }), "screenshot group was crowded out: \(groups.map(\.title))")
+        XCTAssertTrue(groups.contains(where: { $0.title == "Code projects" }), "project group was crowded out: \(groups.map(\.title))")
+    }
+
     func testPruneRemovesLegacySingletonCategoriesButKeepsActiveHierarchy() throws {
         let catalog = try TestSupport.makeCatalog()
         let now = Date()
