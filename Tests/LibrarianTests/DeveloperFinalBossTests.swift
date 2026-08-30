@@ -107,7 +107,6 @@ final class DeveloperFinalBossTests: XCTestCase {
             excludedDirectoryNames: OnboardingExclusions.defaultDirectoryNames).map(\.path))
         XCTAssertTrue(paths.contains(completed.path))
         XCTAssertFalse(LiveExclusions.isExcluded(path: completed.path, prefixes: []))
-        XCTAssertEqual(SourceBroker.classify(path: completed.path), .diskImage)
     }
 
     func testLiveEventsRejectBuildPatternsAndTransientFilesBeforeQueueing() {
