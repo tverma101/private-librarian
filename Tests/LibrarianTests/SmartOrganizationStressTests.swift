@@ -12,9 +12,13 @@ final class SmartOrganizationStressTests: XCTestCase {
         }
 
         // Useful broad signals with real support.
-        for course in 0..<10 {
+        let courseCodes = [
+            "MAT-171", "CSC-151", "ENG-112", "BIO-110", "PSY-150",
+            "COM-120", "HIS-111", "ART-111", "PHY-151", "CHM-151"
+        ]
+        for course in courseCodes {
             for item in 0..<8 {
-                memberships.append(("School/COURSE-\(course)", "course-\(course)-\(item)"))
+                memberships.append(("School/\(course)", "course-\(course)-\(item)"))
             }
         }
         for subtype in ["code", "school", "lms", "receipt", "error", "conversation", "social", "map"] {
@@ -92,5 +96,84 @@ final class SmartOrganizationStressTests: XCTestCase {
             return "general"
         })
         XCTAssertGreaterThanOrEqual(representedLanes.count, 5, "Smart Groups lost useful diversity: \(representedLanes)")
+    }
+
+    func testRepeatedMalformedTaxonomyCannotBecomePolishedSmartGroups() {
+        let malformed = [
+            "School/banana",
+            "School/💥💥💥",
+            "School/mat-171",
+            "School/MAT\u{2011}171",       // Unicode non-breaking hyphen
+            "School/MAT-17",
+            "School/MAT-171/extra",
+            "School/\u{202E}171-TAM",     // bidi control/spoof-looking text
+            "School/" + String(repeating: "A", count: 4_096),
+            "Screenshots/banana",
+            "Screenshots/CODE",
+            "Screenshots/code\u{0000}",
+            "Screenshots/../../evil",
+            "Screenshots/receipt/extra",
+            "Screenshots/🤖"
+        ]
+
+        var memberships: [(categoryPath: String, fileID: String)] = []
+        for (labelIndex, label) in malformed.enumerated() {
+            for item in 0..<12 {
+                memberships.append((label, "poison-\(labelIndex)-\(item)"))
+            }
+        }
+
+        // Benign formatting noise should collapse to the same canonical path,
+        // while the actual taxonomy still has to be valid.
+        memberships += [
+            ("School/MAT-171", "math-a"),
+            (" School // MAT-171 ", "math-b"),
+            ("Screenshots/code", "code-a"),
+            (" Screenshots // code ", "code-b")
+        ]
+
+        let groups = SmartOrganizationPlanner(maxGroups: 18).build(
+            memberships: memberships,
+            similarityClusters: [])
+
+        XCTAssertEqual(Set(groups.map(\.id)), [
+            "category:School/MAT-171",
+            "category:Screenshots/code"
+        ])
+        XCTAssertEqual(groups.first(where: { $0.id == "category:School/MAT-171" })?.fileIDs.count, 2)
+        XCTAssertEqual(groups.first(where: { $0.id == "category:Screenshots/code" })?.fileIDs.count, 2)
+        XCTAssertFalse(groups.contains { group in
+            malformed.contains { bad in group.id.contains(bad) || group.title.contains(bad) }
+        })
+    }
+
+    func testWeirdRealParentFolderNamesDoNotInventVirtualCategories() {
+        let identity = FileIdentity(
+            path: "/tmp/💀 FINAL final v7/School/banana/随机/ordinary.txt",
+            volumeUUID: nil,
+            fileID: 7,
+            size: 128,
+            mtime: Date(),
+            ctime: Date(),
+            kind: .text,
+            isSymlink: false
+        )
+        var evidence = EvidenceExtractor.Evidence()
+        evidence.kind = FileKind.text.rawValue
+        evidence.sizeClass = "small"
+        evidence.filenameTokens = ["ordinary"]
+
+        let result = RuleBasedClassifier().classify(
+            fileID: "weird-parent",
+            identity: identity,
+            evidence: evidence,
+            textContent: "plain notes with no course code or organization keyword"
+        )
+
+        XCTAssertTrue(result.categories.contains("Documents/Text"))
+        XCTAssertFalse(result.categories.contains(where: {
+            $0.contains("banana") || $0.contains("随机") || $0.contains("FINAL")
+        }))
+        XCTAssertFalse(result.categories.contains(where: { $0.hasPrefix("School/") }))
     }
 }
