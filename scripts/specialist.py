@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gc
 import hashlib
 import io
 import json
@@ -25,7 +26,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Set offline policy BEFORE importing transformers/paddle/etc.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
@@ -50,8 +50,6 @@ MODEL_SPECS = {
     "mimo-vl-7b-rl-2508": ("XiaomiMiMo/MiMo-VL-7B-RL-2508", "4bfb270"),
 }
 
-# A generative model may choose among existing broad product concepts only.
-# Course IDs and project names remain deterministic/catalog-derived, never hallucinated here.
 ALLOWED_CATEGORIES = {
     "Image", "Image/Animals", "Image/Vehicles", "Image/Scenery", "Image/Food", "Image/Documents",
     "Screenshots", "Screenshots/code", "Screenshots/school", "Screenshots/lms", "Screenshots/receipt",
@@ -130,7 +128,6 @@ def _decode_image(value: str):
 
 
 def _normalize_tensor(vector) -> list[float]:
-    # torch is imported lazily by model operations.
     if hasattr(vector, "detach"):
         vector = vector.detach()
     if getattr(vector, "ndim", 1) > 1:
@@ -226,8 +223,6 @@ def _paddle_ocr(raw: bytes, suffix: str = ".png") -> dict:
     key = "paddleocr-vl-1.6"
     if not _verify_snapshot(key):
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
-    # PaddleOCR-VL currently exposes a path-oriented pipeline. We therefore write
-    # broker-owned bytes to a private temporary file; the source path is never forwarded.
     from paddleocr import PaddleOCRVL
     pipeline = _CACHE.get(key)
     if pipeline is None:
@@ -337,9 +332,6 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
         raise RuntimeError(f"untrusted/unprovisioned model: {model_id}")
     prompt = _classification_prompt(existing)
     path = str(_model_dir(model_id))
-
-    # MiniCPM and InternVL expose model-specific chat() APIs. Custom code is allowed
-    # only from this already hash-verified, immutable local snapshot.
     if model_id in {"minicpm-v-4.6", "internvl3.5-4b"}:
         from transformers import AutoModel, AutoTokenizer
         cached = _CACHE.get(model_id)
@@ -356,8 +348,6 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
         else:
             response = model.chat(tokenizer, image, prompt, generation_config={"do_sample": False, "max_new_tokens": 320})
         return _extract_json(response[0] if isinstance(response, tuple) else str(response))
-
-    # MiMo/LFM follow the standard processor + image-text-generation path on current Transformers.
     from transformers import AutoModelForImageTextToText, AutoProcessor
     cached = _CACHE.get(model_id)
     if cached is None:
@@ -381,11 +371,31 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
     return _extract_json(text)
 
 
+def _release(model_id: str | None) -> dict:
+    if model_id:
+        _CACHE.pop(model_id, None)
+    else:
+        _CACHE.clear()
+    gc.collect()
+    try:
+        import torch
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return {"released": model_id or "all"}
+
+
 def _handle(request: dict) -> dict:
     op = request.get("op")
     if op == "status":
         ids = request.get("models") or list(MODEL_SPECS)
         return {"offline": True, "available": {mid: _verify_snapshot(mid, verify_hashes=False) for mid in ids if mid in MODEL_SPECS}}
+    if op == "release":
+        model_id = request.get("model")
+        return _release(str(model_id) if model_id else None)
     if op == "siglip_image":
         _, image = _decode_image(str(request.get("data_b64", "")))
         return _siglip_image(image)
