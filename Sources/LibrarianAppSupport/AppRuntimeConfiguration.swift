@@ -159,9 +159,9 @@ public enum AppLocalTranscription {
             modelPath: modelPath)
     }
 
-    /// Pure app-configuration seam: the SwiftUI setting feeds this function,
-    /// and tests can prove the resulting Indexer configuration without relying
-    /// on a developer machine having Whisper installed.
+    /// Pure app-configuration seam. The SwiftUI setting feeds this policy, and
+    /// tests can use explicit fixture paths instead of relying on a developer
+    /// machine having Whisper installed.
     public static func selection(
         enabled: Bool,
         executablePath: String? = nil,
@@ -174,5 +174,24 @@ public enum AppLocalTranscription {
             return (false, DisabledSpeechTranscriptionProvider())
         }
         return (true, provider)
+    }
+
+    /// Apply the app's opt-in decision directly to Indexer.Options and return
+    /// the matching provider. This is the seam used to prove that the UI-level
+    /// setting produces the same configuration the Indexer receives.
+    @discardableResult
+    public static func configure(
+        options: inout Indexer.Options,
+        enabled: Bool,
+        executablePath: String? = nil,
+        modelPath: String? = nil
+    ) -> any SpeechTranscriptionProvider {
+        let selected = selection(
+            enabled: enabled,
+            executablePath: executablePath,
+            modelPath: modelPath
+        )
+        options.enableLocalASR = selected.enabled
+        return selected.provider
     }
 }
