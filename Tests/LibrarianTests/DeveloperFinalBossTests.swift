@@ -10,11 +10,14 @@ final class DeveloperFinalBossTests: XCTestCase {
             "cmake-build-debug", "cmake-build-release", "cmake-build-relwithdebinfo",
             ".gradle", ".m2", ".npm", ".yarn", ".pnpm-store", ".cargo", ".rustup",
             ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite",
-            ".mozbuild", "coverage"
+            ".mozbuild"
         ]
         for name in names {
             XCTAssertTrue(OnboardingExclusions.isExcludedDirectoryName(name), name)
         }
+        // Human folder names are not sacrificed just because a tool sometimes
+        // uses the same word for output.
+        XCTAssertFalse(OnboardingExclusions.isExcludedDirectoryName("coverage"))
     }
 
     func testConfigurationSpecificBuildDirectoryPatternsAreExcluded() {
@@ -51,7 +54,9 @@ final class DeveloperFinalBossTests: XCTestCase {
         ]
         let transient = [
             root.appendingPathComponent("browser.dmg.crdownload"),
+            root.appendingPathComponent("safari-file.download"),
             root.appendingPathComponent("archive.zip.part"),
+            root.appendingPathComponent("firefox-file.partial"),
             root.appendingPathComponent(".DS_Store"),
             root.appendingPathComponent("._main.cc"),
             root.appendingPathComponent("~$notes.docx")
@@ -80,6 +85,31 @@ final class DeveloperFinalBossTests: XCTestCase {
         }
     }
 
+    func testCompletedBrowserDownloadBecomesIndexableAfterFinalRename() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("completed-download-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let partial = root.appendingPathComponent("browser.dmg.crdownload")
+        let completed = root.appendingPathComponent("browser.dmg")
+        try Data("synthetic installer payload".utf8).write(to: partial)
+
+        var paths = Set(try SourceBroker.enumerate(
+            root: root,
+            excludedDirectoryNames: OnboardingExclusions.defaultDirectoryNames).map(\.path))
+        XCTAssertFalse(paths.contains(partial.path))
+        XCTAssertTrue(LiveExclusions.isExcluded(path: partial.path, prefixes: []))
+
+        try FileManager.default.moveItem(at: partial, to: completed)
+        paths = Set(try SourceBroker.enumerate(
+            root: root,
+            excludedDirectoryNames: OnboardingExclusions.defaultDirectoryNames).map(\.path))
+        XCTAssertTrue(paths.contains(completed.path))
+        XCTAssertFalse(LiveExclusions.isExcluded(path: completed.path, prefixes: []))
+        XCTAssertEqual(SourceBroker.classify(path: completed.path), .diskImage)
+    }
+
     func testLiveEventsRejectBuildPatternsAndTransientFilesBeforeQueueing() {
         let excluded = [
             "/repo/out/Default/obj/blink/foo.o",
@@ -89,7 +119,9 @@ final class DeveloperFinalBossTests: XCTestCase {
             "/repo/target/debug/deps/foo.rlib",
             "/repo/node_modules/pkg/index.js",
             "/repo/download.dmg.crdownload",
+            "/repo/safari.download",
             "/repo/video.mp4.part",
+            "/repo/firefox.partial",
             "/repo/.DS_Store",
             "/repo/._main.swift",
             "/repo/~$notes.docx"
