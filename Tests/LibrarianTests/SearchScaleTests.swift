@@ -18,7 +18,7 @@ final class SearchScaleTests: XCTestCase {
             EmbeddingVector(spaceID: imageModelID, dim: 2, data: Self.vector(1, 0))
         }
         static func vector(_ x: Float, _ y: Float) -> Data {
-            var values = [x, y]
+            let values = [x, y]
             return values.withUnsafeBytes { Data($0) }
         }
     }
