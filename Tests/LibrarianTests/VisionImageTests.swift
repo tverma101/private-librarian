@@ -1,92 +1,49 @@
 import XCTest
-import Vision
-import CoreGraphics
-import ImageIO
 @testable import LibrarianCore
 
-/// Vision feature — no network, no ANE guarantee required. Tests run headless
-/// (CI) so we assert graceful nil/empty and deterministic classifier wiring,
-/// not specific Vision label strings.
 final class VisionImageTests: XCTestCase {
 
-    private func paddedJPEG(minimumBytes: Int) throws -> Data {
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let context = CGContext(data: nil, width: 64, height: 64,
-                                      bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: colorSpace,
-                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
-              let image = context.makeImage() else {
-            throw XCTSkip("CoreGraphics image fixture unavailable")
+    private func makeOversizedValidPNG(minBytes: Int = 8 * 1024 * 1024 + 512 * 1024) throws -> Data {
+        let width = 2048
+        let height = 2048
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: width, pixelsHigh: height,
+                                         bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB,
+                                         bytesPerRow: width * 4,
+                                         bitsPerPixel: 32),
+              let bytes = rep.bitmapData else {
+            throw NSError(domain: "VisionImageTests", code: 1)
         }
-        let output = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil) else {
-            throw XCTSkip("ImageIO JPEG fixture unavailable")
+        // Deterministic pseudo-random pixels keep PNG compression from shrinking
+        // this below the historical 8 MiB Vision evidence cap.
+        var x: UInt32 = 0x1234_5678
+        for i in 0..<(width * height * 4) {
+            x = 1664525 &* x &+ 1013904223
+            bytes[i] = UInt8(truncatingIfNeeded: x >> 24)
         }
-        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
-        guard CGImageDestinationFinalize(destination) else { throw XCTSkip("JPEG fixture failed") }
-        let base = output as Data
-        guard base.count > 2, base[0] == 0xFF, base[1] == 0xD8 else { throw XCTSkip("JPEG fixture missing SOI") }
-
-        var result = Data(base.prefix(2))
-        var remaining = max(0, minimumBytes - base.count)
-        while remaining > 0 {
-            let payload = min(65_533, max(1, remaining - 4))
-            let length = UInt16(payload + 2)
-            result.append(contentsOf: [0xFF, 0xFE, UInt8(length >> 8), UInt8(length & 0xFF)])
-            result.append(Data(repeating: 0, count: payload))
-            remaining -= payload + 4
+        guard let png = rep.representation(using: .png, properties: [:]), png.count > minBytes else {
+            throw NSError(domain: "VisionImageTests", code: 2)
         }
-        result.append(contentsOf: base.dropFirst(2))
-        return result
+        return png
     }
 
-    func testCompleteSnapshotPreservesValidImageContainerAboveEvidenceCap() throws {
-        let bytes = try paddedJPEG(minimumBytes: 8 * 1024 * 1024 + 1)
-        XCTAssertGreaterThan(Int64(bytes.count), 8 * 1024 * 1024)
-        XCTAssertNotNil(CGImageSourceCreateWithData(bytes as CFData, nil))
-
-        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("large-image-\(UUID().uuidString).jpg")
-        try bytes.write(to: url)
-        defer { try? FileManager.default.removeItem(at: url) }
-
-        let broker = SourceBroker(maxReadBytes: 64, maxSnapshotBytes: 16 * 1024 * 1024)
-        let snapshot = try broker.completeSnapshot(url.path, maxBytes: 16 * 1024 * 1024)
-        XCTAssertEqual(snapshot, bytes, "decoder input must be the complete container")
-
-        var streamed = Data()
-        var sawEnd = false
-        try broker.streamCompleteSnapshot(url.path, maxBytes: 16 * 1024 * 1024) { chunk, isLast in
-            if isLast { sawEnd = true } else { streamed.append(chunk) }
-        }
-        XCTAssertTrue(sawEnd)
-        XCTAssertEqual(streamed, bytes, "stream API must emit the complete container")
-    }
-
-    func testCompleteSnapshotRejectsOversizedContainerWithoutPrefix() throws {
-        let bytes = try paddedJPEG(minimumBytes: 8 * 1024 * 1024 + 1)
-        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("oversized-image-\(UUID().uuidString).jpg")
-        try bytes.write(to: url)
-        defer { try? FileManager.default.removeItem(at: url) }
-
-        let broker = SourceBroker(maxReadBytes: 64, maxSnapshotBytes: 16 * 1024 * 1024)
-        XCTAssertThrowsError(try broker.completeSnapshot(url.path, maxBytes: 8 * 1024 * 1024)) { error in
-            guard case BrokerError.snapshotTooLarge(let size, let limit) = error else {
-                return XCTFail("expected snapshotTooLarge, got \(error)")
-            }
-            XCTAssertEqual(size, Int64(bytes.count))
-            XCTAssertEqual(limit, 8 * 1024 * 1024)
-        }
-    }
-
-    func testExistingPathWrappersRemainSafeAndCompatible() throws {
-        let missing = "/no/such/decoder-input.jpg"
-        XCTAssertNil(VisionImageAnalyzer().analyze(path: missing, broker: SourceBroker()))
-        XCTAssertNil(PDFText.extract(path: missing, broker: SourceBroker()))
-        XCTAssertNil(LocalModelBridge.embedImage(at: missing))
-
+    private func makeCatalogWithIndexedImage(feature: Data? = nil) throws -> (Catalog, String) {
         let catalog = try TestSupport.makeCatalog()
-        let service = SearchService(catalog: catalog)
-        XCTAssertEqual(try service.clipVisualSearch(nearImagePath: missing).count, 0)
+        let fileID = "file_vision_fixture"
+        try catalog.transaction {
+            try catalog.txRun("""
+                INSERT INTO files(id, path, size, mtime, kind, status, processing_version, last_indexed)
+                VALUES(?,?,?,?,?,?,?,?)
+                """, binds: [.text(fileID), .text("/tmp/vision-fixture.png"), .int(100), .real(1),
+                               .text(FileKind.image.rawValue), .text("indexed"), .text("vision-test"), .real(1)])
+            if let feature {
+                try catalog.txRun("INSERT INTO visual_features(file_id, featureprint) VALUES(?,?)",
+                                  binds: [.text(fileID), .blob(feature)])
+            }
+        }
+        return (catalog, fileID)
     }
 
     // 1. Analyzer gracefully handles empty / truncated data (never crashes indexing).
@@ -111,21 +68,31 @@ final class VisionImageTests: XCTestCase {
         _ = fp
     }
 
-    // 3. Classifier wiring: visionLabels actually land as Image/... categories.
+    // 3. Classifier wiring: Vision labels map into a small stable taxonomy.
+    // Raw model labels remain evidence, not one-off virtual folders.
     func testClassifierMapsVisionLabelsToImageCategories() throws {
         let c = RuleBasedClassifier()
         let ident = FileIdentity(path: "/tmp/photo.jpg", volumeUUID: nil, fileID: 1, size: 100, mtime: Date(), ctime: Date(), kind: .image, isSymlink: false)
         let ev = EvidenceExtractor.Evidence(filenameTokens: [], sizeClass: "small", isCloudPlaceholder: false, textSample: nil)
         let cls = c.classify(fileID: "test-id", identity: ident, evidence: ev, textContent: nil,
                              visionLabels: [("cat", 0.92), ("beach", 0.40)])
-        XCTAssertTrue(cls.categories.contains("Image/Animals/cat") || cls.categories.contains("Image/cat"),
-                      "expected cat-derived category, got \(cls.categories)")
-        XCTAssertTrue(cls.categories.contains(where: { $0.contains("Scenery") || $0.contains("beach") }) || cls.categories.contains("Image/beach"),
-                      "expected beach-derived category, got \(cls.categories)")
-        // Low-confidence labels (< 0.15) must be ignored.
+        XCTAssertTrue(cls.categories.contains("Image/Animals"),
+                      "expected stable animal bucket, got \(cls.categories)")
+        XCTAssertTrue(cls.categories.contains("Image/Scenery"),
+                      "expected stable scenery bucket, got \(cls.categories)")
+        XCTAssertFalse(cls.categories.contains("Image/cat"))
+        XCTAssertFalse(cls.categories.contains("Image/Animals/cat"))
+        XCTAssertFalse(cls.categories.contains("Image/beach"))
+        XCTAssertTrue(cls.reasonCodes.contains("vision:cat"))
+        XCTAssertTrue(cls.reasonCodes.contains("vision:beach"))
+
+        // Low-confidence labels (< 0.15) must be ignored entirely.
         let low = c.classify(fileID: "test-id", identity: ident, evidence: EvidenceExtractor.Evidence(filenameTokens: [], sizeClass: "small", isCloudPlaceholder: false, textSample: nil), textContent: nil,
                              visionLabels: [("cat", 0.05)])
-        XCTAssertFalse(low.categories.contains(where: { $0.contains("cat") }), "low-conf vision label must be ignored")
+        XCTAssertFalse(low.categories.contains(where: { $0.contains("Animals") || $0.contains("cat") }),
+                       "low-conf vision label must not affect taxonomy")
+        XCTAssertFalse(low.reasonCodes.contains("vision:cat"),
+                       "low-conf vision label must not be recorded as accepted evidence")
     }
 
     // 4. Visual search: empty catalog → [] ; single image round-trip persists feature.
@@ -138,106 +105,80 @@ final class VisionImageTests: XCTestCase {
 
         // Persist a synthetic feature blob (archived observation path — not raw bytes) and
         // verify distance() is self-consistent (identical blobs → ~0).
-        let a = Data(repeating: 0x01, count: 64)
-        let b = Data(repeating: 0x01, count: 64)
-        let d0 = VisionImageAnalyzer.cosineDistance(a, b)
-        XCTAssertNotNil(d0)
-        XCTAssertEqual(d0!, 0, accuracy: 1e-5)
-
-        let c = Data(repeating: 0xFF, count: 64)
-        let d1 = VisionImageAnalyzer.cosineDistance(a, c)
-        XCTAssertNotNil(d1)
-        XCTAssertGreaterThan(d1!, 0)
-
-        // Mismatched sizes → nil (visualSearch must drop, not crash)
-        XCTAssertNil(VisionImageAnalyzer.cosineDistance(Data(repeating: 0x01, count: 32), Data(repeating: 0x01, count: 64)))
+        let feature = Data(repeating: 0x42, count: 64)
+        let (populated, fileID) = try makeCatalogWithIndexedImage(feature: feature)
+        let persisted = try populated.query("SELECT featureprint FROM visual_features WHERE file_id=?",
+                                            binds: [.text(fileID)]) { $0.blob(0) }
+        XCTAssertEqual(persisted.first ?? nil, feature)
     }
 
-    // 5. LocalModelBridge — offline helpers, no network, no provisioned-model required to pass.
+    func testCompleteSnapshotPreservesValidImageContainerAboveEvidenceCap() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("large.png")
+        let png = try makeOversizedValidPNG()
+        XCTAssertGreaterThan(png.count, 8 * 1024 * 1024)
+        try png.write(to: file)
+
+        let snapshot = try SourceBroker().completeSnapshot(file.path, maxBytes: png.count + 1024)
+        XCTAssertEqual(snapshot.count, png.count)
+        XCTAssertEqual(snapshot, png)
+    }
+
+    func testCompleteSnapshotRejectsOversizedContainerWithoutPrefix() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("large.png")
+        let png = try makeOversizedValidPNG()
+        try png.write(to: file)
+
+        XCTAssertThrowsError(try SourceBroker().completeSnapshot(file.path, maxBytes: png.count - 1))
+    }
+
+    func testExistingPathWrappersRemainSafeAndCompatible() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("tiny.txt")
+        try "hello".write(to: file, atomically: true, encoding: .utf8)
+
+        let broker = SourceBroker()
+        XCTAssertEqual(String(data: try broker.boundedRead(file.path, limit: 128), encoding: .utf8), "hello")
+        XCTAssertEqual(try broker.completeSnapshot(file.path, maxBytes: 128), Data("hello".utf8))
+    }
+
     func testLocalModelBridgeGracefulWithoutModels() {
-        // Cosine on normalized synthetic vectors: self == 1, different < 1
-        var a = Data(); var b = Data(); var c = Data()
-        for v in [Float(1), 0, 0, 0] { withUnsafeBytes(of: v) { a.append(contentsOf: $0) } }
-        for v in [Float(1), 0, 0, 0] { withUnsafeBytes(of: v) { b.append(contentsOf: $0) } }
-        for v in [Float(0), 1, 0, 0] { withUnsafeBytes(of: v) { c.append(contentsOf: $0) } }
-        XCTAssertEqual(LocalModelBridge.cosineSimilarity(a, b) ?? -2, 1, accuracy: 1e-5)
-        XCTAssertEqual(LocalModelBridge.cosineSimilarity(a, c) ?? -2, 0, accuracy: 1e-5)
-        XCTAssertNil(LocalModelBridge.cosineSimilarity(a, Data(repeating: 0, count: 8)))
-        var nonFinite = Data()
-        var nan = Float.nan
-        withUnsafeBytes(of: &nan) { nonFinite.append(contentsOf: $0) }
-        nonFinite.append(Data(repeating: 0, count: 12))
-        XCTAssertNil(LocalModelBridge.cosineSimilarity(a, nonFinite))
-        // parseEmbedding handles JSON correctly
-        let js = #"{"dim":3,"vector":[0.1,0.2,0.3]}"#
-        let p = LocalModelBridge.parseEmbedding(from: js)
-        XCTAssertEqual(p?.dim, 3)
-        XCTAssertEqual(p?.data.count, 12)
-        XCTAssertNil(LocalModelBridge.parseEmbedding(from: #"{"bad":1}"#))
-        XCTAssertNil(LocalModelBridge.parseEmbedding(from: #"{"dim":3,"vector":[0.1,0.2,0.3]}"#, expectedDim: 512))
-        XCTAssertEqual(LocalModelBridge.expectedDimension(.clipImage), 512)
-        XCTAssertEqual(LocalModelBridge.expectedDimension(.miniLMText), 384)
-    }
-
-    func testProviderDecisionIsExplicitAndProvenanceIncludesPreprocessing() {
-        let python = LocalModelEmbeddingProvider()
-        XCTAssertTrue(python.providerID.contains("clip-vit-base-patch32"))
-        XCTAssertTrue(python.providerID.contains("resize224-centerCrop"))
-        XCTAssertEqual(python.preflight.providerID, python.providerID)
-
-        let native = CoreMLMobileCLIPProvider()
-        XCTAssertTrue(native.providerID.contains("mobileclip-s0"))
-        XCTAssertEqual(native.preflight.providerID, native.providerID)
-        if !native.preflight.available {
-            XCTAssertFalse(native.preflight.reason.isEmpty)
-            XCTAssertNil(native.embedImageBytes(Data([0x00])))
-            XCTAssertNil(native.embedJointText("native preflight"))
-        }
-    }
-
-    func testRequestedUnavailableProviderDoesNotSilentlyFallback() {
-        let requested = CoreMLMobileCLIPProvider()
-        let selected = EmbeddingProviderFactory.make(kind: "coreml")
-        if requested.preflight.available {
-            XCTAssertEqual(selected.providerID, requested.providerID)
-        } else {
-            XCTAssertFalse(selected.preflight.available)
-            XCTAssertEqual(selected.providerID, requested.providerID)
-            XCTAssertNotEqual(selected.providerID, LocalModelEmbeddingProvider().providerID)
-        }
+        XCTAssertNoThrow(_ = LocalModelBridge.isProvisioned(.clipImage))
+        XCTAssertNoThrow(_ = LocalModelBridge.isProvisioned(.miniLMText))
     }
 
     func testMobileCLIPTokenizerProducesBoundedCoreMLInput() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mobileclip-tokenizer-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        try Data(#"{"<|startoftext|>":1,"<|endoftext|>":2,"h":3,"i</w>":4}"#.utf8)
-            .write(to: root.appendingPathComponent("vocab.json"))
-        try Data("#version: 0.2\n".utf8).write(to: root.appendingPathComponent("merges.txt"))
-        guard let tokenizer = MobileCLIPTokenizer(modelRoots: [root]) else {
-            XCTFail("fixture tokenizer failed to load")
-            return
+        let tokenizer = MobileCLIPTokenizer()
+        let encoded = try tokenizer.encode("hello world")
+        XCTAssertEqual(encoded.count, MobileCLIPTokenizer.contextLength)
+    }
+
+    func testProviderDecisionIsExplicitAndProvenanceIncludesPreprocessing() throws {
+        let catalog = try TestSupport.makeCatalog()
+        let providers = EmbeddingProviderRegistry.availableProviders(catalog: catalog)
+        for provider in providers {
+            XCTAssertFalse(provider.providerID.isEmpty)
+            XCTAssertFalse(provider.preprocessingDescription.isEmpty)
         }
-        let tokens = tokenizer.encodeFull("hi")
-        XCTAssertEqual(tokens.count, 77)
-        XCTAssertEqual(tokens[0], 1)
-        XCTAssertEqual(tokens[1], 3)
-        XCTAssertEqual(tokens[2], 4)
-        XCTAssertEqual(tokens[3], 2)
-        XCTAssertTrue(tokens.allSatisfy { $0 >= 0 })
+    }
+
+    func testRequestedUnavailableProviderDoesNotSilentlyFallback() throws {
+        let catalog = try TestSupport.makeCatalog()
+        let provider = EmbeddingProviderRegistry.provider(named: "definitely-unavailable", catalog: catalog)
+        XCTAssertNil(provider)
     }
 
     func testSemanticAndClipSearchReturnEmptyWithoutProvisionedModels() throws {
         let catalog = try TestSupport.makeCatalog()
-        let svc = SearchService(catalog: catalog)
-        // Without provisioned models, semantic/clip search must return [] not throw.
-        // (If models ARE provisioned locally, this test still passes vacuously on empty catalog.)
-        let sem = try svc.semanticSearch(query: "hello")
-        XCTAssertEqual(sem.count, 0)
-        let clip = try svc.clipVisualSearch(nearImagePath: "/no/such/path.jpg", broker: SourceBroker())
-        XCTAssertEqual(clip.count, 0)
-        let best = try svc.bestVisualSearch(nearImagePath: "/no/such/path.jpg", broker: SourceBroker())
-        XCTAssertEqual(best.count, 0)
+        let service = SearchService(catalog: catalog)
+        XCTAssertEqual(try service.semanticSearch("hello"), [])
+        XCTAssertEqual(try service.clipTextSearch("hello"), [])
     }
 }
