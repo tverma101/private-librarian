@@ -176,4 +176,62 @@ final class SmartOrganizationStressTests: XCTestCase {
         }))
         XCTAssertFalse(result.categories.contains(where: { $0.hasPrefix("School/") }))
     }
+
+    func testProgrammingAndEnglishWordsDoNotMasqueradeAsSchoolOrScreenshotEvidence() {
+        func classify(path: String, tokens: [String], text: String) -> Classification {
+            let identity = FileIdentity(
+                path: path,
+                volumeUUID: nil,
+                fileID: UInt64(abs(path.hashValue)),
+                size: 512,
+                mtime: Date(),
+                ctime: Date(),
+                kind: .text,
+                isSymlink: false
+            )
+            var evidence = EvidenceExtractor.Evidence()
+            evidence.kind = FileKind.text.rawValue
+            evidence.sizeClass = "small"
+            evidence.filenameTokens = tokens
+            return RuleBasedClassifier().classify(
+                fileID: "collision-test",
+                identity: identity,
+                evidence: evidence,
+                textContent: text
+            )
+        }
+
+        let code = classify(
+            path: "/tmp/CanvasRenderer.swift",
+            tokens: ["canvas", "renderer"],
+            text: "let canvas = Renderer(); let assignment = node; let screenshot = snapshot()"
+        )
+        XCTAssertTrue(code.categories.contains("Projects/Code"))
+        XCTAssertFalse(code.categories.contains("School"))
+        XCTAssertFalse(code.categories.contains("Assignment"))
+        XCTAssertFalse(code.categories.contains("Screenshot"))
+
+        let material = classify(
+            path: "/tmp/material-design-notes.txt",
+            tokens: ["material", "design", "notes"],
+            text: "material design matrix rendering notes"
+        )
+        XCTAssertFalse(material.categories.contains("School"))
+        XCTAssertFalse(material.categories.contains(where: { $0.hasPrefix("School/") }))
+
+        let courseFilename = classify(
+            path: "/tmp/MAT171_final.txt",
+            tokens: ["mat171", "final"],
+            text: "ordinary review notes"
+        )
+        XCTAssertTrue(courseFilename.categories.contains("School/MAT-171"))
+
+        let lms = classify(
+            path: "/tmp/course-notes.txt",
+            tokens: ["course", "notes"],
+            text: "Canvas course module assignment due Friday"
+        )
+        XCTAssertTrue(lms.categories.contains("School"))
+        XCTAssertTrue(lms.categories.contains("Assignment"))
+    }
 }
