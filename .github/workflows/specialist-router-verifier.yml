@@ -2,14 +2,14 @@ name: Specialist router verifier
 
 on:
   push:
-    branches: [feat/final-local-model-router]
+    branches:
+      - feat/final-local-model-router
 
 permissions:
   contents: write
 
 jobs:
   wire-and-verify:
-    if: contains(github.event.head_commit.message, 'ci: verify specialist router integration')
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -20,8 +20,13 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      - name: Apply exact integration patch
-        run: python3 scripts/apply_specialist_router_integration.py
+      - name: Apply exact integration patch once
+        run: |
+          if grep -q 'public var localModelProfile: LocalModelProfile = .fast' Sources/LibrarianCore/Indexer.swift; then
+            echo 'integration already applied'
+          else
+            python3 scripts/apply_specialist_router_integration.py
+          fi
 
       - name: Validate diff
         run: git diff --check
@@ -54,10 +59,14 @@ jobs:
           scripts/package_app.sh .build/release
           python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
 
-      - name: Commit verified integration
+      - name: Commit verified integration if needed
         run: |
+          git add Sources/LibrarianCore/Indexer.swift Sources/LibrarianApp/PrivateLibrarianApp.swift Sources/LibrarianApp/MagicViews.swift .github/workflows/ci.yml
+          if git diff --cached --quiet; then
+            echo 'no production patch to commit'
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Sources/LibrarianCore/Indexer.swift Sources/LibrarianApp/PrivateLibrarianApp.swift Sources/LibrarianApp/MagicViews.swift .github/workflows/ci.yml
           git commit -m "feat: wire specialist models into cleanup"
           git push origin HEAD:feat/final-local-model-router
