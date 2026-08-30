@@ -103,4 +103,29 @@ final class SmartOrganizationTests: XCTestCase {
         }))
         XCTAssertFalse(groups.contains(where: { $0.id == "semantic:family-weak" }))
     }
+
+    func testPruneRemovesLegacySingletonCategoriesButKeepsActiveHierarchy() throws {
+        let catalog = try TestSupport.makeCatalog()
+        let now = Date()
+        let identity = FileIdentity(
+            path: "/tmp/active.txt", volumeUUID: nil, fileID: 91,
+            size: 10, mtime: now, ctime: now, kind: .text, isSymlink: false)
+        try catalog.upsertFile(identity: identity, id: "active-file")
+
+        let used = try catalog.ensureCategory(named: "School/MAT-171")
+        _ = try catalog.ensureCategory(named: "Image/obsolete-one-off-label")
+        try catalog.run(
+            "INSERT INTO category_membership(category_id, file_id, source) VALUES(?,?,'classifier')",
+            binds: [.int(used), .text("active-file")])
+
+        try catalog.pruneUnusedVirtualCategories()
+
+        let names = try catalog.query("SELECT name FROM virtual_categories ORDER BY name") {
+            $0.text(0) ?? ""
+        }
+        XCTAssertTrue(names.contains("School"), "active parent must remain: \(names)")
+        XCTAssertTrue(names.contains("MAT-171"), "active leaf must remain: \(names)")
+        XCTAssertFalse(names.contains("Image"), "unused legacy parent should be removed: \(names)")
+        XCTAssertFalse(names.contains("obsolete-one-off-label"), "unused legacy leaf should be removed: \(names)")
+    }
 }
