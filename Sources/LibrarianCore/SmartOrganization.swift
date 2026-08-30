@@ -270,13 +270,13 @@ public struct SmartOrganizationPlanner: Sendable {
         if path == "Assignment" {
             return ("Assignments", "School & work", 100)
         }
+        if path == "Documents/PDF" { return ("PDFs", "Documents", 90) }
+        if path == "Documents/Office" { return ("Office documents", "Documents", 90) }
         if path == "Image/Animals" { return ("Animals", "Images", 82) }
         if path == "Image/Vehicles" { return ("Vehicles", "Images", 82) }
         if path == "Image/Scenery" { return ("Scenery", "Images", 82) }
         if path == "Image/Food" { return ("Food", "Images", 82) }
         if path == "Image/Documents" { return ("Document photos", "Images", 82) }
-        if path == "Documents/PDF" { return ("PDFs", "Documents", 72) }
-        if path == "Documents/Office" { return ("Office documents", "Documents", 72) }
         return nil
     }
 
