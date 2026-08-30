@@ -15,7 +15,7 @@ extension SourceBroker {
         excludedDirectoryNames: Set<String> = [],
         maxItems: Int? = nil,
         batchSize: Int = 512,
-        onUnreadableDirectory: ((String) -> Void)? = nil,
+        onUnreadableDirectory: ((String, String) -> Void)? = nil,
         _ body: ([DiscoveredItem]) throws -> Bool
     ) throws -> Int {
         let broker = SourceBroker()
@@ -48,6 +48,14 @@ extension SourceBroker {
         var discovered = 0
         var shouldContinue = true
 
+        func unreadableReason(_ error: Error) -> String {
+            let ns = error as NSError
+            let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+            let code = underlying?.code ?? ns.code
+            if code == Int(EACCES) || code == Int(EPERM) { return "permission-denied" }
+            return "unreadable:\(code)"
+        }
+
         func flush() throws -> Bool {
             guard !batch.isEmpty else { return shouldContinue }
             let current = batch
@@ -76,7 +84,7 @@ extension SourceBroker {
                     includingPropertiesForKeys: [.isSymbolicLinkKey, .isPackageKey],
                     options: [])
             } catch {
-                onUnreadableDirectory?(displayDirectory)
+                onUnreadableDirectory?(displayDirectory, unreadableReason(error))
                 return true
             }
 
@@ -95,9 +103,19 @@ extension SourceBroker {
                     child.lastPathComponent, configured: excludedDirectoryNames) { continue }
                 if OnboardingExclusions.isTransientOrSystemFile(path: childDisplay) { continue }
 
-                // Broker identity is the no-follow authority. A failed identity
-                // is not safe to recurse through.
-                guard let identity = try? broker.identity(at: childDisplay) else { continue }
+                // Broker identity is the no-follow authority. Permission
+                // failures are recorded at the prefix, not once per descendant.
+                let identity: FileIdentity
+                do {
+                    identity = try broker.identity(at: childDisplay)
+                } catch BrokerError.statFailed(let error)
+                    where error == EACCES || error == EPERM {
+                    onUnreadableDirectory?(childDisplay, "permission-denied")
+                    continue
+                } catch {
+                    continue
+                }
+
                 if identity.isSymlink {
                     if try !emit(DiscoveredItem(path: childDisplay, depth: depth)) { return false }
                     continue
@@ -110,9 +128,8 @@ extension SourceBroker {
                     if package {
                         if try !emit(DiscoveredItem(path: childDisplay, depth: depth)) { return false }
                     } else if depth < maxDepth {
-                        // Recurse immediately. Because siblings are sorted this
-                        // preserves global lexical path order without a final
-                        // all-paths sort.
+                        // Recurse immediately. Sibling ordering remains
+                        // deterministic without a final all-paths sort.
                         if try !walk(realDirectory: child,
                                      displayDirectory: childDisplay,
                                      depth: depth + 1) { return false }
