@@ -6,8 +6,11 @@ final class DeveloperFinalBossTests: XCTestCase {
         let names = [
             "node_modules", "DerivedData", "build", ".build", "dist", "out", "obj", "target",
             "WebKitBuild", "buck-out", ".cxx", ".ccache", ".sccache",
+            "bazel-bin", "bazel-out", "bazel-testlogs",
+            "cmake-build-debug", "cmake-build-release", "cmake-build-relwithdebinfo",
             ".gradle", ".m2", ".npm", ".yarn", ".pnpm-store", ".cargo", ".rustup",
-            ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite", "coverage"
+            ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite",
+            ".mozbuild", "coverage"
         ]
         for name in names {
             XCTAssertTrue(OnboardingExclusions.isExcludedDirectoryName(name), name)
@@ -31,7 +34,7 @@ final class DeveloperFinalBossTests: XCTestCase {
         XCTAssertFalse(OnboardingExclusions.isExcludedDirectoryName("output-notes"))
     }
 
-    func testChromiumStyleGeneratedTreesAreNeverEnumerated() throws {
+    func testBrowserStyleGeneratedTreesAndTransientFilesAreNeverEnumerated() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("developer-final-boss-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -39,9 +42,19 @@ final class DeveloperFinalBossTests: XCTestCase {
         let authored = root.appendingPathComponent("src/browser/main.cc")
         let generated = [
             root.appendingPathComponent("out/Default/obj/blink/generated.o"),
+            root.appendingPathComponent("obj-firefox-release/dom/generated.o"),
+            root.appendingPathComponent("cmake-build-profile/CMakeFiles/generated.o"),
+            root.appendingPathComponent("bazel-browser/darwin-fastbuild/bin/generated"),
             root.appendingPathComponent("target/debug/deps/generated.rlib"),
             root.appendingPathComponent("node_modules/pkg/dist/index.js"),
             root.appendingPathComponent("WebKitBuild/Release/WebKit.framework/fake")
+        ]
+        let transient = [
+            root.appendingPathComponent("browser.dmg.crdownload"),
+            root.appendingPathComponent("archive.zip.part"),
+            root.appendingPathComponent(".DS_Store"),
+            root.appendingPathComponent("._main.cc"),
+            root.appendingPathComponent("~$notes.docx")
         ]
         try FileManager.default.createDirectory(
             at: authored.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -51,13 +64,18 @@ final class DeveloperFinalBossTests: XCTestCase {
                 at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
             try "generated".write(to: file, atomically: true, encoding: .utf8)
         }
+        for file in transient {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "temporary".write(to: file, atomically: true, encoding: .utf8)
+        }
 
         let items = try SourceBroker.enumerate(
             root: root,
             excludedDirectoryNames: OnboardingExclusions.defaultDirectoryNames)
         let paths = Set(items.map(\.path))
         XCTAssertTrue(paths.contains(authored.path))
-        for file in generated {
+        for file in generated + transient {
             XCTAssertFalse(paths.contains(file.path), file.path)
         }
     }
