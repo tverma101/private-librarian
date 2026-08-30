@@ -12,12 +12,15 @@ public enum OnboardingExclusions {
         // General build output and compiler caches.
         "DerivedData", "build", ".build", "dist", "out", "obj", "target",
         "WebKitBuild", "buck-out", ".cxx", ".ccache", ".sccache",
+        "bazel-bin", "bazel-out", "bazel-testlogs",
+        "cmake-build-debug", "cmake-build-release", "cmake-build-relwithdebinfo",
+        "cmake-build-minsizerel",
 
         // Package-manager/framework caches that can contain enormous trees of
         // third-party/generated files on developer machines.
         ".gradle", ".m2", ".npm", ".yarn", ".pnpm-store", ".cargo", ".rustup",
         ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".vite",
-        "coverage",
+        ".mozbuild", "coverage",
 
         // Generic caches/runtime noise.
         ".cache", "Caches", "__pycache__", ".Trash"
