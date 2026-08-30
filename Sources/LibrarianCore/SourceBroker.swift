@@ -497,7 +497,8 @@ public struct SourceBroker: Sendable {
             path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
         }
         if exclusions.contains(where: { Self.isPath(baseDisplay, under: $0) }) { return [] }
-        if excludedDirectoryNames.contains(root.lastPathComponent) { return [] }
+        if OnboardingExclusions.isExcludedDirectoryName(root.lastPathComponent,
+                                                        configured: excludedDirectoryNames) { return [] }
         var enqueued: [(dir: URL, display: String, depth: Int)] = [
             (URL(fileURLWithPath: resolvedRoot), baseDisplay, 0)
         ]
@@ -529,7 +530,9 @@ public struct SourceBroker: Sendable {
                     ? String(display.dropLast()) : display
                 let childDisplay = parentDisplay + "/" + child.lastPathComponent
                 if exclusions.contains(where: { Self.isPath(childDisplay, under: $0) }) { continue }
-                if excludedDirectoryNames.contains(child.lastPathComponent) { continue }
+                if OnboardingExclusions.isExcludedDirectoryName(child.lastPathComponent,
+                                                                configured: excludedDirectoryNames) { continue }
+                if OnboardingExclusions.isTransientOrSystemFile(path: childDisplay) { continue }
                 // lstat-level link check FIRST: a symlinked directory must be
                 // recorded as a link and never descended into (plan §40).
                 var lst = stat()
