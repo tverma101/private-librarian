@@ -35,12 +35,16 @@ mkdir -p "$OUT_DIR/$APP_NAME/Contents/Resources/Models"
 
 cp "$BUILD_DIR/LibrarianApp" "$OUT_DIR/$APP_NAME/Contents/MacOS/PrivateLibrarian"
 
-# Bundle offline embedding helper for Tier-2 (pinned python + LIBRARIAN_* env).
-if [ -f "scripts/embed.py" ]; then
-    cp "scripts/embed.py" "$OUT_DIR/$APP_NAME/Contents/Resources/scripts/"
-fi
+# Bundle only offline runtime helpers. Provisioners are deliberately not part
+# of the application: model downloads remain a separate explicit operator action.
+for helper in scripts/embed.py scripts/specialist.py; do
+    if [ -f "$helper" ]; then
+        cp "$helper" "$OUT_DIR/$APP_NAME/Contents/Resources/scripts/"
+    fi
+done
 
-# Optionally bundle provisioned Models for offline Tier-2 in the signed Resources.
+# Optionally bundle already-provisioned Models for offline inference in signed Resources.
+# Public/release builds do not download models and CI normally has no Models directory.
 if [ -d "Models" ]; then
     for m in Models/*; do
         [ -d "$m" ] || continue
