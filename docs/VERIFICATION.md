@@ -1,29 +1,26 @@
 # Verification
 
-This page describes how to verify the current repository and how to interpret the measurements recorded here.
+This page describes how to verify the current repository and how to interpret development measurements.
 
 ## Source of truth
 
-For a current commit, GitHub Actions and a fresh local run are the source of truth. Historical benchmark numbers below are useful for comparison, but they are not release guarantees.
+For a current commit, a fresh GitHub Actions run and a fresh local run are the source of truth. Historical benchmark numbers below are comparison data, not release guarantees.
 
-The integrated branch has three CI jobs:
+The normal CI workflow has three jobs:
 
-- `test` — build, full Swift test suite, Tier-2 provider contract, and vendored SQLCipher provenance checks;
+- `test` — public-repository hygiene, build, full Swift suite, Tier-2 provider contract, and vendored SQLCipher provenance;
 - `quality` — deterministic Golden Library metric/schema checks;
 - `entitlement-audit` — release build, local E2E verification, packaged-app entitlement audit, and network-negative probe.
 
-CI also rejects public-repository hygiene mistakes such as tracked credential/signing files, downloaded model folders, and real-looking personal `/Users/...` paths in source/tests/docs.
-
 ## Reproduce the normal checks
-
-From the repository root:
 
 ```bash
 swift build
+swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 swift test
 ```
 
-For the release-style verification path:
+For the release-style path:
 
 ```bash
 swift build -c release
@@ -34,50 +31,50 @@ sandbox-exec -f <(printf '(version 1)\n(allow default)\n(deny network*)\n') \
   python3 scripts/network_negative_probe.py
 ```
 
-For the deterministic quality harness:
+Quality/performance harnesses:
 
 ```bash
 python3 -B scripts/benchmark_quality.py --output quality-result.json
-```
-
-For the synthetic performance harness:
-
-```bash
 python3 scripts/benchmark_librarian.py --files 10000 --search-iters 5 --relation-iters 3
 ```
 
 ## What the Swift suite covers
 
-The test suite includes coverage for:
+The suite includes coverage for:
 
-- source immutability across indexing passes;
-- symlink refusal, intermediate-symlink breakout, and path-swap/TOCTOU handling;
+- source immutability;
+- symlink refusal and path-swap/TOCTOU handling;
 - catalog encryption and wrong-key refusal;
 - malformed-file resilience;
-- prompt-injection data remaining inert;
+- prompt-injection content remaining inert;
 - exact duplicate detection without deletion;
 - missing-file handling;
-- incremental zero-work behavior for unchanged files;
+- incremental zero-work behavior;
 - OCR and complete compressed-container snapshots;
 - screenshot classification and persisted evidence;
 - similarity families and incremental neighborhood updates;
-- live FSEvents coalescing, exclusions, and dropped-event reconciliation;
+- live FSEvents coalescing/exclusions/dropped-event reconciliation;
 - Review Inbox corrections and evidence-backed learned rules;
-- media decoding, transcript persistence/search, and stale-transcript handling;
+- media decoding, transcript persistence/search, ASR provider invalidation, failure/retry/no-transcript semantics, and stale-transcript suppression;
 - provider/indexer/catalog/search integration;
-- organization graph and onboarding coverage.
+- organization graph and onboarding coverage;
+- bounded Smart Groups, raw-label suppression, lane diversity limits, and legacy taxonomy pruning.
 
-The real provisioned Whisper test is host-conditional. Hosted CI does not ship a local Whisper executable/model, so that test is expected to skip there while the generated-fixture media pipeline remains exercised without an external model.
+The real provisioned Whisper test is host-conditional. Hosted CI does not ship the user's local Whisper executable/model, so that test is expected to skip there while generated-fixture media tests still exercise the production indexing pipeline.
 
-## Known compiler warning
+## Concurrency checking
 
-The current integrated app still emits Swift concurrency diagnostics around the background indexing callback flow. The build succeeds under the current toolchain, but those diagnostics are tracked in issue #46 because they become errors under Swift 6 language-mode enforcement.
+The integration branch is also built with:
 
-Do not describe the current build as warning-free until #46 is closed and a fresh CI run confirms it.
+```bash
+swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+```
+
+This is the regression gate for the app-model callback problem previously tracked in #46. Background indexing remains off the main actor while progress/completion handoff is actor-aware.
 
 ## Packaging and sandbox checks
 
-`scripts/package_app.sh` builds the release-style `.app` and signs it with the configured identity (ad-hoc by default for local verification).
+`scripts/package_app.sh` builds a release-style `.app` and signs it with the configured identity (ad-hoc by default for local verification).
 
 The entitlement audit expects:
 
@@ -87,21 +84,19 @@ The entitlement audit expects:
 - no source read-write entitlement;
 - no network client/server entitlement.
 
-The network-negative probe runs inside an additional deny-network sandbox and attempts outbound and local network operations. Those attempts must be denied.
+The network-negative probe runs inside an additional deny-network sandbox and attempts outbound/local network operations. Those attempts must be denied.
 
 The CLI is a development/verification tool and must not be copied into the production app bundle.
 
 ## SQLCipher provenance
 
-SQLCipher is vendored under `ThirdParty/sqlcipher/` with its license and provenance files. CI checks the expected vendored source/provenance rather than allowing an accidental system SQLite fallback to go unnoticed.
+SQLCipher is vendored under `ThirdParty/sqlcipher/` with license and provenance files. CI checks the expected vendored source/provenance so an accidental system SQLite fallback does not go unnoticed. Catalog tests also verify encrypted-on-disk behavior and wrong-key failure.
 
-Catalog tests also verify encrypted-on-disk behavior and wrong-key failure.
-
-## Optional embedding providers
+## Optional providers
 
 The default app does not require downloaded model artifacts.
 
-Provider checks are explicit and fail closed. A requested provider should be reported unavailable when its expected artifacts, tokenizer data, dependencies, or provenance are incomplete rather than silently switching model spaces.
+Embedding providers fail closed when expected artifacts, tokenizer data, dependencies, or provenance are incomplete rather than silently switching model spaces.
 
 Useful commands include:
 
@@ -110,7 +105,24 @@ python3 scripts/bench_providers.py --providers local fileid coreml --output prov
 .build/release/librarian-cli provider-smoke --samples 5
 ```
 
-A successful Core ML MobileCLIP smoke run proves that the native provider can produce matching-space image/text vectors from broker-supplied bytes/text. It does not by itself prove that the provider wins the Golden Library retrieval-quality comparison.
+A successful Core ML MobileCLIP smoke run proves that the provider can produce matching-space image/text vectors from broker-supplied data. It does not by itself prove that provider wins a Golden Library retrieval-quality comparison.
+
+Local Whisper is opt-in. The app only enables it when the configured executable/model passes preflight. The ASR processing identity includes provider/model generation so configuration changes invalidate unchanged media once and then return to normal incremental skips.
+
+## Smart organization verification
+
+The organizer deliberately has a second, bounded presentation layer above raw classifications/similarity data. Regression tests require that:
+
+- raw Vision labels do not create arbitrary taxonomy folders;
+- broad stable categories are used instead;
+- singleton taxonomy noise is not promoted;
+- Smart Groups stay globally bounded;
+- duplicate, screenshot, school, project, semantic, and general lanes cannot monopolize the screen;
+- semantic groups require minimum support/confidence;
+- old classifier generations force one reclassification;
+- retired orphan taxonomy nodes are pruned from the encrypted catalog after reindex.
+
+This is the main guard against replacing Finder folder spam with thousands of AI-generated virtual folders.
 
 ## Historical 10k synthetic snapshot
 
@@ -130,19 +142,21 @@ A local 10,000-file synthetic run recorded on August 25, 2026 produced approxima
 | Peak RSS reported by harness | 25.5 MB |
 | Catalog size | 18,243,584 bytes |
 
-Treat these as a historical development snapshot, not an SLA or a current-commit benchmark. Re-run the harness when comparing performance-sensitive changes.
+Treat these as a historical development snapshot, not an SLA or current-commit benchmark. Re-run the harness for performance-sensitive changes.
 
 A 100,000-file run was started during development but did not complete, so the project makes no 100k performance claim.
 
-## Current gaps that affect verification
+## One verification gap remains
 
-Several important app-level behaviors remain open and should not be inferred from lower-level green tests:
+The implementation now resolves saved bookmarks fail-closed and retains security-scoped leases for live watched roots. What hosted CI cannot create is the genuine App Sandbox extension granted after a human selects a folder in `NSOpenPanel`.
 
-- #42 — ASR provider/model identity must participate in incremental invalidation;
-- #43 — transcription failure needs explicit retry semantics;
-- #44 — live indexing needs a persistent security-scoped permission lifetime in the sandboxed app;
-- #45 — missing/stale saved bookmarks must fail closed rather than falling back to raw-path access;
-- #46 — Swift 6 concurrency warnings need cleanup;
-- #47 — the implemented local transcription backend still needs app-level settings/wiring.
+Before calling the app daily-use ready, perform the #44 packaged-app smoke:
 
-A green CI run means the checked behaviors passed. It does not mean those open product gaps are already solved.
+1. select a real folder in the packaged app;
+2. index it;
+3. quit and relaunch;
+4. confirm the persisted bookmark restores access;
+5. create/change a file and confirm a later FSEvent reindexes it;
+6. pause/remove/reauthorize and confirm the old access lifetime is released/replaced correctly.
+
+A green hosted CI run verifies the code paths and synthetic regression suite. It cannot substitute for that one OS-granted permission lifecycle test.
