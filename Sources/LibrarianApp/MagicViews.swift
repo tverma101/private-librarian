@@ -109,10 +109,21 @@ struct MagicContentView: View {
                                 .accessibilityLabel("Remove exclusion")
                         }
                     }
-                    Button(model.isIndexing ? "Stop Cleanup" : "Clean Up My Mac") {
-                        if model.isIndexing { model.cancelIndexing() } else { model.startIndexing() }
+                    if model.isIndexing {
+                        Button("Stop Cleanup") { model.cancelIndexing() }
+                    } else {
+                        Menu("Clean Up") {
+                            Button("All Authorized Folders") { model.startIndexing() }
+                            Divider()
+                            ForEach(model.sources.filter { !model.isPaused($0) && !model.needsReauthorization($0) }) { source in
+                                let name = (source.path as NSString).lastPathComponent
+                                Button("Only \(name.isEmpty ? source.path : name)") {
+                                    model.startIndexing(source: source)
+                                }
+                            }
+                        }
+                        .disabled(model.sources.isEmpty || model.sources.allSatisfy { model.isPaused($0) || model.needsReauthorization($0) })
                     }
-                    .disabled(!model.isIndexing && (model.sources.isEmpty || model.sources.allSatisfy { model.isPaused($0) }))
                 }
 
                 Section("Settings") {

@@ -344,10 +344,29 @@ final class LibrarianModel: ObservableObject {
     }
 
     func startIndexing() {
-        guard let indexer = makeIndexer(), let catalog, !isIndexing else { return }
+        guard !isIndexing else { return }
         let jobs: [(SourceFolder, SecurityScopedBookmarkLease)] = sources
             .filter { !pausedPaths.contains($0.path) }
             .compactMap { source in sourceLease(for: source).map { (source, $0) } }
+        startCleanup(jobs: jobs, scopeLabel: "all authorized folders")
+    }
+
+    func startIndexing(source: SourceFolder) {
+        guard !isIndexing, !pausedPaths.contains(source.path) else { return }
+        guard let lease = sourceLease(for: source) else {
+            log("folder needs reauthorization before cleanup: \(source.path)")
+            return
+        }
+        let name = (source.path as NSString).lastPathComponent
+        startCleanup(jobs: [(source, lease)],
+                     scopeLabel: name.isEmpty ? source.path : name)
+    }
+
+    private func startCleanup(
+        jobs: [(SourceFolder, SecurityScopedBookmarkLease)],
+        scopeLabel: String
+    ) {
+        guard let indexer = makeIndexer(), let catalog, !isIndexing else { return }
         guard !jobs.isEmpty else {
             log("no authorized source folders available for cleanup")
             return
@@ -363,14 +382,14 @@ final class LibrarianModel: ObservableObject {
         let token = IndexCancellationToken()
         activeIndexCancellation = token
         isIndexing = true
-        log("cleanup started")
+        log("cleanup started · \(scopeLabel)")
 
-        Task.detached(priority: .userInitiated) { [weak self, jobs, session, token] in
+        Task.detached(priority: .userInitiated) { [weak self, jobs, session, token, scopeLabel] in
             for (_, lease) in jobs {
                 if token.isCancelled { break }
                 _ = try? session.indexRoot(lease.url, cancellation: token) { progress in
                     Task { @MainActor [weak self] in
-                        self?.log("cleanup… \(progress.scanned) files scanned")
+                        self?.log("cleanup \(scopeLabel)… \(progress.scanned) files scanned")
                     }
                 }
             }
@@ -378,7 +397,7 @@ final class LibrarianModel: ObservableObject {
                 guard let self else { return }
                 self.activeIndexCancellation = nil
                 self.isIndexing = false
-                self.log(token.isCancelled ? "cleanup stopped" : "cleanup complete")
+                self.log(token.isCancelled ? "cleanup stopped" : "cleanup complete · \(scopeLabel)")
                 self.refreshDashboard()
             }
         }
