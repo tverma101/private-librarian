@@ -25,6 +25,22 @@ jobs:
           if grep -q 'public var localModelProfile: LocalModelProfile = .fast' Sources/LibrarianCore/Indexer.swift; then
             echo 'integration already applied'
           else
+            python3 - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/apply_specialist_router_integration.py')
+          text = path.read_text()
+          old = r'textContent = nativeText + "\n" + recovered'
+          new = r'textContent = nativeText + "\\n" + recovered'
+          if old not in text:
+              raise SystemExit('expected OCR newline patch source not found')
+          text = text.replace(old, new, 1)
+          text = text.replace(
+              'nativeText.contains(recovered.prefix(256))',
+              'nativeText.contains(String(recovered.prefix(256)))',
+              1,
+          )
+          path.write_text(text)
+          PY
             python3 scripts/apply_specialist_router_integration.py
           fi
 
