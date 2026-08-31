@@ -1,5 +1,19 @@
 # Codex turn log
 
+## 2026-08-31 — PR #57 merged and installed-app headless audit
+
+- `scope`: finish the PR #57 integration, recheck the installed macOS artifact without changing default app associations, remove the duplicate LaunchServices registrations, and record the remaining distribution/user-confirmation boundaries.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; branch `fix/tier2-incremental-ci`; PR #57 is merged at `48d4d7789d24ee1486a4f2ed5868f5a0b04879b5`.
+- `status`: the reviewed specialist/router/release-hardening work is merged and the canonical checkout is updated. A local follow-up adds real AppIcon resources, compiles/verifies `Assets.car` and `AppIcon.icns` during packaging, and updates the release receipts; that follow-up is local-only and is not pushed.
+- `changed_files`: `Sources/LibrarianApp/Assets.xcassets/AppIcon.appiconset/Contents.json`, the ten AppIcon PNG resources, `scripts/package_app.sh`, `docs/VERIFICATION.md`, `docs/troubleshooting/packaging-launch.md`, and this turn log.
+- `validation`: the installed app is universal `arm64` + `x86_64`; `codesign --verify --deep --strict`, the sandbox/read-only entitlement audit, `hdiutil verify`, and readonly DMG mount inspection passed. `dist/` contains only `PrivateLibrarian-0.1.0.dmg`; `/Applications` contains one `PrivateLibrarian.app`; the app contains no CLI. An explicit `open -n -g /Applications/PrivateLibrarian.app` smoke kept `LibrarianApp` alive for three seconds and the exact task-created PID exited cleanly; the recent process log had no crash/fatal/catalog/migration failure. LaunchServices was read before and after removing five exact stale registrations; only `/Applications/PrivateLibrarian.app` remains, and no default handler or association was changed.
+- `evidence_state`: implementation=yes; CI/local tests=yes; packaged=yes; installed=yes; headless launch=yes; visual inspection=yes from a local screenshot in the earlier release check; user-confirmed migration/bookmark relaunch=no; public notarization=no.
+- `residual_gap`: the current certificate is Apple Development, so `spctl`/stapling correctly remain unavailable for public Gatekeeper distribution; Developer ID signing, notarization, and stapling still require the release identity/account. An existing legacy catalog still needs one visible **Migrate Existing Catalog** action and user-approved **Always Allow** Keychain access; the real App Sandbox folder/bookmark/relaunch lifecycle remains human-confirmed work.
+- `cleanup`: stale LaunchServices records were unregistered without deleting the recoverable archived app or changing default app behavior. No user data, catalog, Keychain item, source file, or model data was deleted. No GitHub Actions mutation was performed.
+- `next_action`: if the icon/resource follow-up should be published, review and push it as a separate topic change; otherwise perform the one-time in-app migration and packaged bookmark/relaunch smoke with the user present.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-31.
+
 ## 2026-08-30 — PR #57 deep review and release hardening checkpoint
 
 - `scope`: review PR #57's final local specialist router, resolve the remaining macOS launch/keychain/packaging problems, and tighten the app's UI and offline model lifecycle before merge.

@@ -251,3 +251,30 @@ visually inspected through Computer Use in this run, and the one-time legacy
 Keychain approval was not user-confirmed, so a prompt-free post-migration launch
 is not claimed yet. Public distribution still requires a Developer ID
 Application identity, notarization, and stapling.
+
+## Current merged-release and headless install receipt
+
+On 2026-08-31, PR #57 was confirmed merged into `fix/tier2-incremental-ci` at
+`48d4d7789d24ee1486a4f2ed5868f5a0b04879b5`. The canonical post-merge package
+was rebuilt with `scripts/package_app.sh --xcode --install`. The package now
+compiles the checked-in `AppIcon` asset catalog and verifies both
+`Contents/Resources/Assets.car` and `Contents/Resources/AppIcon.icns`; the
+bundle also declares `CFBundleIconName=AppIcon` and `CFBundleIconFile=AppIcon`.
+
+The installed artifact passed strict code-sign verification, the entitlement
+audit, universal-slice inspection, DMG checksum verification, and a read-only
+DMG mount check. The final DMG SHA-256 was
+`ac30e488a934637a51995a2add79e53c0e575c0c553ff736b9a9e67b9f99edd4`.
+`dist/` contains only the versioned DMG, `/Applications` contains exactly one
+Private Librarian bundle, and the production app contains no CLI executable.
+
+The installed app was reviewed headlessly with an explicit isolated
+`open -n -g` launch. `LibrarianApp` remained alive for the smoke window and
+exited cleanly when only the task-created PID was terminated; recent process
+logs contained no crash, fatal, catalog, migration, or repeated-Keychain
+failure. LaunchServices had five stale registrations for old temporary/archive
+bundles; unregistering those exact paths left only
+`/Applications/PrivateLibrarian.app`. No default app handler or file
+association was changed. The local Apple Development artifact is still not
+notarized/stapled, so `spctl` rejection is a public-distribution boundary, not
+an installed-app launch failure.

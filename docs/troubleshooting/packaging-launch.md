@@ -31,6 +31,11 @@ canonical `/Applications/PrivateLibrarian.app`. Old generated app bundles are
 moved to a recoverable ignored archive instead of being left as duplicate
 launch targets.
 
+The packager also compiles the checked-in `AppIcon` asset catalog into
+`Assets.car` and `AppIcon.icns`, and verifies both resources before signing.
+This keeps Finder/Dock resource resolution inside the signed bundle instead of
+falling back to an empty or stale app-icon registration.
+
 ## Validation
 
 The repaired bundle was rebuilt with `scripts/package_app.sh --xcode --install`.
@@ -48,3 +53,9 @@ notarization, and stapling are not available. That is separate from the fixed
 local launch failure. An existing legacy catalog still needs the explicit
 in-app migration action and one user-approved **Always Allow** Keychain access;
 startup no longer probes that legacy item automatically.
+
+If Finder or an Open With list still shows old copies after a prior development
+run, inspect LaunchServices first and unregister only the exact stale bundle
+paths. Do not reset LaunchServices globally or change the user's default
+handler. The current install should be the only registered
+`/Applications/PrivateLibrarian.app` path.

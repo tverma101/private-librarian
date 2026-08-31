@@ -355,6 +355,8 @@ RESOURCES="$APP_BUNDLE/Contents/Resources"
 MACOS="$APP_BUNDLE/Contents/MacOS"
 DMG_PATH="$OUT_DIR/PrivateLibrarian-$VERSION.dmg"
 DMG_SOURCE_DIR=""
+ASSET_CATALOG="$ROOT_DIR/Sources/LibrarianApp/Assets.xcassets"
+ASSET_PARTIAL_INFO="$ROOT_DIR/.build/private-librarian-assets-partial-info.plist"
 
 cleanup_dmg_source() {
     if [ -n "$DMG_SOURCE_DIR" ] && [ -d "$DMG_SOURCE_DIR" ]; then
@@ -451,6 +453,30 @@ if [ -f "$ROOT_DIR/scripts/specialist.py" ]; then
     install -m 0444 "$ROOT_DIR/scripts/specialist.py" "$RESOURCES/scripts/specialist.py"
 fi
 
+# The release bundle is assembled from the archived executable, so compile
+# the asset catalog explicitly instead of relying on SwiftPM's resource bundle
+# layout. This keeps the app icon and accent color in the actual .app payload.
+[ -d "$ASSET_CATALOG" ] || {
+    echo "missing asset catalog: $ASSET_CATALOG" >&2
+    exit 1
+}
+xcrun actool \
+    --compile "$RESOURCES" \
+    --platform macosx \
+    --minimum-deployment-target 14.0 \
+    --app-icon AppIcon \
+    --accent-color AccentColor \
+    --output-partial-info-plist "$ASSET_PARTIAL_INFO" \
+    "$ASSET_CATALOG" >/dev/null
+[ -f "$RESOURCES/Assets.car" ] || {
+    echo "asset catalog compilation did not produce Assets.car" >&2
+    exit 1
+}
+[ -f "$RESOURCES/AppIcon.icns" ] || {
+    echo "asset catalog compilation did not produce AppIcon.icns" >&2
+    exit 1
+}
+
 # SwiftPM emits the target resource bundle beside the executable. Keep it in
 # the app even though the current UI only needs the executable; this preserves
 # Assets.xcassets and future Bundle.module resources in the distributable.
@@ -488,6 +514,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
     <key>CFBundleExecutable</key><string>$APP_EXECUTABLE</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$BUILD_VERSION</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleIconName</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
