@@ -1,10 +1,11 @@
 import SwiftUI
+import AppKit
 import LibrarianCore
 
 /// Native SwiftUI shell (plan §1, §45, §46). No web server, no WebView,
 /// no listening socket. Sources are added via the system folder picker with
 /// read-only security-scoped bookmarks; the catalog is SQLCipher-encrypted
-/// with its key in the Keychain.
+/// with its key in the app-owned data-protection Keychain.
 @main
 struct PrivateLibrarianApp: App {
     @StateObject private var model = LibrarianModel()
@@ -14,7 +15,12 @@ struct PrivateLibrarianApp: App {
             MagicContentView()
                 .environmentObject(model)
                 .frame(minWidth: 900, minHeight: 560)
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSApplication.willTerminateNotification)) { _ in
+                    model.shutdown()
+                }
         }
+        .defaultSize(width: 1100, height: 720)
         .commands {
             CommandGroup(after: .sidebar) {
                 Button("Add Source Folder…") { model.addSourceFolder() }
@@ -38,6 +44,13 @@ final class LibrarianModel: ObservableObject {
         let bookmarkData: Data?
     }
 
+    private struct Tier2Readiness: Sendable {
+        let coreML: Bool
+        let legacyClip: Bool
+        let legacyMiniLM: Bool
+        let specialistIDs: Set<String>
+    }
+
     @Published var sources: [SourceFolder] = []
     @Published var statusLines: [String] = []
     @Published var searchResults: [String] = []
@@ -52,10 +65,16 @@ final class LibrarianModel: ObservableObject {
     @Published var organizationGraph: OrganizationGraphSnapshot = .empty
     @Published var smartGroups: [SmartOrganizationGroup] = []
     @Published var coverage: OnboardingCoverage = .empty
+    @Published var projectSummaries: [ProjectSemanticSummary] = []
     @Published private(set) var pausedPaths: Set<String> = []
     @Published private(set) var liveIndexRunning = false
     @Published private(set) var livePendingEvents = 0
     @Published private(set) var sourcesNeedingReauthorization: Set<String> = []
+    @Published private(set) var catalogMigrationRequired = false
+    @Published private(set) var catalogMigrationAttempted = false
+    @Published private(set) var isTier2Provisioned = false
+    @Published private(set) var tier2Status = "Checking local model readiness…"
+    @Published private(set) var isSearching = false
     @Published var localTranscriptionEnabled: Bool {
         didSet {
             UserDefaults.standard.set(localTranscriptionEnabled, forKey: AppLocalTranscription.enabledDefaultsKey)
@@ -80,13 +99,6 @@ final class LibrarianModel: ObservableObject {
     }
     @Published var searchMode: String = "auto" // auto | exact | semantic | visual | clipText
 
-    var isTier2Provisioned: Bool {
-        CoreMLMobileCLIPProvider.isAvailable
-            || LocalModelBridge.isProvisioned(.clipImage)
-            || LocalModelBridge.isProvisioned(.miniLMText)
-            || !SpecialistModelBridge.availableModelIDs().isEmpty
-    }
-
     var isLocalTranscriptionAvailable: Bool { AppLocalTranscription.isAvailable }
     var localTranscriptionStatus: String { AppLocalTranscription.statusText }
 
@@ -95,6 +107,11 @@ final class LibrarianModel: ObservableObject {
     private var liveCoordinator: LiveIndexCoordinator?
     private var liveAccessLeases: [String: SecurityScopedBookmarkLease] = [:]
     private var activeIndexCancellation: IndexCancellationToken?
+    private var hasStarted = false
+    private var modelStatusTask: Task<Void, Never>?
+    private var modelStatusGeneration = 0
+    private var searchTask: Task<Void, Never>?
+    private var searchGeneration = 0
 
     static var appSupportDir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -113,21 +130,99 @@ final class LibrarianModel: ObservableObject {
         loadBookmarks()
         loadExclusions()
         loadPausedPaths()
-        openCatalogIfNeeded()
+        refreshModelStatus()
     }
 
     // MARK: - Catalog
 
+    /// Start after the first window has appeared. Legacy Keychain migration
+    /// can require user approval; doing it from init would block SwiftUI from
+    /// rendering any window or status explaining what is happening.
+    func start() {
+        guard !hasStarted else { return }
+        hasStarted = true
+        refreshModelStatus()
+        openCatalogIfNeeded()
+        refreshDashboard()
+    }
+
+    /// Readiness checks can enumerate large model snapshots and invoke a small
+    /// dependency probe. Keep that work off the main actor and cache the result
+    /// until the user explicitly refreshes it or changes the model setup.
+    func refreshModelStatus() {
+        modelStatusTask?.cancel()
+        modelStatusGeneration += 1
+        let generation = modelStatusGeneration
+        tier2Status = "Checking local model readiness…"
+        let work = Task.detached(priority: .utility) {
+            Tier2Readiness(
+                coreML: CoreMLMobileCLIPProvider.isAvailable,
+                legacyClip: LocalModelBridge.isProvisioned(.clipImage),
+                legacyMiniLM: LocalModelBridge.isProvisioned(.miniLMText),
+                specialistIDs: SpecialistModelBridge.availableModelIDs())
+        }
+        modelStatusTask = Task { @MainActor [weak self] in
+            let readiness = await work.value
+            guard let self, self.modelStatusGeneration == generation else { return }
+            self.isTier2Provisioned = readiness.coreML
+                || readiness.legacyClip
+                || readiness.legacyMiniLM
+                || !readiness.specialistIDs.isEmpty
+            if readiness.specialistIDs.contains(LocalModelStack.siglip2.id) {
+                self.tier2Status = "Tier-2 ready — local SigLIP2 specialist"
+            } else if readiness.coreML {
+                self.tier2Status = "Tier-2 ready — Core ML MobileCLIP"
+            } else if readiness.legacyClip || readiness.legacyMiniLM {
+                self.tier2Status = "Model files ready; runtime is checked when indexing starts"
+            } else if !readiness.specialistIDs.isEmpty {
+                self.tier2Status = "Specialist files found; install SigLIP2 or legacy CLIP/MiniLM embeddings"
+            } else {
+                self.tier2Status = "Tier-2 not provisioned — run scripts/setup_models.sh"
+            }
+        }
+    }
+
     private func openCatalogIfNeeded() {
         guard catalog == nil else { return }
         do {
-            let key = try CatalogKeychain.loadOrCreate()
-            let dbPath = Self.appSupportDir.appendingPathComponent("catalog.db").path
-            catalog = try Catalog(path: dbPath, key: key)
-            log("catalog opened (encrypted)")
-            restartLiveCoordinator()
+            if let key = try CatalogKeychain.load() {
+                try openCatalog(key: key)
+            } else {
+                let dbPath = Self.appSupportDir.appendingPathComponent("catalog.db").path
+                if FileManager.default.fileExists(atPath: dbPath) {
+                    catalogMigrationRequired = true
+                    log("existing catalog needs one-time Keychain migration · choose Migrate Existing Catalog")
+                } else {
+                    try openCatalog(key: CatalogKeychain.createAppOwned())
+                }
+            }
         } catch {
             log("catalog error: \(error)")
+        }
+    }
+
+    private func openCatalog(key: Data) throws {
+        let dbPath = Self.appSupportDir.appendingPathComponent("catalog.db").path
+        catalog = try Catalog(path: dbPath, key: key)
+        catalogMigrationRequired = false
+        log("catalog opened (encrypted)")
+        restartLiveCoordinator()
+    }
+
+    /// Perform the only legacy Keychain read, after the user has explicitly
+    /// requested migration from the visible settings control.
+    func migrateCatalog() {
+        guard catalog == nil, catalogMigrationRequired, !catalogMigrationAttempted else { return }
+        catalogMigrationAttempted = true
+        do {
+            guard let key = try CatalogKeychain.migrateLegacy() else {
+                log("legacy catalog key was not found; existing encrypted catalog was left untouched")
+                return
+            }
+            try openCatalog(key: key)
+            refreshDashboard()
+        } catch {
+            log("catalog migration error: \(error)")
         }
     }
 
@@ -172,7 +267,7 @@ final class LibrarianModel: ObservableObject {
             isPausing = true
         }
         if isPausing, isIndexing {
-            activeIndexCancellation?.cancel()
+            activeIndexCancellation?.cancel(reason: .paused)
             log("stopping current cleanup after this file…")
         }
         savePausedPaths()
@@ -181,7 +276,7 @@ final class LibrarianModel: ObservableObject {
     }
 
     func removeSource(_ source: SourceFolder) {
-        if isIndexing { activeIndexCancellation?.cancel() }
+        if isIndexing { activeIndexCancellation?.cancel(reason: .removed) }
         try? catalog?.markRootUnscoped(root: source.path)
         sources.removeAll { $0.id == source.id }
         bookmarkDataByPath.removeValue(forKey: source.path)
@@ -307,18 +402,28 @@ final class LibrarianModel: ObservableObject {
                        transcriptionProvider: transcriptionProvider)
     }
 
-    private func restartLiveCoordinator() {
+    private func stopLiveCoordinator() {
         liveCoordinator?.stop()
         liveCoordinator = nil
         // Dropping the leases balances every successful startAccessing call.
         liveAccessLeases.removeAll()
         liveIndexRunning = false
         livePendingEvents = 0
+    }
+
+    private func restartLiveCoordinator() {
+        stopLiveCoordinator()
+        // A manual cleanup owns the catalog/session window. Do not let a live
+        // FSEvent or wake reconciliation overlap the same root; completion of
+        // the cleanup calls this method again to restore live indexing.
+        guard !isIndexing else { return }
         guard let catalog, !sources.isEmpty else { return }
 
         var roots: [URL] = []
         var leases: [String: SecurityScopedBookmarkLease] = [:]
-        for source in sources where !pausedPaths.contains(source.path) {
+        for source in sources
+            where !pausedPaths.contains(source.path)
+                && !sourcesNeedingReauthorization.contains(source.path) {
             guard let lease = sourceLease(for: source) else { continue }
             roots.append(lease.url)
             leases[source.path] = lease
@@ -343,6 +448,20 @@ final class LibrarianModel: ObservableObject {
                 self.refreshDashboard()
             }
         }
+        coordinator.onRootAccessLost = { [weak self, weak coordinator] resolvedPath, reason in
+            Task { @MainActor [weak self, weak coordinator] in
+                guard let self, coordinator != nil else { return }
+                let source = self.sources.first { candidate in
+                    candidate.path == resolvedPath
+                        || self.liveAccessLeases[candidate.path]?.url.path == resolvedPath
+                }
+                guard let source else { return }
+                self.sourcesNeedingReauthorization.insert(source.path)
+                self.log("folder needs reauthorization: \(source.path) · \(reason)")
+                self.restartLiveCoordinator()
+                self.refreshDashboard()
+            }
+        }
         liveCoordinator = coordinator
         coordinator.start()
         liveIndexRunning = coordinator.running
@@ -350,20 +469,39 @@ final class LibrarianModel: ObservableObject {
 
     func cancelIndexing() {
         guard isIndexing else { return }
-        activeIndexCancellation?.cancel()
+        activeIndexCancellation?.cancel(reason: .cancelled)
         log("stopping cleanup after the current file…")
     }
 
+    func shutdown() {
+        activeIndexCancellation?.cancel(reason: .shutdown)
+        modelStatusTask?.cancel()
+        searchTask?.cancel()
+        stopLiveCoordinator()
+    }
+
     func startIndexing() {
-        guard !isIndexing else { return }
+        if isIndexing {
+            activeIndexCancellation?.cancel(reason: .replaced)
+            log("replacement cleanup requested; stopping after the current file…")
+            return
+        }
         let jobs: [(SourceFolder, SecurityScopedBookmarkLease)] = sources
-            .filter { !pausedPaths.contains($0.path) }
+            .filter {
+                !pausedPaths.contains($0.path)
+                    && !sourcesNeedingReauthorization.contains($0.path)
+            }
             .compactMap { source in sourceLease(for: source).map { (source, $0) } }
         startCleanup(jobs: jobs, scopeLabel: "all authorized folders")
     }
 
     func startIndexing(source: SourceFolder) {
-        guard !isIndexing, !pausedPaths.contains(source.path) else { return }
+        if isIndexing {
+            activeIndexCancellation?.cancel(reason: .replaced)
+            log("replacement cleanup requested; stopping after the current file…")
+            return
+        }
+        guard !pausedPaths.contains(source.path) else { return }
         guard let lease = sourceLease(for: source) else {
             log("folder needs reauthorization before cleanup: \(source.path)")
             return
@@ -383,6 +521,8 @@ final class LibrarianModel: ObservableObject {
             return
         }
 
+        stopLiveCoordinator()
+
         var sessionOptions = ScalableIndexSession.Options()
         sessionOptions.excludedPaths = effectiveExcludedPaths
         sessionOptions.excludedDirectoryNames = OnboardingExclusions.defaultDirectoryNames
@@ -396,20 +536,44 @@ final class LibrarianModel: ObservableObject {
         log("cleanup started · \(scopeLabel)")
 
         Task.detached(priority: .userInitiated) { [weak self, jobs, session, token, scopeLabel] in
-            for (_, lease) in jobs {
+            var unavailableSources: [String] = []
+            var completionReasons: [String] = []
+            for (source, lease) in jobs {
                 if token.isCancelled { break }
-                _ = try? session.indexRoot(lease.url, cancellation: token) { progress in
+                do {
+                    let result = try session.indexRoot(lease.url, cancellation: token) { progress in
+                        Task { @MainActor [weak self] in
+                            self?.log("cleanup \(scopeLabel) · \(progress.rootPath)… \(progress.scanned) files scanned")
+                        }
+                    }
+                    completionReasons.append("\(source.path)=\(result.completion.rawValue)")
+                    if result.completion == .rootUnavailable {
+                        unavailableSources.append(source.path)
+                    }
+                } catch {
                     Task { @MainActor [weak self] in
-                        self?.log("cleanup \(scopeLabel)… \(progress.scanned) files scanned")
+                        self?.log("cleanup \(scopeLabel) failed for \(source.path): \(error)")
                     }
                 }
             }
+            let unavailableSnapshot = unavailableSources
+            let completionSnapshot = completionReasons
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                for path in unavailableSnapshot {
+                    self.sourcesNeedingReauthorization.insert(path)
+                }
                 self.activeIndexCancellation = nil
                 self.isIndexing = false
-                self.log(token.isCancelled ? "cleanup stopped" : "cleanup complete · \(scopeLabel)")
+                if token.isCancelled {
+                    self.log("cleanup stopped · \(token.reason?.rawValue ?? "cancelled")")
+                } else if completionSnapshot.contains(where: { $0.hasSuffix("=rootUnavailable") }) {
+                    self.log("cleanup complete with unavailable folder · \(scopeLabel)")
+                } else {
+                    self.log("cleanup complete · \(scopeLabel)")
+                }
                 self.refreshDashboard()
+                self.restartLiveCoordinator()
             }
         }
     }
@@ -425,6 +589,7 @@ final class LibrarianModel: ObservableObject {
             learnedRules = try catalog.listRules()
             similarityClusters = try catalog.boundedSimilarityClusters(limit: 200)
             smartGroups = try catalog.smartOrganizationGroups()
+            projectSummaries = try catalog.projectSemanticSummaries(limit: 128)
             coverage = try catalog.coverage(roots: sources.map(\.path),
                                             excludedPaths: effectiveExcludedPaths)
             liveIndexRunning = liveCoordinator?.running ?? false
@@ -440,7 +605,7 @@ final class LibrarianModel: ObservableObject {
         case .screenshots:
             let plural = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshots", limit: 200)) ?? []
             let singular = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshot", limit: 200)) ?? []
-            return Array(Dictionary(uniqueKeysWithValues: (plural + singular).map { ($0.id, $0) })
+            return Array(Dictionary((plural + singular).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                 .values.sorted { $0.path < $1.path }.prefix(200))
         case .school:
             return (try? catalog.boundedFileSummaries(categoryPrefix: "School", limit: 200)) ?? []
@@ -526,46 +691,76 @@ final class LibrarianModel: ObservableObject {
     }
 
     func runSearch() {
-        guard let catalog, !query.isEmpty else { return }
-        let svc = SearchService(catalog: catalog, enableLocalEmbeddings: localEmbeddingsEnabled)
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        searchTask?.cancel()
+        searchGeneration += 1
+        let generation = searchGeneration
+        guard let catalog, !normalizedQuery.isEmpty else {
+            searchResults = []
+            isSearching = false
+            return
+        }
+        isSearching = true
+        searchResults = []
+        let enabled = localEmbeddingsEnabled
+        let profile = localModelProfile
         let mode = searchMode
-        var lines: [String] = []
-        switch mode {
-        case "exact":
-            lines = ((try? svc.search(query)) ?? []).map { h in
-                let evidence = h.snippet.map { "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))" } ?? ""
-                return "\(h.fileID) — \((h.path as NSString).lastPathComponent)\(evidence)"
-            }
-        case "semantic":
-            lines = ((try? svc.semanticSearch(query: query)) ?? []).map { h in
-                "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format:"%.2f", h.score))"
-            }
-        case "clipText":
-            lines = ((try? svc.clipTextToImageSearch(query: query)) ?? []).map { h in
-                "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format:"%.2f", h.score))"
-            }
-        default:
-            let sem = (try? svc.semanticSearch(query: query)) ?? []
-            if !sem.isEmpty {
-                lines = sem.map { h in
-                    "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format:"%.2f", h.score))"
-                }
-            } else {
-                let clip = (try? svc.clipTextToImageSearch(query: query)) ?? []
-                if !clip.isEmpty {
-                    lines = clip.map { h in
-                        "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format:"%.2f", h.score))"
-                    }
-                } else {
-                    lines = ((try? svc.search(query)) ?? []).map { h in
-                        let evidence = h.snippet.map { "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))" } ?? ""
-                        return "\(h.fileID) — \((h.path as NSString).lastPathComponent)\(evidence)"
-                    }
-                }
+        let providerKind = CoreMLMobileCLIPProvider.isAvailable ? "coreml-mobileclip" : nil
+        let work = Task.detached(priority: .userInitiated) {
+            Self.searchLines(catalog: catalog, query: normalizedQuery, mode: mode,
+                             enableLocalEmbeddings: enabled, localModelProfile: profile,
+                             embeddingProviderKind: providerKind)
+        }
+        searchTask = Task { @MainActor [weak self] in
+            let lines = await work.value
+            guard let self, self.searchGeneration == generation else { return }
+            self.isSearching = false
+            self.searchResults = lines.isEmpty ? ["No results"] : lines
+        }
+    }
+
+    private nonisolated static func searchLines(
+        catalog: Catalog,
+        query: String,
+        mode: String,
+        enableLocalEmbeddings: Bool,
+        localModelProfile: LocalModelProfile,
+        embeddingProviderKind: String?
+    ) -> [String] {
+        let service = SearchService(
+            catalog: catalog,
+            enableLocalEmbeddings: enableLocalEmbeddings,
+            localModelProfile: localModelProfile,
+            embeddingProviderKind: embeddingProviderKind)
+        func exactLines() -> [String] {
+            ((try? service.search(query)) ?? []).map { hit in
+                let evidence = hit.snippet.map {
+                    "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))"
+                } ?? ""
+                return "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\(evidence)"
             }
         }
-        if lines.isEmpty { lines = ["No results"] }
-        searchResults = lines
+        func semanticLines() -> [String] {
+            ((try? service.semanticSearch(query: query)) ?? []).map { hit in
+                "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format: "%.2f", hit.score))"
+            }
+        }
+        func clipLines() -> [String] {
+            ((try? service.clipTextToImageSearch(query: query)) ?? []).map { hit in
+                "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format: "%.2f", hit.score))"
+            }
+        }
+
+        switch mode {
+        case "exact": return exactLines()
+        case "semantic": return semanticLines()
+        case "clipText": return clipLines()
+        default:
+            let semantic = semanticLines()
+            if !semantic.isEmpty { return semantic }
+            let clip = clipLines()
+            return clip.isEmpty ? exactLines() : clip
+        }
     }
 
     /// Privacy indicators derived from ACTUAL state where possible (plan §45).

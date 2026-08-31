@@ -182,7 +182,10 @@ public struct LocalModelRouter: Sendable {
             append(LocalModelStack.dinov3)
         }
 
-        let needsSpecialistOCR = (context.kind == .pdf || context.isDocumentLikeImage)
+        // PaddleOCR-VL consumes decoded image bytes. PDFs are handled by the
+        // bounded PDFKit/Vision OCR lane and must never be sent as raw PDF
+        // containers to the image worker.
+        let needsSpecialistOCR = context.kind == .image && context.isDocumentLikeImage
             && !context.nativeOCRSucceeded
         if profile != .fast, needsSpecialistOCR { append(LocalModelStack.paddleOCR) }
 
@@ -201,5 +204,28 @@ public struct LocalModelRouter: Sendable {
             }
         }
         return route
+    }
+}
+
+/// Keep indexing and query-time search in the same embedding space. A model
+/// must not be selected for indexing and then silently replaced by a legacy
+/// provider when the user searches later.
+public enum LocalEmbeddingProviderSelection {
+    public static func make(
+        enabled: Bool,
+        requestedProviderKind: String? = nil,
+        specialistBridge: SpecialistModelBridge? = nil
+    ) -> any EmbeddingProvider {
+        if enabled, SpecialistModelBridge.isProvisioned(LocalModelStack.siglip2) {
+            return SpecialistSigLIP2EmbeddingProvider(
+                bridge: specialistBridge ?? SpecialistModelBridge())
+        }
+        if let requestedProviderKind {
+            return EmbeddingProviderFactory.make(kind: requestedProviderKind)
+        }
+        if enabled, CoreMLMobileCLIPProvider.isAvailable {
+            return CoreMLMobileCLIPProvider()
+        }
+        return LocalModelEmbeddingProvider()
     }
 }

@@ -22,7 +22,8 @@ same gate a future LLM classifier would face; prompt injection inside
 document text cannot cross it because there is no tool to call)
         +
 SQLCipher-encrypted catalog on disk (key generated once, held in the
-macOS Keychain, never written next to the db) with FTS5 full-text search
+macOS data-protection Keychain, never written next to the db) with FTS5
+full-text search
         +
 virtual organization only — categories are rows in `virtual_categories`,
 never directories; nothing is ever moved, renamed, deleted, re-tagged,
@@ -44,8 +45,9 @@ or permission-changed at the source
 | `RuleBasedClassifier` + `ClassifierContract` | Deterministic classifier; screenshot results add virtual `Screenshots/<subtype>` memberships and retain the strict output contract. |
 | `LearnedRuleEngine` | Applies only enabled, evidence-bound correction rules after contract validation; promotion requires three distinct matching additive corrections, remains disabled by default, and negative corrections block promotion. |
 | `Scheduler` | Serializes work into LOW/MEDIUM/HIGH slots so indexing never starves interactive work; also the seam where an LLM stage would be rate-limited later. |
-| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, screenshot assessments, hashes, errors, correction-bound learned rules, similarity clusters, and per-root onboarding coverage. Key from `CatalogKeychain` (Keychain generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
+| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, screenshot assessments, hashes, errors, correction-bound learned rules, similarity clusters, and per-root onboarding coverage. Key from `CatalogKeychain` (app-owned data-protection generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
 | `EmbeddingProvider` | Provider-neutral image/text contract. Python and Core ML artifacts are admitted only with pinned provenance manifests; `CoreMLMobileCLIPProvider` loads the genuine MobileCLIP S0 image/text pair lazily, validates 512-D output, and accepts broker bytes only. An explicitly requested unavailable provider stays unavailable instead of silently switching model spaces. |
+| `LocalModelRouter` / `SpecialistModelBridge` | Explicit, cheap-first local specialist registry and bounded JSONL worker. SigLIP2 is the shared image/text space, DINOv3 is a separate visual space, OCR/VLMs receive broker bytes or derived text only, heavy models are transient with bounded offload cleanup, and every snapshot is checked against its pinned manifest before loading. PaddleOCR-VL is excluded on macOS when the upstream runtime is unsupported. |
 | `MobileCLIPTokenizer` | Local CLIP BPE tokenizer for the Core ML text input (`[1,77]` Int32); it reads only the provisioned vocab/merges assets and never receives a source path. |
 | `OrganizationGraphBuilder` | Deterministic multi-label file/category/review/missing relationships persisted as encrypted catalog edges. Graph output is virtual and never performs source filesystem operations. |
 | `ReviewInbox` | Low-confidence queue plus catalog-only correction actions. Corrections persist category overrides so a later re-index cannot silently undo a user's choice. |
@@ -53,9 +55,9 @@ or permission-changed at the source
 | `DuplicateDetector` | Size-bucket → partial fingerprint (head/middle/tail 64 KiB) → full SHA-256 within matching partial groups. Report-only verdicts. |
 | `scripts/benchmark_quality.py` | Model/provider-neutral Golden Library metrics: screenshot subtype accuracy/macro-F1, exact/near-duplicate precision/recall/F1, semantic Recall@10, cluster purity/completeness, OCR recovery, review precision/coverage, correction reduction, and explicit model/preprocessing/runtime comparison records. |
 | `SimilarityClustering` | Provider-neutral exact-hash, feature-print, and embedding adapters feed explicit near-duplicate/semantic threshold edges. Stable family/cluster IDs, representatives, weakest-link confidence, and signal reasons are persisted in SQLCipher; incremental updates rescore only changed neighborhoods and remove missing-node edges. |
-| `SearchService` | FTS5 query front-end plus optional provider-backed MiniLM/CLIP and Vision search; semantic/vector paths join only indexed catalog rows, collapse chunk hits, apply virtual/date/duplicate filters, and quote-escape FTS input. |
+| `SearchService` | FTS5 query front-end plus optional provider-backed MiniLM/CLIP/SigLIP2 and Vision search; indexing and query-time semantic search select the same provider space, vector paths join only indexed catalog rows, collapse chunk hits, apply virtual/date/duplicate filters, and quote-escape FTS input. |
 | `LiveIndexCoordinator` | Optional read-only FSEvents reconciliation for authorized roots. Streams use `kFSEventStreamCreateFlagUseCFTypes` and decode bounded CFArray path delivery; catalog, model, cache, and temporary paths remain excluded even beneath watched roots. Dropped events trigger the existing bounded full-rescan fallback. |
-| `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree` / `graph-stats` / `provider-smoke`; it reports work, similarity, embedding, and graph metrics without exposing source writes. |
+| `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree` / `graph-stats` / `provider-smoke`; it reports work, similarity, embedding, and graph metrics without exposing source writes. It requires `LIBRARIAN_CATALOG_KEY` and never opens the GUI Keychain item. |
 | `LibrarianApp` | SwiftUI dashboard with persisted read-only security-scoped root onboarding, per-root pause/remove/reauthorize, exclusions, overview, screenshot/missing explorers, review inbox, graph view, and privacy status; sandboxed `.app` packaging via `scripts/package_app.sh` or `script/build_and_run.sh`. |
 
 Decoder boundary: compressed PDF/image containers must use the broker's

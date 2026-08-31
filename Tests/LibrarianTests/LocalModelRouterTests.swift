@@ -86,6 +86,19 @@ final class LocalModelRouterTests: XCTestCase {
         XCTAssertEqual(route.map(\.id), [LocalModelStack.miniCPM.id])
     }
 
+    func testPDFNeverRoutesImageOnlyOCRSpecialist() {
+        let router = LocalModelRouter(profile: .balanced)
+        let available = Set(LocalModelStack.all.map(\.id))
+        let route = router.route(
+            context: LocalModelRouteContext(kind: .pdf, confidence: 0.1,
+                                            hasUsefulText: false,
+                                            nativeOCRSucceeded: false,
+                                            isDocumentLikeImage: true),
+            availableModelIDs: available)
+        XCTAssertFalse(route.contains { $0.id == LocalModelStack.paddleOCR.id })
+        XCTAssertFalse(route.contains { $0.capability == .visionFallback })
+    }
+
     func testSigLIPAndDINOUseDifferentSpacesAndDimensions() {
         XCTAssertNotEqual(SpecialistModelBridge.siglipSpaceID, SpecialistModelBridge.dinoSpaceID)
         XCTAssertNotEqual(SpecialistModelBridge.siglipDimension, SpecialistModelBridge.dinoDimension)

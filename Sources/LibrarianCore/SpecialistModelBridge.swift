@@ -67,45 +67,119 @@ public final class SpecialistModelBridge: @unchecked Sendable {
         Set(LocalModelStack.all.compactMap { isProvisioned($0) ? $0.id : nil })
     }
 
+    /// This is a structural discovery check used by the UI and router. The
+    /// Python worker performs the expensive byte-for-byte verification before
+    /// loading a checkpoint, so a manifest can never make untrusted weights
+    /// executable by itself.
     public static func isProvisioned(_ descriptor: LocalModelDescriptor) -> Bool {
-        guard let root = specialistRoot(containing: descriptor.id) else { return false }
-        let directory = root.appendingPathComponent(descriptor.id)
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent("provenance.json")),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["schema"] as? Int == 1,
-              object["model"] as? String == descriptor.id,
-              object["hf_id"] as? String == descriptor.hfID,
-              let revision = object["revision"] as? String,
-              revision.count == 40,
-              revision.hasPrefix(descriptor.revisionPrefix),
-              let files = object["expected_files"] as? [String: Any], !files.isEmpty else { return false }
-        let canonicalRoot = directory.resolvingSymlinksInPath().standardizedFileURL.path
-        for (relative, expected) in files {
-            guard let digest = expected as? String, digest.count == 64,
-                  digest.allSatisfy({ $0.isHexDigit }) else { return false }
-            let file = directory.appendingPathComponent(relative)
-                .resolvingSymlinksInPath().standardizedFileURL
-            guard file.path == canonicalRoot || file.path.hasPrefix(canonicalRoot + "/"),
-                  let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-                  values.isRegularFile == true, values.isSymbolicLink != true else { return false }
+        isProvisioned(descriptor, roots: specialistRoots())
+    }
+
+    /// Internal root-injection seam used by regression tests. Production calls
+    /// the public overload so bundled, Application Support, and configured
+    /// roots are discovered from the process environment.
+    static func isProvisioned(_ descriptor: LocalModelDescriptor, roots: [URL]) -> Bool {
+        guard unsupportedReason(descriptor) == nil else { return false }
+        for root in roots {
+            let directory = root.appendingPathComponent(descriptor.id)
+            guard let rootValues = try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  rootValues.isDirectory == true, rootValues.isSymbolicLink != true,
+                  let data = try? Data(contentsOf: directory.appendingPathComponent("provenance.json")),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["schema"] as? Int == 1,
+                  object["model"] as? String == descriptor.id,
+                  object["hf_id"] as? String == descriptor.hfID,
+                  let revision = object["revision"] as? String,
+                  revision.count == 40,
+                  revision.hasPrefix(descriptor.revisionPrefix),
+                  let files = object["expected_files"] as? [String: Any], !files.isEmpty else { continue }
+            let canonicalRoot = directory.resolvingSymlinksInPath().standardizedFileURL.path
+            var expectedPaths = Set<String>()
+            var valid = true
+            for (relative, expected) in files {
+                guard let digest = expected as? String, digest.count == 64,
+                      digest.allSatisfy({ $0.isHexDigit }),
+                      Self.isSafeRelativePath(relative) else {
+                    valid = false
+                    break
+                }
+                let file = directory.appendingPathComponent(relative)
+                guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                      values.isRegularFile == true, values.isSymbolicLink != true else {
+                    valid = false
+                    break
+                }
+                let resolved = file.resolvingSymlinksInPath().standardizedFileURL.path
+                guard resolved.hasPrefix(canonicalRoot + "/") else {
+                    valid = false
+                    break
+                }
+                expectedPaths.insert(relative)
+            }
+            guard valid else { continue }
+
+            // A stale or injected extra regular file must not be silently trusted.
+            // `.cache` is intentionally ignored here and by the provisioner; it is
+            // never part of the immutable model snapshot.
+            var actualPaths = Set<String>()
+            guard let enumerator = FileManager.default.enumerator(
+                at: directory,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                options: []) else { continue }
+            for case let file as URL in enumerator {
+                guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                      values.isSymbolicLink != true else {
+                    valid = false
+                    break
+                }
+                guard values.isRegularFile == true else { continue }
+                let resolvedFile = file.resolvingSymlinksInPath().standardizedFileURL.path
+                guard resolvedFile.hasPrefix(canonicalRoot + "/") else {
+                    valid = false
+                    break
+                }
+                let relative = String(resolvedFile.dropFirst(canonicalRoot.count + 1))
+                if relative == "provenance.json" || file.pathComponents.contains(".cache") { continue }
+                actualPaths.insert(relative)
+            }
+            if valid && actualPaths == expectedPaths { return true }
         }
-        return true
+        return false
     }
 
     public static func preflight(_ descriptor: LocalModelDescriptor) -> EmbeddingProviderPreflight {
         let script = LocalModelBridge.scriptsDir()?.appendingPathComponent("specialist.py")
         let provisioned = isProvisioned(descriptor)
         let hasScript = script.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        let hasRuntime = LocalModelBridge.pythonExecutable() != nil
+        var runtimeModulesAvailable = false
         let reason: String
-        if !hasScript { reason = "specialist.py is not packaged/available" }
+        if let unsupported = unsupportedReason(descriptor) { reason = unsupported }
+        else if !hasScript { reason = "specialist.py is not packaged/available" }
+        else if !hasRuntime { reason = "isolated Python runtime is not installed — run scripts/setup_models.sh --specialist-runtime-only" }
         else if !provisioned {
             reason = descriptor.gated
                 ? "Pinned model is not provisioned (this model is gated and requires accepted access)."
                 : "Pinned specialist checkpoint is not provisioned."
-        } else { reason = "Pinned local specialist snapshot is available; runtime remains offline-only." }
+        } else if let script {
+            let runtime = LocalModelBridge.runPython(
+                [script.path, "--runtime-check", descriptor.id], timeout: 8)
+            if runtime.exitCode != 0 {
+                let detail = (runtime.stderr.isEmpty ? runtime.stdout : runtime.stderr)
+                    .split(whereSeparator: \.isNewline).first.map(String.init)
+                    ?? "required Python modules are unavailable"
+                reason = "specialist runtime unavailable — \(detail)"
+            } else {
+                runtimeModulesAvailable = true
+                reason = "Pinned local specialist snapshot is available; runtime remains offline-only."
+            }
+        } else {
+            reason = "specialist.py is not packaged/available"
+        }
         return EmbeddingProviderPreflight(
             providerID: descriptor.id,
-            available: hasScript && provisioned,
+            available: unsupportedReason(descriptor) == nil && hasScript && hasRuntime && provisioned
+                && runtimeModulesAvailable,
             reason: reason,
             artifacts: [descriptor.hfID + "@" + descriptor.revisionPrefix],
             dependencies: [descriptor.runtime])
@@ -187,6 +261,15 @@ public final class SpecialistModelBridge: @unchecked Sendable {
         "dinov3-visual:\(LocalModelStack.dinov3.revisionPrefix):vitb16-v1"
     }
 
+    private static func unsupportedReason(_ descriptor: LocalModelDescriptor) -> String? {
+        #if os(macOS)
+        if descriptor.id == LocalModelStack.paddleOCR.id {
+            return "PaddleOCR-VL is not supported on macOS CPU/Apple silicon; native Vision OCR remains enabled."
+        }
+        #endif
+        return nil
+    }
+
     private static func parseClassification(_ object: [String: Any]?, modelID: String) -> SpecialistClassification? {
         guard let object, object["error"] == nil,
               let categories = object["categories"] as? [String], !categories.isEmpty,
@@ -215,15 +298,31 @@ public final class SpecialistModelBridge: @unchecked Sendable {
         return data
     }
 
-    private static func specialistRoot(containing modelID: String) -> URL? {
-        for models in LocalModelBridge.modelsRoots() {
-            let specialists = models.appendingPathComponent("specialists")
-            if FileManager.default.fileExists(atPath: specialists.appendingPathComponent(modelID)
-                .appendingPathComponent("provenance.json").path) {
-                return specialists
-            }
+    private static func specialistRoots() -> [URL] {
+        var candidates: [URL] = []
+        let environment = ProcessInfo.processInfo.environment
+        if let list = environment["LIBRARIAN_SPECIALIST_MODELS_DIRS"] {
+            candidates.append(contentsOf: list.split(separator: ":").map { URL(fileURLWithPath: String($0)) })
         }
-        return nil
+        if let single = environment["LIBRARIAN_SPECIALIST_MODELS_DIR"], !single.isEmpty {
+            candidates.append(URL(fileURLWithPath: single))
+        }
+        candidates.append(contentsOf: LocalModelBridge.modelsRoots().map {
+            $0.appendingPathComponent("specialists", isDirectory: true)
+        })
+        var seen = Set<String>()
+        return candidates.filter {
+            seen.insert($0.standardizedFileURL.path).inserted
+                && FileManager.default.fileExists(atPath: $0.path)
+        }
+    }
+
+    private static func isSafeRelativePath(_ relative: String) -> Bool {
+        guard !relative.isEmpty, !relative.hasPrefix("/"), !relative.contains("\\") else { return false }
+        let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+        return !components.isEmpty && components.allSatisfy { component in
+            !component.isEmpty && component != "." && component != ".."
+        }
     }
 
     /// One long-lived process per Indexer keeps embedding models warm. Heavy models are explicitly
@@ -240,12 +339,10 @@ public final class SpecialistModelBridge: @unchecked Sendable {
         init?() {
             guard let script = LocalModelBridge.scriptsDir()?.appendingPathComponent("specialist.py"),
                   FileManager.default.fileExists(atPath: script.path) else { return nil }
-            let candidates = LocalModelBridge.modelsRoots().map { $0.appendingPathComponent("specialists") }
-            let root = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) })
-            let pythonCandidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
-            guard let python = pythonCandidates.first(where: FileManager.default.isExecutableFile(atPath:)) else { return nil }
+            let candidates = SpecialistModelBridge.specialistRoots()
+            guard let python = LocalModelBridge.pythonExecutable(), !candidates.isEmpty else { return nil }
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: python)
+            process.executableURL = python
             process.arguments = [script.path, "--worker"]
             var env = ProcessInfo.processInfo.environment
             env["HF_HUB_OFFLINE"] = "1"
@@ -253,7 +350,10 @@ public final class SpecialistModelBridge: @unchecked Sendable {
             env["HF_DATASETS_OFFLINE"] = "1"
             env["HF_HUB_DISABLE_TELEMETRY"] = "1"
             env["DO_NOT_TRACK"] = "1"
-            if let root { env["LIBRARIAN_SPECIALIST_MODELS_DIR"] = root.path }
+            env["LIBRARIAN_SPECIALIST_MODELS_DIRS"] = candidates.map(\.path).joined(separator: ":")
+            if env["LIBRARIAN_SPECIALIST_MODELS_DIR"] == nil, let root = candidates.first {
+                env["LIBRARIAN_SPECIALIST_MODELS_DIR"] = root.path
+            }
             process.environment = env
             let input = Pipe(), output = Pipe(), error = Pipe()
             process.standardInput = input
@@ -282,14 +382,24 @@ public final class SpecialistModelBridge: @unchecked Sendable {
             lock.lock()
             defer { lock.unlock() }
             guard !closed else { return }
+            closeLocked()
+        }
+
+        private func closeLocked() {
+            guard !closed else { return }
             closed = true
             try? input.fileHandleForWriting.close()
-            if process.isRunning {
-                process.terminate()
-                let deadline = Date().addingTimeInterval(0.5)
-                while process.isRunning && Date() < deadline { usleep(20_000) }
-                if process.isRunning { process.interrupt() }
-            }
+            guard process.isRunning else { return }
+            process.terminate()
+            let gracefulDeadline = Date().addingTimeInterval(0.5)
+            while process.isRunning && Date() < gracefulDeadline { usleep(20_000) }
+            if process.isRunning { process.interrupt() }
+            let interruptDeadline = Date().addingTimeInterval(0.5)
+            while process.isRunning && Date() < interruptDeadline { usleep(20_000) }
+            #if canImport(Darwin)
+            if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+            #endif
+            process.waitUntilExit()
         }
 
         func call(_ request: [String: Any], timeout: TimeInterval) -> [String: Any]? {
@@ -300,8 +410,17 @@ public final class SpecialistModelBridge: @unchecked Sendable {
             guard data.count <= 96 * 1024 * 1024 else { return nil }
             data.append(10)
             let deadline = Date().addingTimeInterval(max(0.1, timeout))
-            guard write(data, deadline: deadline) else { return nil }
-            return readResponse(deadline: deadline)
+            guard write(data, deadline: deadline) else {
+                closeLocked()
+                return nil
+            }
+            guard let response = readResponse(deadline: deadline) else {
+                // A timeout, malformed line, EOF, or oversized response makes
+                // the JSONL stream unsynchronized. Do not reuse the worker.
+                closeLocked()
+                return nil
+            }
+            return response
         }
 
         private func write(_ data: Data, deadline: Date) -> Bool {

@@ -24,7 +24,9 @@ func printUsage() {
     librarian-cli tree    --catalog <path>            Print virtual category tree
     librarian-cli provider-smoke [--samples <n>]      Measure genuine MobileCLIP image/text inference
 
-    The catalog is SQLCipher-encrypted; its key lives in the macOS Keychain.
+    The GUI app owns its signed data-protection Keychain item. The CLI never
+    opens that item; set LIBRARIAN_CATALOG_KEY to a 64-character hex key for
+    headless verification.
     Source folders are opened strictly O_RDONLY|O_NOFOLLOW. Nothing is ever
     written to, moved, renamed, or deleted in the indexed folders.
     """
@@ -129,25 +131,37 @@ func runProviderSmoke(samples: Int) throws {
 func openCatalog(_ catalogPath: String) throws -> Catalog {
     // Headless / CI path: an explicit hex key (LIBRARIAN_CATALOG_KEY, 64 hex
     // chars = 32 bytes) bypasses the Keychain entirely so automated runs are
-    // deterministic and prompt-free.
-    if let hex = ProcessInfo.processInfo.environment["LIBRARIAN_CATALOG_KEY"] {
-        let chars = Array(hex.lowercased())
-        guard chars.count == 64, chars.allSatisfy({ $0.isHexDigit }) else {
-            throw KeyError.badEnvKey
-        }
-        var bytes = [UInt8](); bytes.reserveCapacity(32)
-        var i = 0
-        while i < chars.count {
-            bytes.append(UInt8(String(chars[i..<i + 2]), radix: 16)!)
-            i += 2
-        }
-        return try Catalog(path: catalogPath, key: Data(bytes))
+    // deterministic and prompt-free. Keeping the CLI on this path prevents
+    // an unsigned development executable from claiming the GUI app's key.
+    guard let hex = ProcessInfo.processInfo.environment["LIBRARIAN_CATALOG_KEY"] else {
+        throw KeyError.missingEnvKey
     }
-    let key = try CatalogKeychain.loadOrCreate()
-    return try Catalog(path: catalogPath, key: key)
+    let chars = Array(hex.lowercased())
+    guard chars.count == 64, chars.allSatisfy({ $0.isHexDigit }) else {
+        throw KeyError.badEnvKey
+    }
+    var bytes = [UInt8](); bytes.reserveCapacity(32)
+    var i = 0
+    while i < chars.count {
+        bytes.append(UInt8(String(chars[i..<i + 2]), radix: 16)!)
+        i += 2
+    }
+    return try Catalog(path: catalogPath, key: Data(bytes))
 }
 
-enum KeyError: Error { case badEnvKey }
+enum KeyError: Error, CustomStringConvertible {
+    case missingEnvKey
+    case badEnvKey
+
+    var description: String {
+        switch self {
+        case .missingEnvKey:
+            return "LIBRARIAN_CATALOG_KEY is required for CLI catalog commands; the CLI never accesses the GUI Keychain item"
+        case .badEnvKey:
+            return "LIBRARIAN_CATALOG_KEY must contain exactly 64 hexadecimal characters"
+        }
+    }
+}
 
 let args = CommandLine.arguments
 guard args.count >= 2 else { printUsage(); exit(2) }
@@ -179,7 +193,7 @@ do {
             broker: broker, catalog: catalog, indexer: indexer, options: sessionOptions)
         let result = try session.indexRoot(url)
         let groups = try indexer.computeDuplicateGroups()
-        print("indexed \(result.processed) files (\(result.scanned) scanned) in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+        print("index-root=\(result.rootPath) completion=\(result.completion.rawValue) indexed=\(result.processed) scanned=\(result.scanned) missing=\(result.missingMarked) unreadable-directories=\(result.unreadableDirectories) cancelled=\(result.cancelled) paused=\(result.paused) elapsed=\(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
         let metrics = indexer.workMetrics
         print("work-metrics visionCalls=\(metrics.visionCalls) ocrCalls=\(metrics.ocrCalls) clipCalls=\(metrics.clipCalls) textEmbedCalls=\(metrics.textEmbedCalls) decodeCalls=\(metrics.decodeCalls)")
         let similarity = indexer.similarityMetrics

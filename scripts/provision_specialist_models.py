@@ -19,7 +19,9 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
@@ -91,6 +93,12 @@ MODELS = {
 PROFILE_ORDER = {"embeddings": 0, "balanced": 1, "quality": 2}
 
 
+def unsupported_reason(name: str) -> str | None:
+    if name == "paddleocr-vl-1.6" and sys.platform == "darwin":
+        return "PaddleOCR-VL is not supported on macOS CPU/Apple silicon; native Vision OCR remains the supported path."
+    return None
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as handle:
@@ -101,10 +109,10 @@ def sha256_file(path: Path) -> str:
 
 def regular_files(root: Path) -> Iterable[Path]:
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name == "provenance.json" or ".cache" in path.parts:
-            continue
         if path.is_symlink():
             raise RuntimeError(f"symlink is not allowed in a trusted model snapshot: {path}")
+        if not path.is_file() or path.name == "provenance.json" or ".cache" in path.parts:
+            continue
         yield path
 
 
@@ -134,7 +142,7 @@ def build_manifest(name: str, spec: dict, dest: Path, revision: str) -> dict:
     for path in regular_files(dest):
         resolved = path.resolve()
         try:
-            relative = str(resolved.relative_to(root))
+            relative = resolved.relative_to(root).as_posix()
         except ValueError as exc:
             raise RuntimeError(f"model file escapes snapshot root: {path}") from exc
         files[relative] = sha256_file(path)
@@ -151,13 +159,21 @@ def build_manifest(name: str, spec: dict, dest: Path, revision: str) -> dict:
     }
 
 
-def verify_one(name: str, require_revision: str | None = None) -> bool:
+def _verify_snapshot(name: str, dest: Path, require_revision: str | None = None) -> bool:
     spec = MODELS[name]
-    dest = MODELS_ROOT / name
+    if reason := unsupported_reason(name):
+        print(f"[{name}] {reason}", file=sys.stderr)
+        return False
+    if not dest.is_dir() or dest.is_symlink():
+        print(f"[{name}] model directory is missing or is a symlink", file=sys.stderr)
+        return False
     try:
         record = json.loads((dest / "provenance.json").read_text())
     except Exception as exc:
         print(f"[{name}] missing/invalid provenance: {exc}", file=sys.stderr)
+        return False
+    if not isinstance(record, dict):
+        print(f"[{name}] provenance must be a JSON object", file=sys.stderr)
         return False
     revision = record.get("revision")
     if (
@@ -179,10 +195,19 @@ def verify_one(name: str, require_revision: str | None = None) -> bool:
         return False
     root = dest.resolve()
     for relative, expected_sha in expected.items():
-        if not isinstance(relative, str) or not isinstance(expected_sha, str) or len(expected_sha) != 64:
+        if (
+            not isinstance(relative, str)
+            or not isinstance(expected_sha, str)
+            or not relative
+            or relative.startswith("/")
+            or "\\" in relative
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or len(expected_sha) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in expected_sha)
+        ):
             print(f"[{name}] malformed manifest entry {relative!r}", file=sys.stderr)
             return False
-        path = dest / relative
+        path = dest.joinpath(*relative.split("/"))
         try:
             path.resolve().relative_to(root)
         except ValueError:
@@ -205,8 +230,19 @@ def verify_one(name: str, require_revision: str | None = None) -> bool:
     return True
 
 
-def provision_one(name: str) -> bool:
+def verify_one(name: str, require_revision: str | None = None) -> bool:
+    return _verify_snapshot(name, MODELS_ROOT / name, require_revision=require_revision)
+
+
+def provision_one(name: str, *, force: bool = False) -> bool:
     spec = MODELS[name]
+    if reason := unsupported_reason(name):
+        print(f"[{name}] {reason}", file=sys.stderr)
+        return False
+    dest = MODELS_ROOT / name
+    if not force and dest.exists() and _verify_snapshot(name, dest):
+        print(f"[{name}] ready: {dest}")
+        return True
     try:
         import huggingface_hub as hf
     except ImportError:
@@ -217,23 +253,34 @@ def provision_one(name: str) -> bool:
     except RuntimeError as exc:
         print(f"[{name}] {exc}", file=sys.stderr)
         return False
-    dest = MODELS_ROOT / name
-    dest.mkdir(parents=True, exist_ok=True)
+    MODELS_ROOT.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{name}.staging-", dir=MODELS_ROOT))
     print(f"[{name}] {spec['hf_id']}@{revision[:12]} — {spec['note']}")
     print(f"  license: {spec['license']}")
     try:
         hf.snapshot_download(
             repo_id=spec["hf_id"],
             revision=revision,
-            local_dir=str(dest),
-            local_dir_use_symlinks=False,
+            local_dir=str(staging),
         )
-        manifest = build_manifest(name, spec, dest, revision)
-        (dest / "provenance.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        manifest = build_manifest(name, spec, staging, revision)
+        (staging / "provenance.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        if not _verify_snapshot(name, staging, require_revision=revision):
+            return False
+
+        # Keep the previous checkpoint recoverable. The final rename is the
+        # only point at which the active model directory changes.
+        if dest.exists() or dest.is_symlink():
+            archive_parent = Path(tempfile.mkdtemp(prefix=f".{name}.previous-", dir=MODELS_ROOT))
+            dest.rename(archive_parent / name)
+        staging.rename(dest)
     except Exception as exc:
         extra = " Accept the gated model terms and authenticate first." if spec.get("gated") else ""
         print(f"[{name}] provisioning failed: {exc}.{extra}", file=sys.stderr)
         return False
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
     return verify_one(name, require_revision=revision)
 
 
@@ -242,25 +289,45 @@ def main() -> int:
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--profile", choices=sorted(PROFILE_ORDER, key=PROFILE_ORDER.get))
     parser.add_argument("--model", choices=sorted(MODELS))
+    parser.add_argument(
+        "--models-dir", type=Path,
+        help="specialist model root (default: LIBRARIAN_SPECIALIST_MODELS_DIR or repo Models/specialists)")
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--force", action="store_true",
+                        help="redownload a verified checkpoint and preserve the old directory")
     args = parser.parse_args()
+
+    global MODELS_ROOT
+    if args.models_dir is not None:
+        MODELS_ROOT = args.models_dir.expanduser().resolve()
 
     if args.list:
         for name, spec in MODELS.items():
             present = " [present]" if (MODELS_ROOT / name / "provenance.json").is_file() else ""
             gated = " gated" if spec.get("gated") else ""
-            print(f"{name:28s} profile={spec['profile']:10s}{gated:7s} {spec['hf_id']} {spec['license']}{present}")
+            unsupported = f" [unsupported: {unsupported_reason(name)}]" if unsupported_reason(name) else ""
+            print(f"{name:28s} profile={spec['profile']:10s}{gated:7s} {spec['hf_id']} {spec['license']}{present}{unsupported}")
         return 0
 
     if bool(args.profile) == bool(args.model):
         parser.error("choose exactly one of --profile or --model")
-    names = selected_for_profile(args.profile) if args.profile else [args.model]
+    requested_names = selected_for_profile(args.profile) if args.profile else [args.model]
+    names = []
+    for name in requested_names:
+        assert name is not None
+        if reason := unsupported_reason(name):
+            if args.model:
+                print(f"[{name}] {reason}", file=sys.stderr)
+                return 2
+            print(f"[{name}] skipped: {reason}", file=sys.stderr)
+            continue
+        names.append(name)
     if args.profile == "quality" and not args.verify_only:
         print("WARNING: quality profile includes multiple multi-GB models; this is an explicit large download.", file=sys.stderr)
     MODELS_ROOT.mkdir(parents=True, exist_ok=True)
     ok = True
     for name in names:
-        result = verify_one(name) if args.verify_only else provision_one(name)
+        result = verify_one(name) if args.verify_only else provision_one(name, force=args.force)
         ok = result and ok
     return 0 if ok else 1
 

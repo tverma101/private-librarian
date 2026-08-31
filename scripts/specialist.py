@@ -17,13 +17,16 @@ import argparse
 import base64
 import gc
 import hashlib
+import importlib
 import io
 import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -34,8 +37,32 @@ os.environ.setdefault("DO_NOT_TRACK", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 ROOT = Path(__file__).resolve().parent.parent
-MODELS_ROOT = Path(os.environ.get("LIBRARIAN_SPECIALIST_MODELS_DIR", ROOT / "Models" / "specialists"))
+
+
+def _model_roots() -> list[Path]:
+    candidates: list[Path] = []
+    configured = os.environ.get("LIBRARIAN_SPECIALIST_MODELS_DIRS", "")
+    if configured:
+        candidates.extend(Path(value) for value in configured.split(os.pathsep) if value)
+    single = os.environ.get("LIBRARIAN_SPECIALIST_MODELS_DIR")
+    if single:
+        candidates.append(Path(single))
+    candidates.append(ROOT / "Models" / "specialists")
+    result: list[Path] = []
+    seen: set[str] = set()
+    for value in candidates:
+        key = str(value.expanduser().resolve())
+        if key not in seen:
+            seen.add(key)
+            result.append(Path(key))
+    return result
+
+
+MODELS_ROOTS = _model_roots()
+MODELS_ROOT = MODELS_ROOTS[0]
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
+MAX_IMAGE_PIXELS = 50_000_000
+MAX_IMAGE_EDGE = 16_384
 MAX_TEXT_CHARS = 16_000
 MAX_OUTPUT_CHARS = 8_192
 
@@ -50,6 +77,17 @@ MODEL_SPECS = {
     "mimo-vl-7b-rl-2508": ("XiaomiMiMo/MiMo-VL-7B-RL-2508", "4bfb270"),
 }
 
+RUNTIME_MODULES = {
+    "siglip2-so400m-naflex": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
+    "dinov3-vitb16-lvd1689m": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
+    "paddleocr-vl-1.6": ("PIL", "paddle", "paddleocr"),
+    "minicpm-v-4.6": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
+    "ling-3.0-tiny": ("torch", "transformers", "accelerate", "safetensors"),
+    "lfm2.5-vl-3b": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
+    "internvl3.5-4b": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
+    "mimo-vl-7b-rl-2508": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
+}
+
 ALLOWED_CATEGORIES = {
     "Image", "Image/Animals", "Image/Vehicles", "Image/Scenery", "Image/Food", "Image/Documents",
     "Screenshots", "Screenshots/code", "Screenshots/school", "Screenshots/lms", "Screenshots/receipt",
@@ -60,6 +98,7 @@ ALLOWED_CATEGORIES = {
 
 _CACHE = {}
 _TRUSTED = set()
+_TRUSTED_ROOTS: dict[str, Path] = {}
 
 # Keep only the cheap image encoders warm. OCR/reasoners/VLMs are transient and
 # must never overlap each other or the warm encoder set on a memory-constrained Mac.
@@ -88,6 +127,27 @@ OFFLOAD_ROOT = Path(os.environ.get(
 ))
 
 
+def unsupported_reason(model_id: str) -> str | None:
+    if model_id == "paddleocr-vl-1.6" and sys.platform == "darwin":
+        return "PaddleOCR-VL is not supported on macOS CPU/Apple silicon; use the native Vision OCR path."
+    return None
+
+
+def runtime_check(model_id: str) -> tuple[bool, str]:
+    reason = unsupported_reason(model_id)
+    if reason:
+        return False, reason
+    modules = RUNTIME_MODULES.get(model_id)
+    if modules is None:
+        return False, f"unknown specialist model {model_id!r}"
+    for module in modules:
+        try:
+            importlib.import_module(module)
+        except Exception as exc:
+            return False, f"missing or unusable Python module {module}: {exc}"
+    return True, "required specialist runtime modules are available"
+
+
 def _clear_accelerator_cache() -> None:
     gc.collect()
     try:
@@ -105,7 +165,21 @@ def _drop_cached_models(keep: set[str] | None = None) -> None:
     for model_id in list(_CACHE):
         if model_id not in keep:
             _CACHE.pop(model_id, None)
+            _TRUSTED.discard(model_id)
+            _TRUSTED_ROOTS.pop(model_id, None)
+            _remove_offload(model_id)
     _clear_accelerator_cache()
+
+
+def _remove_offload(model_id: str) -> None:
+    target = OFFLOAD_ROOT / model_id
+    try:
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+    except FileNotFoundError:
+        pass
 
 
 def _prepare_for_model(model_id: str) -> None:
@@ -164,18 +238,43 @@ def _sha256(path: Path) -> str:
 def _model_dir(model_id: str) -> Path:
     if model_id not in MODEL_SPECS:
         raise ValueError(f"unknown specialist model {model_id!r}")
+    trusted = _TRUSTED_ROOTS.get(model_id)
+    if trusted is not None and trusted.is_dir() and not trusted.is_symlink():
+        return trusted
+    for root in MODELS_ROOTS:
+        candidate = root / model_id
+        if candidate.is_dir() and not candidate.is_symlink():
+            return candidate
     return MODELS_ROOT / model_id
 
 
-def _verify_snapshot(model_id: str, verify_hashes: bool = True) -> bool:
-    if model_id in _TRUSTED:
-        return True
-    hf_id, revision_prefix = MODEL_SPECS.get(model_id, (None, None))
-    if not hf_id:
+def _safe_relative_path(relative: str) -> bool:
+    if not relative or relative.startswith("/") or "\\" in relative:
         return False
-    root = _model_dir(model_id)
+    parts = relative.split("/")
+    return all(part not in {"", ".", ".."} for part in parts)
+
+
+def _actual_snapshot_paths(root: Path) -> set[str]:
+    actual: set[str] = set()
+    if not root.is_dir() or root.is_symlink():
+        return actual
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"symlink is not allowed in trusted model snapshot: {path}")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative == "provenance.json" or ".cache" in path.relative_to(root).parts:
+            continue
+        actual.add(relative)
+    return actual
+
+
+def _verify_snapshot_at(model_id: str, root: Path, verify_hashes: bool) -> bool:
+    hf_id, revision_prefix = MODEL_SPECS[model_id]
     try:
-        record = json.loads((root / "provenance.json").read_text())
+        record = json.loads((root / "provenance.json").read_text(encoding="utf-8"))
     except Exception:
         return False
     revision = record.get("revision")
@@ -193,7 +292,12 @@ def _verify_snapshot(model_id: str, verify_hashes: bool = True) -> bool:
         return False
     resolved_root = root.resolve()
     for relative, wanted in expected.items():
-        if not isinstance(relative, str) or not isinstance(wanted, str) or len(wanted) != 64:
+        if (
+            not isinstance(relative, str)
+            or not isinstance(wanted, str)
+            or not _safe_relative_path(relative)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", wanted) is None
+        ):
             return False
         path = root / relative
         try:
@@ -204,8 +308,31 @@ def _verify_snapshot(model_id: str, verify_hashes: bool = True) -> bool:
             return False
         if verify_hashes and _sha256(path) != wanted.lower():
             return False
-    _TRUSTED.add(model_id)
+    try:
+        if _actual_snapshot_paths(root) != set(expected):
+            return False
+    except (OSError, ValueError):
+        return False
     return True
+
+
+def _verify_snapshot(model_id: str, verify_hashes: bool = True) -> bool:
+    if unsupported_reason(model_id):
+        return False
+    if model_id not in MODEL_SPECS:
+        return False
+    if verify_hashes and model_id in _TRUSTED:
+        return True
+    for root in MODELS_ROOTS:
+        candidate = root / model_id
+        if not candidate.is_dir() or candidate.is_symlink():
+            continue
+        if _verify_snapshot_at(model_id, candidate, verify_hashes):
+            if verify_hashes:
+                _TRUSTED.add(model_id)
+                _TRUSTED_ROOTS[model_id] = candidate
+            return True
+    return False
 
 
 def _decode_image(value: str):
@@ -213,9 +340,21 @@ def _decode_image(value: str):
     if not raw or len(raw) > MAX_IMAGE_BYTES:
         raise ValueError("image payload is empty or exceeds the 64 MiB specialist ceiling")
     from PIL import Image
-    image = Image.open(io.BytesIO(raw)).convert("RGB")
-    image.load()
-    return raw, image
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            image = Image.open(io.BytesIO(raw))
+            width, height = image.size
+            if width <= 0 or height <= 0 or width > MAX_IMAGE_EDGE or height > MAX_IMAGE_EDGE:
+                raise ValueError("image dimensions exceed the specialist ceiling")
+            if width * height > MAX_IMAGE_PIXELS:
+                raise ValueError("image pixel count exceeds the specialist ceiling")
+            image.load()
+            image = image.convert("RGB")
+            image.load()
+            return raw, image
+    except Exception as exc:
+        raise ValueError("invalid or oversized image payload") from exc
 
 
 def _normalize_tensor(vector) -> list[float]:
@@ -259,7 +398,9 @@ def _siglip_image(image) -> dict:
             vector = model.get_image_features(**inputs)
         else:
             output = model(**inputs)
-            vector = getattr(output, "image_embeds", None) or getattr(output, "pooler_output", None)
+            vector = getattr(output, "image_embeds", None)
+            if vector is None:
+                vector = getattr(output, "pooler_output", None)
             if vector is None:
                 raise RuntimeError("SigLIP2 runtime exposed no image embedding")
     values = _normalize_tensor(vector)
@@ -275,7 +416,9 @@ def _siglip_text(text: str) -> dict:
             vector = model.get_text_features(**inputs)
         else:
             output = model(**inputs)
-            vector = getattr(output, "text_embeds", None) or getattr(output, "pooler_output", None)
+            vector = getattr(output, "text_embeds", None)
+            if vector is None:
+                vector = getattr(output, "pooler_output", None)
             if vector is None:
                 raise RuntimeError("SigLIP2 runtime exposed no text embedding")
     values = _normalize_tensor(vector)
@@ -316,13 +459,21 @@ def _dino_image(image) -> dict:
 
 def _paddle_ocr(raw: bytes, suffix: str = ".png") -> dict:
     key = "paddleocr-vl-1.6"
+    if reason := unsupported_reason(key):
+        raise RuntimeError(reason)
     if not _verify_snapshot(key):
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
     _prepare_for_model(key)
     from paddleocr import PaddleOCRVL
     pipeline = _CACHE.get(key)
     if pipeline is None:
-        pipeline = PaddleOCRVL(vl_rec_model_dir=str(_model_dir(key)))
+        pipeline = PaddleOCRVL(
+            pipeline_version="v1.6",
+            vl_rec_model_dir=str(_model_dir(key)),
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_layout_detection=False,
+        )
         _CACHE[key] = pipeline
     suffix = suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix or "") else ".bin"
     with tempfile.TemporaryDirectory(prefix="private-librarian-ocr-") as directory:
@@ -476,6 +627,9 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
 def _release(model_id: str | None) -> dict:
     if model_id:
         _CACHE.pop(model_id, None)
+        _TRUSTED.discard(model_id)
+        _TRUSTED_ROOTS.pop(model_id, None)
+        _remove_offload(model_id)
         _clear_accelerator_cache()
     else:
         _drop_cached_models()
@@ -523,6 +677,7 @@ def main() -> int:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--syntax-check", action="store_true")
+    parser.add_argument("--runtime-check", choices=sorted(MODEL_SPECS))
     args = parser.parse_args()
     if args.syntax_check:
         _memory_policy_self_test()
@@ -533,6 +688,11 @@ def main() -> int:
             "memory_policy": "warm-encoders-only; transient-exclusive; disk-offload-available",
         }))
         return 0
+    if args.runtime_check:
+        ready, reason = runtime_check(args.runtime_check)
+        print(json.dumps({"offline": True, "model": args.runtime_check,
+                          "available": ready, "reason": reason}))
+        return 0 if ready else 1
     if args.check:
         print(json.dumps({"offline": True, "available": {mid: _verify_snapshot(mid, verify_hashes=False) for mid in MODEL_SPECS}}))
         return 0
