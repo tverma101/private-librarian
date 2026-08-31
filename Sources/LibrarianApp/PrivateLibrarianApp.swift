@@ -5,13 +5,14 @@ import LibrarianCore
 /// Native SwiftUI shell (plan §1, §45, §46). No web server, no WebView,
 /// no listening socket. Sources are added via the system folder picker with
 /// read-only security-scoped bookmarks; the catalog is SQLCipher-encrypted
-/// with its key in the app-owned data-protection Keychain.
+/// with its key in the app-owned Keychain.
 @main
 struct PrivateLibrarianApp: App {
+    @NSApplicationDelegateAdaptor(PrivateLibrarianAppDelegate.self) private var appDelegate
     @StateObject private var model = LibrarianModel()
 
     var body: some Scene {
-        WindowGroup("Private Librarian") {
+        WindowGroup("Private Librarian", id: "main") {
             MagicContentView()
                 .environmentObject(model)
                 .frame(minWidth: 900, minHeight: 560)
@@ -27,6 +28,27 @@ struct PrivateLibrarianApp: App {
                     .keyboardShortcut("o")
             }
         }
+        Settings {
+            LibrarianSettingsView()
+                .environmentObject(model)
+        }
+    }
+}
+
+/// Keep the app a normal, activatable Dock application. SwiftUI's state
+/// restoration can restore the scene controller before a window is visible;
+/// explicitly activating the regular app lets the primary WindowGroup present
+/// instead of leaving a live process with no user-facing window.
+final class PrivateLibrarianAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DispatchQueue.main.async {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        true
     }
 }
 
@@ -48,7 +70,9 @@ final class LibrarianModel: ObservableObject {
         let coreML: Bool
         let legacyClip: Bool
         let legacyMiniLM: Bool
+        let legacyRuntime: Bool
         let specialistIDs: Set<String>
+        let specialistRuntimeIDs: Set<String>
     }
 
     @Published var sources: [SourceFolder] = []
@@ -72,6 +96,8 @@ final class LibrarianModel: ObservableObject {
     @Published private(set) var sourcesNeedingReauthorization: Set<String> = []
     @Published private(set) var catalogMigrationRequired = false
     @Published private(set) var catalogMigrationAttempted = false
+    @Published private(set) var catalogReady = false
+    @Published private(set) var catalogError: String?
     @Published private(set) var isTier2Provisioned = false
     @Published private(set) var tier2Status = "Checking local model readiness…"
     @Published private(set) var isSearching = false
@@ -101,6 +127,7 @@ final class LibrarianModel: ObservableObject {
 
     var isLocalTranscriptionAvailable: Bool { AppLocalTranscription.isAvailable }
     var localTranscriptionStatus: String { AppLocalTranscription.statusText }
+    var isUsingFreshCatalog: Bool { activeCatalogFilename == Self.freshCatalogFilename }
 
     private var catalog: Catalog?
     private var bookmarkDataByPath: [String: Data] = [:]
@@ -118,6 +145,24 @@ final class LibrarianModel: ObservableObject {
         let dir = base.appendingPathComponent("PrivateLibrarian", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    private static let catalogFilename = "catalog.db"
+    private static let freshCatalogFilename = "catalog-fresh.db"
+    private static let activeCatalogFilenameKey = "catalog-active-filename-v1"
+
+    private var activeCatalogFilename: String {
+        UserDefaults.standard.string(forKey: Self.activeCatalogFilenameKey) == Self.freshCatalogFilename
+            ? Self.freshCatalogFilename
+            : Self.catalogFilename
+    }
+
+    private var catalogURL: URL {
+        Self.appSupportDir.appendingPathComponent(activeCatalogFilename)
+    }
+
+    private var legacyCatalogURL: URL {
+        Self.appSupportDir.appendingPathComponent(Self.catalogFilename)
     }
 
     init() {
@@ -155,27 +200,37 @@ final class LibrarianModel: ObservableObject {
         let generation = modelStatusGeneration
         tier2Status = "Checking local model readiness…"
         let work = Task.detached(priority: .utility) {
-            Tier2Readiness(
+            let legacyClip = LocalModelBridge.isProvisioned(.clipImage)
+            let legacyMiniLM = LocalModelBridge.isProvisioned(.miniLMText)
+            let specialistIDs = SpecialistModelBridge.availableModelIDs()
+            let specialistRuntimeIDs = Set<String>(specialistIDs.compactMap { (id: String) -> String? in
+                guard let descriptor = LocalModelStack.all.first(where: { $0.id == id }) else { return nil }
+                return SpecialistModelBridge.preflight(descriptor).available ? id : nil
+            })
+            return Tier2Readiness(
                 coreML: CoreMLMobileCLIPProvider.isAvailable,
-                legacyClip: LocalModelBridge.isProvisioned(.clipImage),
-                legacyMiniLM: LocalModelBridge.isProvisioned(.miniLMText),
-                specialistIDs: SpecialistModelBridge.availableModelIDs())
+                legacyClip: legacyClip,
+                legacyMiniLM: legacyMiniLM,
+                legacyRuntime: (legacyClip || legacyMiniLM) && LocalModelBridge.isAvailable(),
+                specialistIDs: specialistIDs,
+                specialistRuntimeIDs: specialistRuntimeIDs)
         }
         modelStatusTask = Task { @MainActor [weak self] in
             let readiness = await work.value
             guard let self, self.modelStatusGeneration == generation else { return }
             self.isTier2Provisioned = readiness.coreML
-                || readiness.legacyClip
-                || readiness.legacyMiniLM
-                || !readiness.specialistIDs.isEmpty
-            if readiness.specialistIDs.contains(LocalModelStack.siglip2.id) {
+                || readiness.legacyRuntime
+                || !readiness.specialistRuntimeIDs.isEmpty
+            if readiness.specialistRuntimeIDs.contains(LocalModelStack.siglip2.id) {
                 self.tier2Status = "Tier-2 ready — local SigLIP2 specialist"
             } else if readiness.coreML {
                 self.tier2Status = "Tier-2 ready — Core ML MobileCLIP"
+            } else if readiness.legacyRuntime {
+                self.tier2Status = "Tier-2 ready — offline Python embeddings"
             } else if readiness.legacyClip || readiness.legacyMiniLM {
-                self.tier2Status = "Model files ready; runtime is checked when indexing starts"
+                self.tier2Status = "Checkpoint files found; offline Python runtime is unavailable"
             } else if !readiness.specialistIDs.isEmpty {
-                self.tier2Status = "Specialist files found; install SigLIP2 or legacy CLIP/MiniLM embeddings"
+                self.tier2Status = "Specialist checkpoints found; their offline runtime is unavailable"
             } else {
                 self.tier2Status = "Tier-2 not provisioned — run scripts/setup_models.sh"
             }
@@ -186,26 +241,41 @@ final class LibrarianModel: ObservableObject {
         guard catalog == nil else { return }
         do {
             if let key = try CatalogKeychain.load() {
-                try openCatalog(key: key)
+                try openCatalog(key: key, at: catalogURL)
             } else {
-                let dbPath = Self.appSupportDir.appendingPathComponent("catalog.db").path
-                if FileManager.default.fileExists(atPath: dbPath) {
+                let dbExists = FileManager.default.fileExists(atPath: catalogURL.path)
+                if activeCatalogFilename == Self.freshCatalogFilename {
+                    if dbExists {
+                        catalogError = "the fresh catalog key is unavailable; its encrypted data was left untouched"
+                        log("fresh catalog key is unavailable; encrypted catalog was left untouched")
+                    } else {
+                        try openCatalog(key: CatalogKeychain.createAppOwned(), at: catalogURL)
+                    }
+                } else if dbExists {
                     catalogMigrationRequired = true
+                    catalogReady = false
                     log("existing catalog needs one-time Keychain migration · choose Migrate Existing Catalog")
                 } else {
-                    try openCatalog(key: CatalogKeychain.createAppOwned())
+                    try openCatalog(key: CatalogKeychain.createAppOwned(), at: catalogURL)
                 }
             }
         } catch {
+            catalogReady = false
+            catalogError = error.localizedDescription
             log("catalog error: \(error)")
         }
     }
 
-    private func openCatalog(key: Data) throws {
-        let dbPath = Self.appSupportDir.appendingPathComponent("catalog.db").path
-        catalog = try Catalog(path: dbPath, key: key)
+    private func openCatalog(key: Data, at url: URL) throws {
+        catalog = try Catalog(path: url.path, key: key)
         catalogMigrationRequired = false
-        log("catalog opened (encrypted)")
+        catalogError = nil
+        catalogReady = true
+        if url.lastPathComponent == Self.freshCatalogFilename {
+            log("new catalog opened (encrypted); existing catalog.db remains untouched")
+        } else {
+            log("catalog opened (encrypted)")
+        }
         restartLiveCoordinator()
     }
 
@@ -219,11 +289,49 @@ final class LibrarianModel: ObservableObject {
                 log("legacy catalog key was not found; existing encrypted catalog was left untouched")
                 return
             }
-            try openCatalog(key: key)
+            try openCatalog(key: key, at: legacyCatalogURL)
             refreshDashboard()
         } catch {
             log("catalog migration error: \(error)")
         }
+    }
+
+    /// Open a new encrypted catalog without touching an existing catalog whose
+    /// key lives in the legacy login Keychain. The old database and sidecars
+    /// stay in place so this choice is recoverable and does not require a
+    /// Keychain approval. The existing catalog remains available for a later
+    /// explicit recovery/migration workflow.
+    func startFreshCatalog() {
+        guard catalog == nil,
+              catalogMigrationRequired,
+              !catalogMigrationAttempted,
+              activeCatalogFilename == Self.catalogFilename else { return }
+
+        let freshURL = Self.appSupportDir.appendingPathComponent(Self.freshCatalogFilename)
+        guard !FileManager.default.fileExists(atPath: freshURL.path) else {
+            catalogError = "a fresh catalog already exists, but its app-owned key is unavailable"
+            log("fresh catalog already exists; existing catalog.db was left untouched")
+            return
+        }
+
+        do {
+            let key = try CatalogKeychain.createAppOwned()
+            UserDefaults.standard.set(Self.freshCatalogFilename, forKey: Self.activeCatalogFilenameKey)
+            try openCatalog(key: key, at: freshURL)
+            refreshDashboard()
+        } catch {
+            UserDefaults.standard.removeObject(forKey: Self.activeCatalogFilenameKey)
+            catalogReady = false
+            catalogError = error.localizedDescription
+            log("could not start fresh catalog: \(error); existing catalog.db was left untouched")
+        }
+    }
+
+    func retryCatalogOpen() {
+        guard catalog == nil, !catalogMigrationRequired else { return }
+        catalogError = nil
+        openCatalogIfNeeded()
+        refreshDashboard()
     }
 
     // MARK: - Read-only source access via security-scoped bookmarks
@@ -375,9 +483,9 @@ final class LibrarianModel: ObservableObject {
 
     private var effectiveExcludedPaths: [String] {
         let defaults = OnboardingExclusions.defaultPaths(
-            catalogPath: Self.appSupportDir.appendingPathComponent("catalog.db").path,
+            catalogPath: catalogURL.path,
             modelPaths: LocalModelBridge.modelsRoots().map(\.path))
-        return Array(Set(defaults + excludedPaths)).sorted()
+        return Array(Set(defaults + [legacyCatalogURL.path] + excludedPaths)).sorted()
     }
 
     private func makeIndexer() -> Indexer? {
@@ -791,7 +899,7 @@ final class LibrarianModel: ObservableObject {
     }
 
     private func catalogOnDiskEncrypted() -> Bool {
-        let p = Self.appSupportDir.appendingPathComponent("catalog.db").path
+        let p = catalogURL.path
         return catalog != nil && FileManager.default.fileExists(atPath: p)
             && !Catalog.onDiskHeaderIsPlaintextSQLite(path: p)
     }

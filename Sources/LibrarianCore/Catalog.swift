@@ -2,7 +2,7 @@ import Foundation
 import SQLCipher
 
 /// SQLCipher-backed catalog: the ONLY writable store in the system.
-/// Key lives in the macOS data-protection Keychain (see CatalogKeychain). All content —
+/// Key lives in the app-owned macOS Keychain (see CatalogKeychain). All content —
 /// filenames, OCR, transcripts, embeddings, classifications — is encrypted at
 /// rest. FTS5 provides local full-text search inside the encrypted file.
 public final class Catalog: @unchecked Sendable {
@@ -31,7 +31,7 @@ public final class Catalog: @unchecked Sendable {
     // MARK: - Lifecycle
 
     /// Open (creating if needed) an encrypted catalog at `path`.
-    /// - Parameter key: raw key material from the data-protection Keychain.
+    /// - Parameter key: raw key material from the app-owned Keychain.
     public init(path: String, key: Data) throws {
         queue.setSpecific(key: queueKey, value: ())
         self.path = path

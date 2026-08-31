@@ -95,7 +95,7 @@ public struct LocalModelEmbeddingProvider: EmbeddingProvider {
             available: runtime,
             reason: reason,
             artifacts: [LocalModelBridge.Model.clipImage.rawValue, LocalModelBridge.Model.miniLMText.rawValue],
-            dependencies: ["python3", "torch", "transformers", "PIL", "sentence_transformers"])
+            dependencies: ["python3", "torch", "transformers", "PIL", "numpy", "sentence_transformers"])
     }
 
     public func embedText(_ text: String) -> EmbeddingVector? {

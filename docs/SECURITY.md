@@ -19,10 +19,10 @@ The source subsystem must not gain APIs for writing or truncating files, moving/
 
 ### The catalog is the writable layer
 
-The catalog is SQLCipher-encrypted and its key is stored in the app-owned
-data-protection Keychain item in the app's default sandbox namespace. The
-packager does not invent restricted Keychain-sharing entitlements without a
-matching provisioning profile. Virtual categories, search text, embeddings, transcripts, similarity
+The catalog is SQLCipher-encrypted and its key is stored in an app-owned
+generic-password Keychain item under a dedicated stable service name. The
+profile-free packager does not invent restricted data-protection or
+Keychain-sharing entitlements without a matching provisioning profile. Virtual categories, search text, embeddings, transcripts, similarity
 relationships, review state, corrections, and learned rules belong in the
 catalog. The CLI never opens this item and requires an explicit
 `LIBRARIAN_CATALOG_KEY` for headless checks.
@@ -30,7 +30,7 @@ catalog. The CLI never opens this item and requires an explicit
 An item created by an older unsigned development CLI may require one explicit
 macOS approval. Startup never probes that legacy item: the app renders first
 and exposes **Migrate Existing Catalog**. That action preserves the key, copies
-it once into the app-owned item, and caches a denial for the rest of the
+it once into the new app-owned item, and caches a denial for the rest of the
 process. It never rotates the key or deletes the old catalog to silence the
 prompt.
 

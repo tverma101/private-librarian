@@ -210,11 +210,11 @@ def run_worker(model_dir: Path, samples: int) -> dict:
 
 def record_local(model_dir: Path, samples: int) -> dict:
     clip, mini = model_dir / "clip-vit-base-patch32", model_dir / "all-MiniLM-L6-v2"
-    runtime = deps(["torch", "transformers", "PIL", "sentence_transformers"])
+    runtime = deps(["torch", "transformers", "PIL", "numpy", "sentence_transformers"])
     clip_verified = verified_python_model(clip, "clip-vit-base-patch32")
     mini_verified = verified_python_model(mini, "all-MiniLM-L6-v2")
-    clip_ready = clip_verified and all(runtime[name] for name in ("torch", "transformers", "PIL"))
-    mini_ready = mini_verified and all(runtime[name] for name in ("torch", "sentence_transformers"))
+    clip_ready = clip_verified and all(runtime[name] for name in ("torch", "transformers", "PIL", "numpy"))
+    mini_ready = mini_verified and all(runtime[name] for name in ("torch", "sentence_transformers", "numpy"))
     out = {
         "provider": "python-transformers",
         "model": {"clip": CLIP_ID, "text": "sentence-transformers/all-MiniLM-L6-v2@1110a243"},

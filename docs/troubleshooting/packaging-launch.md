@@ -22,8 +22,9 @@ prove that launch policy would accept the restricted entitlements.
 `scripts/package_app.sh` now signs only the profile-free sandbox/read-only
 entitlements from `Sources/LibrarianApp/Entitlements.plist.in`. It keeps the
 stable Apple Development identity and bundle identifier, and does not invent a
-Keychain-sharing entitlement that the local signing setup cannot authorize.
-The data-protection Keychain uses the app's default sandbox namespace.
+Keychain-sharing or data-protection entitlement that the local signing setup
+cannot authorize. The app-owned catalog key uses a dedicated stable
+traditional Keychain service instead.
 
 The normal package path also stages the app under ignored `.build/` output,
 leaves only `PrivateLibrarian-VERSION.dmg` in `dist/`, and installs one

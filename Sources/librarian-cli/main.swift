@@ -24,7 +24,7 @@ func printUsage() {
     librarian-cli tree    --catalog <path>            Print virtual category tree
     librarian-cli provider-smoke [--samples <n>]      Measure genuine MobileCLIP image/text inference
 
-    The GUI app owns its signed data-protection Keychain item. The CLI never
+    The GUI app owns its stable signed app-specific Keychain item. The CLI never
     opens that item; set LIBRARIAN_CATALOG_KEY to a 64-character hex key for
     headless verification.
     Source folders are opened strictly O_RDONLY|O_NOFOLLOW. Nothing is ever

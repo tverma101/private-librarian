@@ -11,7 +11,7 @@ Private Librarian is a native macOS app that indexes folders you choose, underst
 ## What the app does
 
 - Indexes user-selected folders through a read-only `SourceBroker` boundary.
-- Stores writable knowledge in a SQLCipher-encrypted catalog; the key lives in the app-owned data-protection Keychain.
+- Stores writable knowledge in a SQLCipher-encrypted catalog; the key lives in a stable app-owned Keychain item.
 - Searches extracted document text, OCR, and local transcripts.
 - Skips expensive work for unchanged files.
 - Detects exact duplicates and near-duplicate image families without deleting anything.
@@ -107,7 +107,8 @@ Development signing identity so macOS does not treat every rebuild as a new
 Keychain client. Set `CODESIGN_IDENTITY` explicitly for release signing; an
 ad-hoc signature is used only when no identity is available. The packager does
 not add restricted Keychain-group entitlements without a matching provisioning
-profile; the data-protection Keychain uses the app's default sandbox namespace.
+profile; the app-owned catalog item instead uses a dedicated stable service
+name, isolated from the old CLI item.
 If an older unsigned development build created the catalog item, startup renders first and exposes
 **Migrate Existing Catalog**. Choose that action and then **Always Allow** once
 so the same key can be copied into the app-owned item. `--install` copies the
@@ -162,10 +163,12 @@ python3 scripts/provision_image_models.py --all --verify-only \
 checkpoints wired into the app: pinned CLIP ViT-B/32 and all-MiniLM-L6-v2.
 The default destination is the app-container
 `Library/Application Support/PrivateLibrarian/` so the sandboxed installed app
-can find the runtime and models without depending on its launch directory. Downloads
-are written atomically, retain a SHA-256 provenance manifest, and omit unused
-TensorFlow/Flax/ONNX exports. `--verify-only` is offline and never contacts
-Hugging Face. The app itself never downloads or installs anything.
+can find the runtime and models without depending on its launch directory.
+Downloads are written atomically, retain a SHA-256 provenance manifest, and
+omit unused TensorFlow/Flax/ONNX exports. `--verify-only` is offline and never
+contacts Hugging Face. The helper performs CLIP's pinned image preprocessing
+with PIL/NumPy, so `torchvision` is not a hidden runtime requirement. The app
+itself never downloads or installs anything.
 
 For the final local specialist stack, use an explicit profile:
 

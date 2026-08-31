@@ -21,8 +21,8 @@ deterministic rule-based classification behind a strict output-schema wall
 same gate a future LLM classifier would face; prompt injection inside
 document text cannot cross it because there is no tool to call)
         +
-SQLCipher-encrypted catalog on disk (key generated once, held in the
-macOS data-protection Keychain, never written next to the db) with FTS5
+SQLCipher-encrypted catalog on disk (key generated once, held in the stable
+app-owned macOS Keychain item, never written next to the db) with FTS5
 full-text search
         +
 virtual organization only — categories are rows in `virtual_categories`,
@@ -45,7 +45,7 @@ or permission-changed at the source
 | `RuleBasedClassifier` + `ClassifierContract` | Deterministic classifier; screenshot results add virtual `Screenshots/<subtype>` memberships and retain the strict output contract. |
 | `LearnedRuleEngine` | Applies only enabled, evidence-bound correction rules after contract validation; promotion requires three distinct matching additive corrections, remains disabled by default, and negative corrections block promotion. |
 | `Scheduler` | Serializes work into LOW/MEDIUM/HIGH slots so indexing never starves interactive work; also the seam where an LLM stage would be rate-limited later. |
-| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, screenshot assessments, hashes, errors, correction-bound learned rules, similarity clusters, and per-root onboarding coverage. Key from `CatalogKeychain` (app-owned data-protection generic-password item, `AfterFirstUnlockThisDeviceOnly`). |
+| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, screenshot assessments, hashes, errors, correction-bound learned rules, similarity clusters, and per-root onboarding coverage. Key from `CatalogKeychain` (app-owned generic-password item in a dedicated stable service). |
 | `EmbeddingProvider` | Provider-neutral image/text contract. Python and Core ML artifacts are admitted only with pinned provenance manifests; `CoreMLMobileCLIPProvider` loads the genuine MobileCLIP S0 image/text pair lazily, validates 512-D output, and accepts broker bytes only. An explicitly requested unavailable provider stays unavailable instead of silently switching model spaces. |
 | `LocalModelRouter` / `SpecialistModelBridge` | Explicit, cheap-first local specialist registry and bounded JSONL worker. SigLIP2 is the shared image/text space, DINOv3 is a separate visual space, OCR/VLMs receive broker bytes or derived text only, heavy models are transient with bounded offload cleanup, and every snapshot is checked against its pinned manifest before loading. PaddleOCR-VL is excluded on macOS when the upstream runtime is unsupported. |
 | `MobileCLIPTokenizer` | Local CLIP BPE tokenizer for the Core ML text input (`[1,77]` Int32); it reads only the provisioned vocab/merges assets and never receives a source path. |

@@ -133,56 +133,18 @@ struct MagicContentView: View {
                         .disabled(model.sources.isEmpty || model.sources.allSatisfy { model.isPaused($0) || model.needsReauthorization($0) })
                     }
                 }
-
-                Section("Settings") {
-                    if model.catalogMigrationRequired {
-                        Button("Migrate Existing Catalog") { model.migrateCatalog() }
-                            .disabled(model.catalogMigrationAttempted)
-                        Text(model.catalogMigrationAttempted
-                             ? "Migration was attempted; relaunch to retry after approving the Keychain prompt."
-                             : "One-time macOS approval may appear. Choose Always Allow to keep this catalog.")
-                            .font(.caption2)
-                            .foregroundStyle(.orange)
-                    }
-                    Toggle("Local embeddings", isOn: $model.localEmbeddingsEnabled)
-                        .help(model.isTier2Provisioned ? "On-device only — no network; runtime is checked before use" : "Run scripts/setup_models.sh first")
-                        .disabled(!model.isTier2Provisioned)
-                    Picker("Model profile", selection: $model.localModelProfile) {
-                        Text("Fast · embeddings only").tag(LocalModelProfile.fast)
-                        Text("Balanced · specialist fallback").tag(LocalModelProfile.balanced)
-                        Text("Quality · heavy fallback allowed").tag(LocalModelProfile.quality)
-                    }
-                    .pickerStyle(.menu)
-                    .help("Models are local-only and never downloaded automatically. Heavy models run only on ambiguous files.")
-                    Toggle("Local transcription", isOn: $model.localTranscriptionEnabled)
-                        .help("Opt-in whisper.cpp transcription. Nothing is downloaded automatically.")
-                        .disabled(!model.isLocalTranscriptionAvailable)
-                    Text(model.localTranscriptionStatus)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Picker("Search", selection: $model.searchMode) {
-                        Text("Auto").tag("auto")
-                        Text("Exact").tag("exact")
-                        Text("Semantic").tag("semantic")
-                        Text("CLIP text→image").tag("clipText")
-                    }
-                    .pickerStyle(.menu)
-                    .onChange(of: model.searchMode) { _, value in
-                        UserDefaults.standard.set(value, forKey: "tier2-search-mode-v1")
-                    }
-                    Text(model.tier2Status)
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
             }
             .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 250, ideal: 300, max: 360)
         } detail: {
             VStack(spacing: 0) {
                 HStack(spacing: 10) {
                     TextField("Search everything…", text: $model.query)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { model.runSearch() }
+                        .disabled(!model.catalogReady)
                     Button("Search") { model.runSearch() }
-                        .disabled(model.isSearching)
+                        .disabled(model.isSearching || !model.catalogReady)
                     if model.isSearching {
                         ProgressView()
                             .controlSize(.small)
@@ -215,30 +177,52 @@ struct MagicContentView: View {
                         .padding(.horizontal, 20)
                         .padding(.top, 4)
                 }
-                if !model.searchResults.isEmpty {
-                    GroupBox("Search results") {
-                        ForEach(Array(model.searchResults.enumerated()), id: \.offset) { _, result in
-                            Text(result).textSelection(.enabled)
+                if !model.catalogReady {
+                    CatalogBlockedView()
+                        .padding(20)
+                } else {
+                    if !model.searchResults.isEmpty {
+                        GroupBox("Search results") {
+                            ForEach(Array(model.searchResults.enumerated()), id: \.offset) { _, result in
+                                Text(result).textSelection(.enabled)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.top, 8)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 8)
-                }
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        HStack {
-                            Text(model.selectedSection.title).font(.title2.bold())
-                            Spacer()
-                            Text("virtual · offline · read-only")
-                                .font(.caption).foregroundStyle(.secondary)
+
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 18) {
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id("detail-top")
+                                HStack {
+                                    Text(model.selectedSection.title).font(.title2.bold())
+                                    Spacer()
+                                    Text("virtual · offline · read-only")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                sectionBody
+                            }
+                            .padding(20)
                         }
-                        sectionBody
+                        .onAppear { proxy.scrollTo("detail-top", anchor: .top) }
+                        .onChange(of: model.selectedSection) { _, _ in
+                            proxy.scrollTo("detail-top", anchor: .top)
+                        }
                     }
-                    .padding(20)
                 }
                 Divider()
                 MagicPrivacyBar(indicators: model.privacyIndicators()).padding(10)
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                SettingsLink {
+                    Label("Settings", systemImage: "gearshape")
+                }
             }
         }
         .onAppear { model.start() }
@@ -674,6 +658,110 @@ private struct ReviewInboxView: View {
     }
 }
 
+struct LibrarianSettingsView: View {
+    @EnvironmentObject private var model: LibrarianModel
+
+    var body: some View {
+        Form {
+            Section("Catalog") {
+                if model.catalogReady {
+                    Label(model.isUsingFreshCatalog ? "Fresh encrypted catalog open" : "Encrypted catalog open",
+                          systemImage: "checkmark.seal.fill")
+                        .foregroundStyle(.green)
+                    if model.isUsingFreshCatalog {
+                        Text("The previous catalog.db remains untouched. This fresh catalog was created without requesting its legacy Keychain item.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else if model.catalogMigrationRequired {
+                    CatalogMigrationBanner()
+                } else if let error = model.catalogError, !error.isEmpty {
+                    Label("Catalog unavailable", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Button("Retry Catalog") { model.retryCatalogOpen() }
+                } else {
+                    Label("Opening encrypted catalog…", systemImage: "hourglass")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("Local intelligence") {
+                Toggle("Local embeddings", isOn: $model.localEmbeddingsEnabled)
+                    .disabled(!model.isTier2Provisioned)
+                    .help("Enabled only after the offline runtime and a verified checkpoint pass preflight")
+                Picker("Model profile", selection: $model.localModelProfile) {
+                    Text("Fast · embeddings only").tag(LocalModelProfile.fast)
+                    Text("Balanced · specialist fallback").tag(LocalModelProfile.balanced)
+                    Text("Quality · heavy fallback allowed").tag(LocalModelProfile.quality)
+                }
+                Text(model.tier2Status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Toggle("Local transcription", isOn: $model.localTranscriptionEnabled)
+                    .disabled(!model.isLocalTranscriptionAvailable)
+                    .help("Opt-in whisper.cpp transcription; nothing is downloaded automatically")
+                Text(model.localTranscriptionStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            Section("Search") {
+                Picker("Mode", selection: $model.searchMode) {
+                    Text("Auto").tag("auto")
+                    Text("Exact").tag("exact")
+                    Text("Semantic").tag("semantic")
+                    Text("CLIP text → image").tag("clipText")
+                }
+                .onChange(of: model.searchMode) { _, value in
+                    UserDefaults.standard.set(value, forKey: "tier2-search-mode-v1")
+                }
+            }
+
+            Section("Privacy") {
+                Text("Models run offline only after explicit provisioning. Source folders are read-only and the encrypted catalog is kept in the app container.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(minWidth: 560, idealWidth: 620, minHeight: 460)
+        .padding()
+    }
+}
+
+private struct CatalogBlockedView: View {
+    @EnvironmentObject private var model: LibrarianModel
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("Catalog is not open", systemImage: "lock.doc")
+        } description: {
+            if model.catalogMigrationRequired {
+                Text("The existing encrypted catalog is waiting for the one-time migration action above. No library results are being shown until it opens.")
+            } else if let error = model.catalogError, !error.isEmpty {
+                Text("The catalog could not be opened: \(error)")
+            } else {
+                Text("The encrypted catalog is still opening. Try again if this message remains.")
+            }
+        } actions: {
+            if !model.catalogMigrationRequired {
+                Button("Retry Catalog") { model.retryCatalogOpen() }
+            } else if !model.catalogMigrationAttempted {
+                Button("Start New Catalog") { model.startFreshCatalog() }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 private struct CatalogMigrationBanner: View {
     @EnvironmentObject private var model: LibrarianModel
 
@@ -687,16 +775,25 @@ private struct CatalogMigrationBanner: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("One-time catalog migration required")
                         .font(.headline)
-                    Text("Private Librarian found an existing encrypted catalog. Approve the single macOS Keychain request only if you want to keep it; the catalog is not overwritten.")
+                    Text("Private Librarian found an existing encrypted catalog. Migrate it with one macOS Keychain approval, or start a separate fresh catalog without approval. The existing catalog is never overwritten.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Button(model.catalogMigrationAttempted ? "Migration attempted" : "Migrate Existing Catalog") {
-                        model.migrateCatalog()
+                    HStack {
+                        Button(model.catalogMigrationAttempted ? "Migration attempted" : "Migrate Existing Catalog") {
+                            model.migrateCatalog()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.catalogMigrationAttempted)
+                        .accessibilityHint("Reads the legacy catalog key once and does not modify source files")
+                        if !model.catalogMigrationAttempted {
+                            Button("Start New Catalog") {
+                                model.startFreshCatalog()
+                            }
+                            .buttonStyle(.bordered)
+                            .accessibilityHint("Creates a separate encrypted catalog and leaves the existing catalog untouched")
+                        }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.catalogMigrationAttempted)
-                    .accessibilityHint("Reads the legacy catalog key once and does not modify source files")
                     if model.catalogMigrationAttempted {
                         Text("If access was denied, relaunch and try again after choosing Always Allow.")
                             .font(.caption2)

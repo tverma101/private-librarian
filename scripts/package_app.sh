@@ -535,8 +535,9 @@ cp "$ENTITLEMENTS" "$SIGNED_ENTITLEMENTS"
 # entitlements here. Apple requires those values to be backed by a matching
 # provisioning profile; a manually signed sandbox app without that profile is
 # rejected by AMFI at launch even though codesign --verify succeeds. The
-# data-protection Keychain uses the app's default sandbox namespace, and the
-# stable certificate + bundle identifier are sufficient for this single app.
+# app-owned catalog service is intentionally separate from the legacy CLI
+# service. It uses the stable signed application identity without requiring the
+# restricted data-protection Keychain entitlement or a provisioning profile.
 plutil -lint "$SIGNED_ENTITLEMENTS" >/dev/null
 codesign --force --sign "$IDENTITY" --timestamp=none --options runtime \
     --entitlements "$SIGNED_ENTITLEMENTS" "$APP_BUNDLE"

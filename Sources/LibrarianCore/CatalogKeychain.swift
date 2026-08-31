@@ -1,13 +1,27 @@
 import Foundation
 import Security
 
-/// Stores the SQLCipher catalog key in macOS's data-protection Keychain as a
-/// generic password item. The key is generated once (32 random bytes) and
-/// never leaves the Keychain except to hand to the Catalog at open time.
+/// Stores the SQLCipher catalog key in an app-owned macOS Keychain item. The
+/// key is generated once (32 random bytes) and never leaves the Keychain
+/// except to hand to the Catalog at open time.
+///
+/// The distributable is a profile-free, sandboxed SwiftPM app. macOS requires
+/// the signed application-identifier entitlement for the data-protection
+/// Keychain, and manually adding that restricted entitlement makes an
+/// otherwise launchable bundle fail AMFI without a matching provisioning
+/// profile. This app therefore uses its own stable service name in the
+/// traditional Keychain, whose access control is tied to the stable signed
+/// application identity and does not require that restricted entitlement.
 public enum CatalogKeychain {
 
-    public static let service = "com.tejas.private-librarian.catalog"
+    /// New app-owned namespace. Keep this distinct from the service used by
+    /// older unsigned CLI builds so a fresh launch never probes that item.
+    public static let service = "com.tejas.private-librarian.catalog.app-v2"
     public static let account = "catalog-v1"
+
+    /// Legacy service used by the pre-packaging CLI. It is accessed only by
+    /// the explicit migration action in the GUI.
+    private static let legacyService = "com.tejas.private-librarian.catalog"
 
     /// Keep one result per process. Besides avoiding needless Security-server
     /// traffic, this is important for SwiftUI/AppKit lifecycle churn: a
@@ -32,7 +46,7 @@ public enum CatalogKeychain {
             case .osStatus(let s):
                 switch s {
                 case errSecUserCanceled, errSecAuthFailed, errSecInteractionNotAllowed:
-                    return "catalog Keychain access was denied; choose Migrate Existing Catalog and then Always Allow once"
+                    return "catalog Keychain access was denied; relaunch the app before retrying"
                 case errSecMissingEntitlement:
                     return "catalog Keychain access is missing the app's signed entitlement"
                 default:
@@ -50,7 +64,7 @@ public enum CatalogKeychain {
 
     /// Load the app-owned key or create + store a fresh one. If an older
     /// development CLI created the item in macOS's legacy login keychain,
-    /// migrate the same key once into the data-protection keychain instead of
+    /// migrate the same key once into the app-owned namespace instead of
     /// rotating the key and making the encrypted catalog unreadable.
     public static func loadOrCreate() throws -> Data {
         lookupCache.lock.lock()
@@ -80,7 +94,7 @@ public enum CatalogKeychain {
         }
     }
 
-    /// Create a key in the app-owned data-protection Keychain without ever
+    /// Create a key in the app-owned Keychain without ever
     /// consulting the legacy login-keychain item. The GUI uses this path for
     /// a genuinely new catalog so first launch is never blocked by a legacy
     /// access prompt.
@@ -109,7 +123,7 @@ public enum CatalogKeychain {
     }
 
     /// Explicitly migrate the old login-keychain item into the app-owned
-    /// data-protection Keychain. This is intentionally separate from normal
+    /// Keychain namespace. This is intentionally separate from normal
     /// startup: reading an item created by an older unsigned build can invoke
     /// a macOS approval prompt, so only a visible user action may request it.
     /// Returns nil when no legacy item exists and never creates a replacement
@@ -132,18 +146,18 @@ public enum CatalogKeychain {
     }
 
     public static func load() throws -> Data? {
-        try load(useDataProtectionKeychain: true)
+        try load(service: service)
     }
 
     private static func loadLegacy() throws -> Data? {
         // This is intentionally the only legacy lookup. A successful read is
-        // immediately copied to the app-owned data-protection keychain; a
+        // immediately copied to the app-owned Keychain namespace; a
         // denial is cached by loadOrCreate() for the rest of this process so
         // SwiftUI lifecycle callbacks cannot show a prompt loop.
-        try load(useDataProtectionKeychain: false)
+        try load(service: legacyService)
     }
 
-    private static func load(useDataProtectionKeychain: Bool) throws -> Data? {
+    private static func load(service: String) throws -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -151,12 +165,8 @@ public enum CatalogKeychain {
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
-        var scopedQuery = query
-        if useDataProtectionKeychain {
-            scopedQuery[kSecUseDataProtectionKeychain as String] = true
-        }
         var out: CFTypeRef?
-        let status = SecItemCopyMatching(scopedQuery as CFDictionary, &out)
+        let status = SecItemCopyMatching(query as CFDictionary, &out)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess else { throw KeyError.osStatus(status) }
         guard let data = out as? Data, data.count == 32 else {
@@ -171,8 +181,6 @@ public enum CatalogKeychain {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: key,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            kSecUseDataProtectionKeychain as String: true,
         ]
         let status = SecItemAdd(query as CFDictionary, nil)
         guard status == errSecSuccess else { throw KeyError.osStatus(status) }
@@ -180,28 +188,21 @@ public enum CatalogKeychain {
 
     /// Destroy the stored key (used by tests with a test-scoped service name).
     public static func destroy(service: String = service) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecUseDataProtectionKeychain as String: true,
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeyError.osStatus(status)
+        let services = service == Self.service ? [Self.service, Self.legacyService] : [service]
+        for currentService in services {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: currentService,
+            ]
+            let status = SecItemDelete(query as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw KeyError.osStatus(status)
+            }
         }
 
         // Keep the historical API's destroy semantics for callers cleaning up
         // a test-scoped service, while normal runtime migration never deletes
         // the legacy item.
-        let legacyQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-        ]
-        let legacyStatus = SecItemDelete(legacyQuery as CFDictionary)
-        guard legacyStatus == errSecSuccess || legacyStatus == errSecItemNotFound else {
-            throw KeyError.osStatus(legacyStatus)
-        }
-
         if service == Self.service {
             lookupCache.lock.lock()
             lookupCache.key = nil

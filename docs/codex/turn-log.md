@@ -1,5 +1,60 @@
 # Codex turn log
 
+## 2026-08-31 — final package and catalog persistence audit
+
+- `scope`: verify the repaired installed app and distributable after the confirmed stale-catalog reset, model-runtime repair, and profile-free Keychain change.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; branch `fix/tier2-incremental-ci`; PR #57 remains merged and this follow-up stays local.
+- `validation`: final `scripts/package_app.sh --xcode --install` completed with DMG SHA-256 `70c0d09e5c9ecb61ce7782ad8571b0dcc6d0df3b7ad5837a7a26e1d7d4baebc7`; `hdiutil verify`, deep code-sign verification, hardened sandbox entitlement audit, and universal `x86_64 arm64` audit passed. `dist/` contains only the versioned DMG and `/Applications` contains one `PrivateLibrarian.app`. The packaged offline helper reports both pinned models ready with Torch, Transformers, PIL, NumPy, and sentence-transformers available; image/text inference had already produced the expected 512/384 dimensions.
+- `persistence`: the exact installed app was quit and relaunched explicitly from `/Applications/PrivateLibrarian.app`; it checked in as a foreground sandboxed process and the second launch logged only Keychain lookup activity, with no `errSecMissingEntitlement`, crash, or prompt-loop evidence. The reset catalog remains encrypted on disk with its WAL/SHM sidecars; the old three files remain recoverable in `/tmp/private-librarian-stale-catalog-reset.n5Prz0`.
+- `evidence_state`: implementation=yes; tested=yes; packaged=yes; installed=yes; model manifests/runtime=yes; live explicit relaunch/persistence=yes; Computer Use AX read=no because the native pipe closed on the bounded fresh attempt; user-confirmed folder/bookmark/indexing=no; public notarization=no.
+- `residual_gap`: this machine has only an Apple Development signing identity, so public Gatekeeper distribution still needs Developer ID signing, notarization, and stapling. The empty catalog is intentional after reset and needs the user to choose an authorized source folder before indexing can produce data.
+- `cleanup`: no default association, LaunchServices global state, Keychain item, model/runtime, source bookmark, repository file, GitHub PR, or Actions workflow was deleted or changed outside scope. No screenshot-based UI inspection was used.
+- `next_action`: leave the explicit installed app open for the user to authorize a source folder and run the first cleanup/index; publish only if the user separately authorizes Git push/PR work.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-31.
+
+## 2026-08-31 — packaged model smoke found and fixed a false-ready CLIP path
+
+- `scope`: verify the final installed model helper with real offline inference after the catalog/keychain/package repair.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; branch `fix/tier2-incremental-ci`; changes remain local until explicitly published.
+- `finding`: `embed.py --check` reported CLIP ready while the actual installed runtime failed in `CLIPImageProcessor` because `torchvision` was not installed or declared. MiniLM inference passed, so the defect was specific to the CLIP image preprocessing path.
+- `implementation`: removed the fragile `CLIPImageProcessor` dependency and implemented the pinned 224px resize, center crop, RGB conversion, and CLIP mean/std normalization with existing PIL/NumPy/Torch dependencies. Readiness and provider benchmark dependency lists now include NumPy, and setup comments describe the contract.
+- `validation`: syntax and diff checks passed; the installed packaged helper reported both models ready, produced a 384-dimensional MiniLM vector and a 512-dimensional CLIP image vector with `HF_HUB_OFFLINE=1`; Swift suite passed 169 tests with 0 failures; the app was rebuilt, installed, and deep-sign/entitlement checks remained passing.
+- `evidence_state`: implementation=yes; tested=yes; model manifests verified=yes; packaged=yes; installed=yes; real packaged inference=yes; Computer Use AX read=no because the native pipe closed on each bounded attempt; user-confirmed folder/bookmark/indexing=no; public notarization=no.
+- `residual_gap`: the current machine still has only an Apple Development identity, so public Gatekeeper distribution needs Developer ID signing, notarization, and stapling. A real folder-picker/bookmark/indexing smoke remains user-confirmed work.
+- `cleanup`: no user data, Keychain item, model, source file, default association, LaunchServices global state, GitHub PR, or Actions workflow was changed. The app remains installed at `/Applications/PrivateLibrarian.app`; `dist/` contains only the versioned DMG.
+- `next_action`: leave the installed app available for the user to add an authorized folder and run the first explicit cleanup/index.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-31.
+
+## 2026-08-31 — catalog reset and profile-free Keychain repair
+
+- `scope`: honor the confirmed reset of the stale catalog, make a fresh launch usable without legacy Keychain migration, and correct the installed bundle's Keychain failure.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; branch `fix/tier2-incremental-ci`; source and documentation changes remain local until explicitly published.
+- `root_cause`: the previous package called the data-protection Keychain while the manually signed profile-free app had no application-identifier entitlement. macOS returned `errSecMissingEntitlement` during fresh-catalog creation. The earlier package's signed entitlements were launch-safe but incomplete for that API.
+- `changed_files`: `Sources/LibrarianCore/CatalogKeychain.swift`, `Sources/LibrarianCore/Catalog.swift`, `Sources/LibrarianApp/PrivateLibrarianApp.swift`, `Sources/librarian-cli/main.swift`, `scripts/package_app.sh`, `README.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/VERIFICATION.md`, `docs/troubleshooting/keychain-prompts.md`, `docs/troubleshooting/packaging-launch.md`, and this turn log.
+- `reset`: after the user's confirmation, the exact old `catalog.db`, `catalog.db-wal`, and `catalog.db-shm` were moved out of Application Support into recoverable `/tmp/private-librarian-stale-catalog-reset.n5Prz0`; model runtime/weights and source bookmarks were preserved. No Keychain item was deleted.
+- `implementation`: the app-owned key now uses a dedicated stable service (`com.tejas.private-librarian.catalog.app-v2`) in the traditional Keychain, while the pre-packaging CLI service remains migration-only. Startup never queries that legacy service. Packaging continues to omit restricted entitlements and keeps one signed app plus one versioned DMG.
+- `validation`: strict Swift 6 build passed; full Swift suite passed 169 tests with 0 failures; local E2E passed all ten checks; installed model runtime `embed.py --check` reported both pinned models ready with offline dependencies; Xcode archive/package/install passed; installed app passed entitlement and deep-sign verification; live launch created a new encrypted catalog and logged successful Keychain lookup/add without `errSecMissingEntitlement` or a prompt loop.
+- `evidence_state`: implementation=yes; tested=yes; packaged=yes; installed=yes; live process/catalog creation=yes; final AX tree read after this relaunch was interrupted by a Computer Use native-pipe failure; user-confirmed reset=yes; public notarization=no.
+- `residual_gap`: the current machine still has only an Apple Development identity, so public Gatekeeper distribution needs Developer ID signing, notarization, and stapling. A real folder-picker/bookmark quit-relaunch smoke remains user-confirmed work.
+- `cleanup`: only the three confirmed stale catalog files left app state and remain recoverable in `/tmp`; models, source permissions, app bundle, repository work, and legacy Keychain item were preserved. No default association, LaunchServices global state, GitHub PR, or Actions workflow was changed.
+- `next_action`: complete one persistence relaunch check against the new app-owned Keychain service, then leave the installed app open for the user to authorize a source folder and run the first cleanup/index.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-31.
+
+## 2026-08-31 — stale catalog reset boundary
+
+- `scope`: investigate the report that the installed app is stale/empty and identify the exact state that is blocking the catalog UI.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; branch `fix/tier2-incremental-ci`; current source edits remain local and uncommitted.
+- `inspected`: the running installed app is `/Applications/PrivateLibrarian.app`; Application Support contains only the legacy `catalog.db` plus its `catalog.db-wal` and `catalog.db-shm` sidecars (about 436 KiB total); no fresh catalog or active-catalog preference is present.
+- `root_cause`: the stale encrypted catalog has no app-owned key, so startup correctly refuses to probe the legacy login Keychain and waits for an explicit migration or fresh-catalog choice. This is a data-protection gate, not an indexing failure.
+- `destructive_boundary`: no deletion was performed. A reset can safely target only those three catalog files after the app quits, then allow a new app-owned catalog; downloaded models, source bookmarks/permissions, repository work, and the installed app are outside that reset unless separately authorized.
+- `evidence_state`: diagnosis=yes; exact target inventory=yes; reset=no pending explicit confirmation; user-confirmed data deletion=no.
+- `next_action`: confirm whether to delete exactly `catalog.db`, `catalog.db-wal`, and `catalog.db-shm` from the sandbox Application Support directory, preserving all other app state.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-31.
+
 ## 2026-08-31 — PR #57 merged and installed-app headless audit
 
 - `scope`: finish the PR #57 integration, recheck the installed macOS artifact without changing default app associations, remove the duplicate LaunchServices registrations, and record the remaining distribution/user-confirmation boundaries.

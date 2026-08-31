@@ -95,8 +95,8 @@ user-specific model weights in Application Support.
 For the final signed bundle, the packager uses the stable certificate and
 bundle identifier but does not invent restricted application-identifier or
 Keychain-group entitlements without a matching provisioning profile. The
-data-protection Keychain therefore remains in the app's default sandbox
-namespace. The GUI first queries that app-owned item. If a legacy
+app-owned catalog key therefore uses a dedicated stable traditional Keychain
+service. The GUI first queries that app-owned item. If a legacy
 login-keychain item from an old unsigned CLI is present, startup renders first
 and exposes **Migrate Existing Catalog**; only that explicit action can require
 one macOS approval. The same key is then copied into the new item and future
@@ -124,6 +124,11 @@ SQLCipher is vendored under `ThirdParty/sqlcipher/` with license and provenance 
 The default app does not require downloaded model artifacts.
 
 Embedding providers fail closed when expected artifacts, tokenizer data, dependencies, or provenance are incomplete rather than silently switching model spaces.
+
+The Python CLIP helper keeps its pinned resize/center-crop/normalization path in
+`scripts/embed.py` using PIL/NumPy; it does not rely on an undeclared
+`torchvision` import. A readiness check is necessary, but the release smoke
+should also exercise one real image and one real text vector.
 
 The supported Python setup is:
 

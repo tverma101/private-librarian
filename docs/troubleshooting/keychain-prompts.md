@@ -25,15 +25,16 @@ runtime now caches one success or failure per process.
 `scripts/package_app.sh` now archives the app through Xcode and automatically
 selects a stable local Developer ID or Apple Development identity, with
 `CODESIGN_IDENTITY` available for an explicit release identity. It does not
-inject restricted Keychain-group entitlements without a matching provisioning
-profile; the data-protection Keychain uses the app's default sandbox
-namespace. It falls back to ad-hoc only when no certificate is installed.
+inject restricted Keychain-group or data-protection entitlements without a
+matching provisioning profile. The app-owned catalog key uses a dedicated
+stable traditional Keychain service, isolated from the legacy CLI service. It
+falls back to ad-hoc only when no certificate is installed.
 
-`CatalogKeychain.loadOrCreate()` first reads the new data-protection Keychain,
+`CatalogKeychain.loadOrCreate()` first reads the new app-owned Keychain service,
 but the GUI startup path does not call the legacy lookup automatically. When
 an existing encrypted catalog has no app-owned key, the window renders with a
 visible **Migrate Existing Catalog** action. That action performs one legacy
-lookup, preserves the same 32-byte key, and writes it to the app-owned item.
+lookup, preserves the same 32-byte key, and writes it to the new app-owned item.
 Choose **Always Allow** on that one prompt. Afterward, normal launches use the
 new item and do not touch the legacy ACL. A denial is cached for the process;
 relaunching is the deliberate retry boundary.
@@ -43,8 +44,13 @@ The CLI no longer accesses the GUI Keychain at all. It requires
 trigger a Keychain prompt.
 
 The existing catalog key is preserved. Do not delete the Keychain item or
-`catalog.db` as a prompt workaround: rotating either one makes the encrypted
-catalog unreadable without a migration path.
+`catalog.db` merely as a prompt workaround: rotating either one makes the
+encrypted catalog unreadable without a migration path. If the catalog is
+known to be disposable, a deliberate reset may move exactly `catalog.db`,
+`catalog.db-wal`, and `catalog.db-shm` out of the app container while the app
+is quit; leave the model/runtime directories and source bookmarks alone. The
+next launch creates a new app-owned item and encrypted catalog without
+consulting the legacy service.
 
 ## Validation
 

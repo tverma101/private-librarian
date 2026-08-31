@@ -31,7 +31,7 @@ MODELS_DIR = Path(os.environ.get(
 )).expanduser()
 
 # Map logical model name -> HF dir + runtime
-# clip-vit-base-patch32: CLIP image + text (PyTorch, PIL processor fallback — no torchvision needed)
+# clip-vit-base-patch32: CLIP image + text (PyTorch, PIL/numpy preprocessing)
 # all-MiniLM-L6-v2: text embedding via sentence_transformers
 MODEL_HANDLERS = {
     "clip-vit-base-patch32": "clip",
@@ -56,7 +56,6 @@ MODEL_PROVENANCE = {
 
 # Lazy singletons — keep model warm within one process invocation (batch mode)
 _clip_model = None
-_clip_proc = None
 _minilm_model = None
 _trusted_models = set()
 
@@ -149,27 +148,25 @@ def _dependency_status():
         "torch": importlib.util.find_spec("torch") is not None,
         "transformers": importlib.util.find_spec("transformers") is not None,
         "PIL": importlib.util.find_spec("PIL") is not None,
+        "numpy": importlib.util.find_spec("numpy") is not None,
         "sentence_transformers": importlib.util.find_spec("sentence_transformers") is not None,
     }
 
 
 def _model_dependencies_ready(model: str, dependencies: dict[str, bool]) -> bool:
     required = {
-        "clip-vit-base-patch32": ("torch", "transformers", "PIL"),
-        "all-MiniLM-L6-v2": ("torch", "sentence_transformers"),
+        "clip-vit-base-patch32": ("torch", "transformers", "PIL", "numpy"),
+        "all-MiniLM-L6-v2": ("torch", "sentence_transformers", "numpy"),
     }.get(model, ())
     return all(dependencies.get(name, False) for name in required)
 
 
 def _load_clip():
-    global _clip_model, _clip_proc
+    global _clip_model
     if _clip_model is not None:
-        return _clip_model, _clip_proc
-    from transformers import CLIPImageProcessor, CLIPModel, CLIPTokenizer
+        return _clip_model
+    from transformers import CLIPModel, CLIPTokenizer
 
-    _clip_proc = CLIPImageProcessor.from_pretrained(
-        str(MODELS_DIR / "clip-vit-base-patch32"), local_files_only=True
-    )
     _clip_model = CLIPModel.from_pretrained(
         str(MODELS_DIR / "clip-vit-base-patch32"), local_files_only=True
     )
@@ -182,7 +179,39 @@ def _load_clip():
     except Exception:
         pass
     _clip_model.eval()
-    return _clip_model, _clip_proc
+    return _clip_model
+
+
+CLIP_IMAGE_SIZE = 224
+CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def _clip_pixel_values(image, torch):
+    """Apply CLIP's resize/center-crop/normalize contract without torchvision.
+
+    Recent Transformers releases make ``CLIPImageProcessor`` import
+    torchvision even for this CPU-only path. Keeping preprocessing here makes
+    the runtime contract match the pinned requirements and avoids installing a
+    second, tightly coupled vision stack just to resize one image.
+    """
+    import numpy as np
+    from PIL import Image
+
+    width, height = image.size
+    scale = CLIP_IMAGE_SIZE / min(width, height)
+    resized_width = max(CLIP_IMAGE_SIZE, round(width * scale))
+    resized_height = max(CLIP_IMAGE_SIZE, round(height * scale))
+    resampling = getattr(Image, "Resampling", Image)
+    resized = image.resize((resized_width, resized_height), resample=resampling.BICUBIC)
+    left = (resized_width - CLIP_IMAGE_SIZE) // 2
+    top = (resized_height - CLIP_IMAGE_SIZE) // 2
+    cropped = resized.crop((left, top, left + CLIP_IMAGE_SIZE, top + CLIP_IMAGE_SIZE))
+    pixels = torch.from_numpy(np.asarray(cropped, dtype=np.float32)).permute(2, 0, 1).contiguous()
+    pixels = pixels / 255.0
+    mean = torch.tensor(CLIP_IMAGE_MEAN, dtype=pixels.dtype).view(3, 1, 1)
+    std = torch.tensor(CLIP_IMAGE_STD, dtype=pixels.dtype).view(3, 1, 1)
+    return ((pixels - mean) / std).unsqueeze(0)
 
 
 def _load_minilm():
@@ -212,7 +241,7 @@ def _embed_image_bytes(data: bytes, model: str = "clip-vit-base-patch32"):
         import torch
         from PIL import Image
 
-        clip_model, clip_proc = _load_clip()
+        clip_model = _load_clip()
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -228,8 +257,7 @@ def _embed_image_bytes(data: bytes, model: str = "clip-vit-base-patch32"):
         except Exception as e:
             return {"error": f"cannot decode image bytes: {e}"}
         with torch.no_grad():
-            inputs = clip_proc(images=img, return_tensors="pt")
-            out = clip_model.get_image_features(pixel_values=inputs["pixel_values"])
+            out = clip_model.get_image_features(pixel_values=_clip_pixel_values(img, torch))
             if hasattr(out, "pooler_output"):
                 vec = out.pooler_output[0]
             elif hasattr(out, "image_embeds"):
@@ -275,7 +303,7 @@ def _embed_clip_text_bytes(data: bytes):
         return {"error": "empty text on stdin"}
     try:
         import torch
-        clip_model, _ = _load_clip()
+        clip_model = _load_clip()
         tok = getattr(clip_model, "_clip_tokenizer", None)
         if tok is None:
             from transformers import CLIPTokenizer
