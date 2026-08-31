@@ -8,7 +8,7 @@ Called by LibrarianCore/LocalModelBridge.swift as a subprocess.
 Usage:
   python3 scripts/embed.py --stdin-image --model clip-vit-base-patch32
   python3 scripts/embed.py --stdin-text --model all-MiniLM-L6-v2
-  python3 scripts/embed.py --check  # exit 0 if runtime available, non-zero otherwise
+  /path/to/model-runtime/bin/python3 scripts/embed.py --check  # offline readiness check
   python3 scripts/embed.py --worker  # JSONL bytes/text worker
 
 Output: JSON to stdout {"dim":512,"vector":[0.1, ...]} or {"error":"..."}.
@@ -17,13 +17,17 @@ Never touches the network — verified by entitlement-audit and network_negative
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
 import os
 ROOT = Path(__file__).resolve().parent.parent
-MODELS_DIR = Path(os.environ.get("LIBRARIAN_MODELS_DIR", str(ROOT / "Models")))
+MODELS_DIR = Path(os.environ.get(
+    "LIBRARIAN_MODELS_DIR",
+    str(Path.home() / "Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models"),
+)).expanduser()
 
 # Map logical model name -> HF dir + runtime
 # clip-vit-base-patch32: CLIP image + text (PyTorch, PIL processor fallback — no torchvision needed)
@@ -33,6 +37,7 @@ MODEL_HANDLERS = {
     "all-MiniLM-L6-v2": "minilm",
 }
 MODEL_DIMS = {"clip-vit-base-patch32": 512, "all-MiniLM-L6-v2": 384}
+PROVENANCE_SCHEMA = 2
 MODEL_PROVENANCE = {
     "clip-vit-base-patch32": {
         "hf_id": "openai/clip-vit-base-patch32",
@@ -69,7 +74,13 @@ def _provenance_valid(model: str, verify_hashes: bool = False) -> bool:
         record = json.loads((destination / "provenance.json").read_text())
     except Exception:
         return False
-    if record.get("model") != model or any(record.get(key) != value for key, value in spec.items()):
+    if not isinstance(record, dict):
+        return False
+    if (
+        record.get("schema") != PROVENANCE_SCHEMA
+        or record.get("model") != model
+        or any(record.get(key) != value for key, value in spec.items())
+    ):
         return False
     expected_files = record.get("expected_files")
     if not isinstance(expected_files, dict) or not expected_files:
@@ -88,7 +99,7 @@ def _provenance_valid(model: str, verify_hashes: bool = False) -> bool:
             path.resolve().relative_to(root)
         except ValueError:
             return False
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             return False
         if verify_hashes and _sha256_file(path) != expected.lower():
             return False
@@ -103,15 +114,21 @@ def _require_model(model: str) -> bool:
     return True
 
 
-def _check_deps():
-    try:
-        import torch  # noqa: F401
-        import transformers  # noqa: F401
-        from PIL import Image  # noqa: F401
-    except ImportError as e:
-        print(json.dumps({"error": f"missing dependency: {e}"}))
-        return False
-    return True
+def _dependency_status():
+    return {
+        "torch": importlib.util.find_spec("torch") is not None,
+        "transformers": importlib.util.find_spec("transformers") is not None,
+        "PIL": importlib.util.find_spec("PIL") is not None,
+        "sentence_transformers": importlib.util.find_spec("sentence_transformers") is not None,
+    }
+
+
+def _model_dependencies_ready(model: str, dependencies: dict[str, bool]) -> bool:
+    required = {
+        "clip-vit-base-patch32": ("torch", "transformers", "PIL"),
+        "all-MiniLM-L6-v2": ("torch", "sentence_transformers"),
+    }.get(model, ())
+    return all(dependencies.get(name, False) for name in required)
 
 
 def _load_clip():
@@ -245,14 +262,20 @@ def main():
     args = ap.parse_args()
 
     if args.check:
-        ok = _check_deps()
+        dependencies = _dependency_status()
         trusted = [m for m in MODEL_HANDLERS if _provenance_valid(m, verify_hashes=True)]
-        if not trusted:
-            print(json.dumps({"error": "no provenance-verified models under Models/"}), file=sys.stderr)
-            sys.exit(2)
-        print(json.dumps({"status": "ready", "models_dir": str(MODELS_DIR), "dimensions": MODEL_DIMS,
-                          "offline": True, "trusted_models": trusted}))
-        sys.exit(0 if ok else 1)
+        ready = [m for m in trusted if _model_dependencies_ready(m, dependencies)]
+        status = "ready" if ready else "unavailable"
+        print(json.dumps({
+            "status": status,
+            "models_dir": str(MODELS_DIR),
+            "dimensions": MODEL_DIMS,
+            "offline": True,
+            "trusted_models": trusted,
+            "ready_models": ready,
+            "dependencies": dependencies,
+        }))
+        sys.exit(0 if ready else 1)
 
     if args.stdin_image:
         model = args.model or "clip-vit-base-patch32"

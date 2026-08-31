@@ -36,6 +36,110 @@ final class ScalableIndexSessionTests: XCTestCase {
         XCTAssertLessThanOrEqual(maximumBatch, 64)
     }
 
+    func testLargeDirectoryRemainsDeterministicWithoutHeapSizedListing() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("large-streaming-directory-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for index in stride(from: 5_000, through: 1, by: -1) {
+            try Data("\(index)".utf8).write(
+                to: root.appendingPathComponent(String(format: "file-%05d.txt", index)))
+        }
+
+        var paths: [String] = []
+        let discovered = try SourceBroker.enumerateBatches(root: root, batchSize: 127) { batch in
+            paths.append(contentsOf: batch.map(\.path))
+            return true
+        }
+
+        XCTAssertEqual(discovered, 5_000)
+        XCTAssertEqual(paths, paths.sorted(), "large-directory traversal must stay deterministic")
+    }
+
+    func testMaxItemsStopsDiscoveryAndDeliversTheFinalBoundedBatch() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("limited-streaming-directory-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for index in 0..<40 {
+            try Data("\(index)".utf8).write(
+                to: root.appendingPathComponent(String(format: "file-%03d.txt", index)))
+        }
+
+        var observed = 0
+        var batches = 0
+        let discovered = try SourceBroker.enumerateBatches(
+            root: root, maxItems: 3, batchSize: 100) { batch in
+                batches += 1
+                observed += batch.count
+                return true
+            }
+
+        XCTAssertEqual(discovered, 3)
+        XCTAssertEqual(observed, 3)
+        XCTAssertEqual(batches, 1)
+    }
+
+    func testCancellationStopsDuringLargeDirectoryCursorConstruction() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cancelled-directory-cursor-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for index in 0..<1_000 {
+            try Data([UInt8(index & 0xff)]).write(
+                to: root.appendingPathComponent(String(format: "file-%04d.txt", index)))
+        }
+
+        var checks = 0
+        var callbackCalls = 0
+        let discovered = try SourceBroker.enumerateBatches(
+            root: root,
+            batchSize: 64,
+            continuePredicate: {
+                checks += 1
+                return checks < 100
+            }
+        ) { _ in
+            callbackCalls += 1
+            return true
+        }
+
+        XCTAssertEqual(discovered, 0)
+        XCTAssertGreaterThanOrEqual(checks, 100)
+        XCTAssertEqual(callbackCalls, 0)
+    }
+
+    func testUnavailableRootProducesExplicitCompletionReason() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("missing-root-\(UUID().uuidString)")
+        var callback: (path: String, reason: String)?
+        let discovered = try SourceBroker.enumerateBatches(
+            root: root,
+            onRootUnavailable: { path, reason in callback = (path, reason) }
+        ) { _ in true }
+
+        XCTAssertEqual(discovered, 0)
+        XCTAssertEqual(callback?.path, root.path)
+        XCTAssertFalse(callback?.reason.isEmpty ?? true)
+
+        let catalog = try TestSupport.makeCatalog()
+        let indexer = Indexer(broker: SourceBroker(), catalog: catalog, scheduler: Scheduler())
+        var options = ScalableIndexSession.Options()
+        options.updateSimilarity = false
+        let result = try ScalableIndexSession(
+            broker: SourceBroker(), catalog: catalog, indexer: indexer, options: options)
+            .indexRoot(root)
+        XCTAssertEqual(result.completion, .rootUnavailable)
+        XCTAssertEqual(result.rootPath, root.path)
+        XCTAssertEqual(result.missingMarked, 0)
+        let summary = try catalog.projectSemanticSummaries().first
+        XCTAssertEqual(summary?.complete, false)
+        XCTAssertTrue(summary?.summary.contains("status partial") == true)
+    }
+
     func testCancellationSkipsMissingSweepAndResumeConverges() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("cancellable-root-\(UUID().uuidString)")
@@ -66,9 +170,11 @@ final class ScalableIndexSessionTests: XCTestCase {
 
         let token = IndexCancellationToken()
         let partial = try session.indexRoot(root, cancellation: token) { progress in
-            if progress.scanned >= 70 { token.cancel() }
+            if progress.scanned >= 70 { token.cancel(reason: .paused) }
         }
         XCTAssertTrue(partial.cancelled)
+        XCTAssertTrue(partial.paused)
+        XCTAssertEqual(partial.completion, .paused)
         XCTAssertGreaterThanOrEqual(partial.scanned, 70)
         XCTAssertLessThan(partial.scanned, 239)
 

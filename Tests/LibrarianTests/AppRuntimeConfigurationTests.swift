@@ -82,6 +82,26 @@ final class AppRuntimeConfigurationTests: XCTestCase {
         XCTAssertEqual(counter.ends, 1)
     }
 
+    func testBookmarkLeaseFailsClosedWhenAccessCannotStart() throws {
+        let counter = AccessCounter()
+        let resolved = URL(fileURLWithPath: "/tmp/denied-root", isDirectory: true)
+
+        XCTAssertThrowsError(try SecurityScopedBookmarkLease(
+            bookmarkData: Data([8]),
+            resolver: { _ in .init(url: resolved, isStale: false) },
+            beginAccess: { _ in
+                _ = counter.begin()
+                return false
+            },
+            endAccess: { _ in counter.end() }
+        )) { error in
+            XCTAssertEqual(error as? SecurityScopedBookmarkLease.LeaseError, .accessDenied)
+        }
+
+        XCTAssertEqual(counter.begins, 1)
+        XCTAssertEqual(counter.ends, 0, "a lease must not stop access it never started")
+    }
+
     func testLocalTranscriptionSettingReachesIndexerConfigurationOnlyAfterPreflight() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("app-runtime-asr-\(UUID().uuidString)", isDirectory: true)

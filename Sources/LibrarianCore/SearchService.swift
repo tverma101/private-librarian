@@ -79,15 +79,24 @@ public struct SearchService: Sendable {
         limit: Int, best: inout [String: (score: Float, path: String)]
     ) {
         if let current = best[fileID] {
-            if score > current.score { best[fileID] = (score, path) }
+            if score > current.score || (score == current.score && path < current.path) {
+                best[fileID] = (score, path)
+            }
             return
         }
         if best.count < limit {
             best[fileID] = (score, path)
             return
         }
-        guard let weakest = best.min(by: { $0.value.score < $1.value.score }),
-              score > weakest.value.score else { return }
+        guard let weakest = best.min(by: {
+            if $0.value.score != $1.value.score {
+                return $0.value.score < $1.value.score
+            }
+            // On an equal score, retain the lexically earlier path.
+            return $0.value.path > $1.value.path
+        }),
+              score > weakest.value.score
+                || (score == weakest.value.score && path < weakest.value.path) else { return }
         best.removeValue(forKey: weakest.key)
         best[fileID] = (score, path)
     }
@@ -97,15 +106,23 @@ public struct SearchService: Sendable {
         limit: Int, best: inout [String: (distance: Float, path: String)]
     ) {
         if let current = best[fileID] {
-            if distance < current.distance { best[fileID] = (distance, path) }
+            if distance < current.distance || (distance == current.distance && path < current.path) {
+                best[fileID] = (distance, path)
+            }
             return
         }
         if best.count < limit {
             best[fileID] = (distance, path)
             return
         }
-        guard let worst = best.max(by: { $0.value.distance < $1.value.distance }),
-              distance < worst.value.distance else { return }
+        guard let worst = best.max(by: {
+            if $0.value.distance != $1.value.distance {
+                return $0.value.distance < $1.value.distance
+            }
+            return $0.value.path < $1.value.path
+        }),
+              distance < worst.value.distance
+                || (distance == worst.value.distance && path < worst.value.path) else { return }
         best.removeValue(forKey: worst.key)
         best[fileID] = (distance, path)
     }
@@ -140,7 +157,7 @@ public struct SearchService: Sendable {
             if rows.count < Int(Self.vectorBatchSize) { break }
         }
         return best.map { ($0.key, $0.value.path, $0.value.distance) }
-            .sorted { $0.2 < $1.2 }
+            .sorted { $0.2 != $1.2 ? $0.2 < $1.2 : $0.1 < $1.1 }
     }
 
     // MARK: - Tier-2 local embeddings (CLIP / MiniLM, still offline — no network)
@@ -192,7 +209,7 @@ public struct SearchService: Sendable {
                                 query: q.data, threshold: threshold,
                                 limit: limit, best: &best)
         return best.map { ($0.key, $0.value.path, $0.value.score) }
-            .sorted { $0.2 > $1.2 }
+            .sorted { $0.2 != $1.2 ? $0.2 > $1.2 : $0.1 < $1.1 }
     }
 
     private func scoreImageEmbeddingTable(
@@ -203,7 +220,7 @@ public struct SearchService: Sendable {
                                 query: query, threshold: threshold,
                                 limit: limit, best: &best)
         return best.map { ($0.key, $0.value.path, $0.value.score) }
-            .sorted { $0.2 > $1.2 }
+            .sorted { $0.2 != $1.2 ? $0.2 > $1.2 : $0.1 < $1.1 }
     }
 
     /// Visual similarity via local CLIP embeddings (512-d, cosine) — higher quality than Vision feature-print.

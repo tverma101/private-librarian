@@ -11,7 +11,7 @@ Private Librarian is a native macOS app that indexes folders you choose, underst
 ## What the app does
 
 - Indexes user-selected folders through a read-only `SourceBroker` boundary.
-- Stores writable knowledge in a SQLCipher-encrypted catalog; the key lives in Keychain.
+- Stores writable knowledge in a SQLCipher-encrypted catalog; the key lives in the app-owned data-protection Keychain.
 - Searches extracted document text, OCR, and local transcripts.
 - Skips expensive work for unchanged files.
 - Detects exact duplicates and near-duplicate image families without deleting anything.
@@ -85,10 +85,36 @@ bash script/build_and_run.sh
 For a release-style sandboxed bundle:
 
 ```bash
-swift build -c release
-scripts/package_app.sh .build/release
-python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
+scripts/package_app.sh --xcode --install
+python3 scripts/audit_entitlements.py /Applications/PrivateLibrarian.app --expect-hardened
 ```
+
+This repository is a Swift package rather than an `.xcodeproj`. The packager
+uses the `LibrarianApp` SwiftPM scheme through `xcodebuild archive`, stages the
+archive product into the canonical app bundle, and signs the final bundle.
+Use `--swiftpm` with an existing release build only when a raw SwiftPM build is
+needed for a development check.
+
+Packaging emits one versioned `dist/PrivateLibrarian-0.1.0.dmg`. The app is
+staged under ignored `.build/` output and removed after the DMG is verified, so
+the installed `/Applications/PrivateLibrarian.app` is the only persistent app
+copy. Add `--install` to install that validated bundle; add `--open` only when
+you want to launch it. `--no-dmg` without `--install` intentionally leaves a
+temporary `.build/package-stage/PrivateLibrarian.app` for development checks.
+
+The packager automatically prefers an installed stable Developer ID or Apple
+Development signing identity so macOS does not treat every rebuild as a new
+Keychain client. Set `CODESIGN_IDENTITY` explicitly for release signing; an
+ad-hoc signature is used only when no identity is available. The packager does
+not add restricted Keychain-group entitlements without a matching provisioning
+profile; the data-protection Keychain uses the app's default sandbox namespace.
+If an older unsigned development build created the catalog item, startup renders first and exposes
+**Migrate Existing Catalog**. Choose that action and then **Always Allow** once
+so the same key can be copied into the app-owned item. `--install` copies the
+validated result to `/Applications/PrivateLibrarian.app`.
+
+The GUI is the only process that opens the app-owned Keychain item. The CLI
+never prompts for it; pass `LIBRARIAN_CATALOG_KEY` for headless catalog checks.
 
 The CLI is a development/verification tool and is intentionally not shipped inside the packaged app.
 
@@ -100,10 +126,9 @@ The integration branch is checked with:
 swift build
 swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 swift test
-swift build -c release
-bash scripts/e2e_local.sh .build/release/librarian-cli
-scripts/package_app.sh .build/release
-python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
+bash scripts/e2e_local.sh "$(swift build --show-bin-path)/librarian-cli"
+scripts/package_app.sh --xcode --install
+python3 scripts/audit_entitlements.py /Applications/PrivateLibrarian.app --expect-hardened
 ```
 
 CI also covers immutability, symlink escape, malformed inputs, prompt-injection data, incremental zero-work behavior, OCR, screenshots, similarity, media/transcripts, learning, live indexing, Smart Group anti-spam behavior, public-repository hygiene, and Golden Library quality checks.
@@ -126,9 +151,21 @@ scripts/compile_mobileclip_coreml.sh
 For the optional Python-backed image/text baselines:
 
 ```bash
-python3 scripts/provision_image_models.py --all
-python3 scripts/provision_image_models.py --all --verify-only
+./scripts/setup_models.sh
+python3 scripts/provision_image_models.py --all --verify-only \
+  --models-dir "$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models"
+"$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/model-runtime/bin/python3" \
+  scripts/embed.py --check
 ```
+
+`setup_models.sh` creates an isolated Python runtime and installs only the
+checkpoints wired into the app: pinned CLIP ViT-B/32 and all-MiniLM-L6-v2.
+The default destination is the app-container
+`Library/Application Support/PrivateLibrarian/` so the sandboxed installed app
+can find the runtime and models without depending on its launch directory. Downloads
+are written atomically, retain a SHA-256 provenance manifest, and omit unused
+TensorFlow/Flax/ONNX exports. `--verify-only` is offline and never contacts
+Hugging Face. The app itself never downloads or installs anything.
 
 Local transcription is opt-in in the app. It only becomes available when the configured local Whisper executable and model pass preflight. Nothing is downloaded automatically.
 

@@ -74,15 +74,21 @@ struct MagicContentView: View {
                                     Button { model.togglePaused(source) } label: {
                                         Image(systemName: model.isPaused(source) ? "play" : "pause")
                                     }.buttonStyle(.borderless)
+                                        .frame(width: 28, height: 28)
+                                        .contentShape(Rectangle())
                                         .accessibilityLabel(model.isPaused(source) ? "Resume source" : "Pause source")
                                     Button { model.reauthorizeSource(source) } label: {
                                         Image(systemName: "arrow.triangle.2.circlepath")
                                     }.buttonStyle(.borderless)
+                                        .frame(width: 28, height: 28)
+                                        .contentShape(Rectangle())
                                         .help("Re-authorize folder")
                                         .accessibilityLabel("Re-authorize folder")
                                     Button { model.removeSource(source) } label: {
                                         Image(systemName: "trash")
                                     }.buttonStyle(.borderless)
+                                        .frame(width: 28, height: 28)
+                                        .contentShape(Rectangle())
                                         .help("Remove root from the catalog view")
                                         .accessibilityLabel("Remove source from catalog")
                                 }
@@ -106,6 +112,8 @@ struct MagicContentView: View {
                             Button { model.removeExclusion(path) } label: {
                                 Image(systemName: "xmark.circle").foregroundStyle(.secondary)
                             }.buttonStyle(.borderless)
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
                                 .accessibilityLabel("Remove exclusion")
                         }
                     }
@@ -127,8 +135,17 @@ struct MagicContentView: View {
                 }
 
                 Section("Settings") {
+                    if model.catalogMigrationRequired {
+                        Button("Migrate Existing Catalog") { model.migrateCatalog() }
+                            .disabled(model.catalogMigrationAttempted)
+                        Text(model.catalogMigrationAttempted
+                             ? "Migration was attempted; relaunch to retry after approving the Keychain prompt."
+                             : "One-time macOS approval may appear. Choose Always Allow to keep this catalog.")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
                     Toggle("Local embeddings", isOn: $model.localEmbeddingsEnabled)
-                        .help(model.isTier2Provisioned ? "On-device only — no network" : "Provision Models/ first")
+                        .help(model.isTier2Provisioned ? "On-device only — no network; runtime is checked before use" : "Run scripts/setup_models.sh first")
                         .disabled(!model.isTier2Provisioned)
                     Toggle("Local transcription", isOn: $model.localTranscriptionEnabled)
                         .help("Opt-in whisper.cpp transcription. Nothing is downloaded automatically.")
@@ -146,7 +163,7 @@ struct MagicContentView: View {
                     .onChange(of: model.searchMode) { _, value in
                         UserDefaults.standard.set(value, forKey: "tier2-search-mode-v1")
                     }
-                    Text(model.isTier2Provisioned ? "Tier-2 ready" : "Tier-2 not provisioned")
+                    Text(model.tier2Status)
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
@@ -166,6 +183,22 @@ struct MagicContentView: View {
                 .padding(12)
 
                 Divider()
+                if let latestStatus = model.statusLines.last {
+                    Label(latestStatus,
+                          systemImage: latestStatus.localizedCaseInsensitiveContains("error")
+                            ? "exclamationmark.triangle" : "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(latestStatus.localizedCaseInsensitiveContains("error") ? .orange : .secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .textSelection(.enabled)
+                }
+                if model.catalogMigrationRequired {
+                    CatalogMigrationBanner()
+                        .padding(.horizontal, 20)
+                        .padding(.top, 4)
+                }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         HStack {
@@ -182,7 +215,7 @@ struct MagicContentView: View {
                 MagicPrivacyBar(indicators: model.privacyIndicators()).padding(10)
             }
         }
-        .onAppear { model.refreshDashboard() }
+        .onAppear { model.start() }
     }
 
     @ViewBuilder
@@ -266,6 +299,18 @@ private struct OverviewView: View {
             GroupBox("What the librarian knows") {
                 Text("Multiple labels, review state, similarity relationships, and missing-file history live in the encrypted catalog. The source folders remain untouched.")
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if !model.projectSummaries.isEmpty {
+                GroupBox("Project summaries") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(model.projectSummaries) { project in
+                            Text(project.summary)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             if !model.searchResults.isEmpty {
                 GroupBox("Search results") {
@@ -563,7 +608,7 @@ private struct LearnedRulesView: View {
 
 private struct ReviewInboxView: View {
     @EnvironmentObject private var model: LibrarianModel
-    @State private var category = "Review/Confirmed"
+    @State private var categoryDrafts: [String: String] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -583,21 +628,65 @@ private struct ReviewInboxView: View {
                             Text(item.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                             Text(item.reasonCodes.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
                             HStack {
-                                TextField("Category", text: $category).textFieldStyle(.roundedBorder)
+                                TextField("Category", text: Binding(
+                                    get: { categoryDrafts[item.fileID] ?? "Review/Confirmed" },
+                                    set: { categoryDrafts[item.fileID] = $0 }))
+                                    .textFieldStyle(.roundedBorder)
                                 if let candidate = item.categories.first {
                                     Button("Accept \(candidate)") {
-                                        model.applyReviewCorrection(item: item, category: candidate, action: .addCategory)
+                                        apply(item: item, category: candidate, action: .addCategory)
                                     }
                                 }
-                                Button("Add") { model.applyReviewCorrection(item: item, category: category, action: .addCategory) }
-                                Button("Remove") { model.applyReviewCorrection(item: item, category: category, action: .removeCategory) }
-                                Button("Unknown") { model.applyReviewCorrection(item: item, category: "", action: .markUnknown) }
+                                Button("Add") { apply(item: item, category: categoryDrafts[item.fileID] ?? "Review/Confirmed", action: .addCategory) }
+                                Button("Remove") { apply(item: item, category: categoryDrafts[item.fileID] ?? "Review/Confirmed", action: .removeCategory) }
+                                Button("Unknown") { apply(item: item, category: "", action: .markUnknown) }
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    private func apply(item: ReviewItem, category: String, action: ReviewCorrectionAction) {
+        model.applyReviewCorrection(item: item, category: category, action: action)
+        categoryDrafts.removeValue(forKey: item.fileID)
+    }
+}
+
+private struct CatalogMigrationBanner: View {
+    @EnvironmentObject private var model: LibrarianModel
+
+    var body: some View {
+        GroupBox {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "key.fill")
+                    .foregroundStyle(.orange)
+                    .font(.title3)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("One-time catalog migration required")
+                        .font(.headline)
+                    Text("Private Librarian found an existing encrypted catalog. Approve the single macOS Keychain request only if you want to keep it; the catalog is not overwritten.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(model.catalogMigrationAttempted ? "Migration attempted" : "Migrate Existing Catalog") {
+                        model.migrateCatalog()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.catalogMigrationAttempted)
+                    .accessibilityHint("Reads the legacy catalog key once and does not modify source files")
+                    if model.catalogMigrationAttempted {
+                        Text("If access was denied, relaunch and try again after choosing Always Allow.")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .tint(.orange)
     }
 }
 

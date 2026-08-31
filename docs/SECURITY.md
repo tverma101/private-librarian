@@ -4,7 +4,10 @@
 
 Private Librarian may read files inside folders the user authorizes, but it must never modify those source files. All organization, search data, corrections, relationships, and learned rules live in a separate encrypted catalog.
 
-The packaged app is designed to run without runtime network access. Optional local model provisioning is an explicit setup step rather than something the app silently does in the background.
+The packaged app is designed to run without runtime network access. Optional
+local model provisioning is an explicit setup step: `scripts/setup_models.sh`
+installs a local runtime and pinned weights under Application Support rather
+than allowing the app to silently download packages or model files.
 
 ## Hard boundaries
 
@@ -16,7 +19,20 @@ The source subsystem must not gain APIs for writing or truncating files, moving/
 
 ### The catalog is the writable layer
 
-The catalog is SQLCipher-encrypted and its key is stored in Keychain. Virtual categories, search text, embeddings, transcripts, similarity relationships, review state, corrections, and learned rules belong there.
+The catalog is SQLCipher-encrypted and its key is stored in the app-owned
+data-protection Keychain item in the app's default sandbox namespace. The
+packager does not invent restricted Keychain-sharing entitlements without a
+matching provisioning profile. Virtual categories, search text, embeddings, transcripts, similarity
+relationships, review state, corrections, and learned rules belong in the
+catalog. The CLI never opens this item and requires an explicit
+`LIBRARIAN_CATALOG_KEY` for headless checks.
+
+An item created by an older unsigned development CLI may require one explicit
+macOS approval. Startup never probes that legacy item: the app renders first
+and exposes **Migrate Existing Catalog**. That action preserves the key, copies
+it once into the app-owned item, and caches a denial for the rest of the
+process. It never rotates the key or deletes the old catalog to silence the
+prompt.
 
 Deleting or rebuilding the catalog must not alter originals.
 
@@ -54,7 +70,7 @@ Provisioning scripts may use the network only when the user explicitly runs a do
 
 Tier 1 uses Apple's on-device Vision framework for image labels, feature prints, and OCR and requires no downloaded model.
 
-Tier 2 is optional. The repository includes a Python-backed local CLIP/MiniLM path, a Core ML MobileCLIP S0 provider, explicit provisioning/verification scripts, and provider/preprocessing provenance. An unavailable requested provider reports unavailable rather than silently switching embedding spaces.
+Tier 2 is optional. The repository includes a Python-backed local CLIP/MiniLM path, a Core ML MobileCLIP S0 provider, explicit provisioning/verification scripts, and provider/preprocessing provenance. The Python setup keeps only the two wired checkpoints, verifies every file against a manifest, and places them under Application Support by default. An unavailable requested provider reports unavailable rather than silently switching embedding spaces.
 
 ## Media and transcription
 
@@ -79,9 +95,10 @@ swift build
 swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
 swift test
 swift build -c release
-bash scripts/e2e_local.sh .build/release/librarian-cli
-scripts/package_app.sh .build/release
-python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
+BUILD_DIR="$(swift build -c release --show-bin-path)"
+bash scripts/e2e_local.sh "$BUILD_DIR/librarian-cli"  # the fixture script creates a temporary key
+scripts/package_app.sh --xcode --install
+python3 scripts/audit_entitlements.py /Applications/PrivateLibrarian.app --expect-hardened
 sandbox-exec -f <(printf '(version 1)\n(allow default)\n(deny network*)\n') \
   python3 scripts/network_negative_probe.py
 ```

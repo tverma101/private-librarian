@@ -1,269 +1,425 @@
 #!/usr/bin/env python3
-"""
-Provision cheap, fast image-sorting models for Private Librarian.
+"""Provision the optional Python embedding checkpoints used by the app.
 
-Zero-download baseline (Apple Vision) works with no provisioning.
-Downloaded models add embedding quality when the user opts in.
+Apple Vision is the zero-download baseline. This command only manages the two
+Python checkpoints wired into ``embed.py``:
 
-Models are small, fast, and widely used in 2025-2026:
-  - clip-vit-base-patch32 (150 MB) — OpenAI CLIP base
-  - siglip-base-patch16-224 (180 MB) — Google SigLIP
-  - MobileCLIP-S0 (30 MB) — Apple MobileCLIP (fastest on-device)
-  - dinov2-small (80 MB) — Meta DINOv2 for visual similarity
+* ``clip-vit-base-patch32`` for image and joint text embeddings;
+* ``all-MiniLM-L6-v2`` for semantic text embeddings.
 
-All are cached under Models/ and verified by SHA. CI skips this.
-Usage:
+The native MobileCLIP/Core ML path has a separate provisioner. Keeping the
+registries separate prevents ``--all`` from downloading models that the app
+cannot use.
+
+Downloads are made at immutable Hugging Face revisions, written into a
+temporary sibling directory, verified, and then installed by rename. A
+partial or legacy directory is never treated as a usable model. Existing
+invalid directories are moved aside with a recoverable name instead of being
+deleted.
+
+Examples:
+
   python3 scripts/provision_image_models.py --list
-  python3 scripts/provision_image_models.py --all
   python3 scripts/provision_image_models.py --model clip-vit-base-patch32
+  python3 scripts/provision_image_models.py --all
   python3 scripts/provision_image_models.py --all --verify-only
+  python3 scripts/provision_image_models.py --all --models-dir /path/to/Models
+
+The app itself never downloads. Use ``scripts/setup_models.sh`` to install the
+isolated local runtime and these checkpoints together. Without ``--models-dir``
+the provisioner uses the user's Application Support model root.
 """
+from __future__ import annotations
+
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
 import sys
-from pathlib import Path
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterator
 
-ROOT = Path(__file__).resolve().parent.parent
-MODELS_DIR = ROOT / "Models"
+PROVENANCE_SCHEMA = 2
+WEIGHT_NAMES = ("pytorch_model.bin", "model.safetensors")
 
-# Pinned immutable revisions — fetched via HF API on 2026-08-22. Do not float.
-# Download records the Git-LFS SHA-256 manifest for the pinned revision;
-# --verify-only rechecks those bytes without contacting the network.
-MODELS = {
+
+# Only models consumed by scripts/embed.py belong in this registry. The
+# explicit allowlists avoid downloading duplicate TensorFlow/Flax/ONNX exports
+# that were present in an older cache and inflated the local tree to gigabytes.
+MODELS: dict[str, dict[str, Any]] = {
     "clip-vit-base-patch32": {
         "hf_id": "openai/clip-vit-base-patch32",
         "revision": "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268",
-        "size": "~350 MB",
+        "size": "~610 MB",
         "license": "MIT",
-        "note": "OpenAI CLIP ViT-B/32 — baseline image+text embedding",
-    },
-    "siglip-base-patch16-224": {
-        "hf_id": "google/siglip-base-patch16-224",
-        "revision": "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
-        "size": "~350 MB",
-        "license": "Apache-2.0",
-        "note": "Google SigLIP — better than CLIP on small models",
-    },
-    "mobileclip-s0": {
-        "hf_id": "apple/MobileCLIP-S0",
-        "revision": "71aa3e13dda93115871afbd017336535ba29886c",
-        "size": "~60 MB",
-        "license": "Apple Sample Code License",
-        "note": "Apple MobileCLIP-S0 — fastest on-device CLIP variant",
-    },
-    "dinov2-small": {
-        "hf_id": "facebook/dinov2-small",
-        "revision": "ed25f3a31f01632728cabb09d1542f84ab7b0056",
-        "size": "~80 MB",
-        "license": "Apache-2.0",
-        "note": "Meta DINOv2 small — visual feature embedding, no text",
+        "note": "OpenAI CLIP ViT-B/32 — image and joint text embeddings",
+        "allow_patterns": [
+            "config.json",
+            "preprocessor_config.json",
+            "pytorch_model.bin",
+            "merges.txt",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        ],
+        "required_files": [
+            "config.json",
+            "preprocessor_config.json",
+            "pytorch_model.bin",
+            "merges.txt",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        ],
     },
     "all-MiniLM-L6-v2": {
         "hf_id": "sentence-transformers/all-MiniLM-L6-v2",
         "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-        "size": "~80 MB",
+        "size": "~95 MB",
         "license": "Apache-2.0",
-        "note": "MiniLM — 384-d text embedding for semantic search (wired)",
+        "note": "MiniLM — 384-d semantic text embeddings",
+        "allow_patterns": [
+            "1_Pooling/config.json",
+            "config.json",
+            "config_sentence_transformers.json",
+            "modules.json",
+            "model.safetensors",
+            "sentence_bert_config.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.txt",
+        ],
+        "required_files": [
+            "1_Pooling/config.json",
+            "config.json",
+            "modules.json",
+            "model.safetensors",
+            "sentence_bert_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.txt",
+        ],
     },
 }
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
-def ensure_hf():
+class ProvisioningError(RuntimeError):
+    """An actionable provisioning or verification failure."""
+
+
+def default_models_dir() -> Path:
+    configured = os.environ.get("LIBRARIAN_MODELS_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / "Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def safe_relative_path(relative: str) -> bool:
+    """Return whether a manifest path is a plain, root-relative POSIX path."""
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        return False
+    path = PurePosixPath(relative)
+    return not path.is_absolute() and all(part not in ("", ".", "..") for part in path.parts)
+
+
+def regular_files(root: Path) -> tuple[dict[str, Path], str | None]:
+    """Collect regular, non-symlink files below root, excluding HF caches."""
+    if not root.is_dir() or root.is_symlink():
+        return {}, "model directory is missing or is a symlink"
+    files: dict[str, Path] = {}
+    try:
+        paths = sorted(root.rglob("*"))
+    except OSError as exc:
+        return {}, f"cannot enumerate model directory: {exc}"
+    for path in paths:
+        relative_path = path.relative_to(root)
+        if ".cache" in relative_path.parts:
+            continue
+        relative = relative_path.as_posix()
+        if path.is_symlink():
+            return {}, f"symlink is not allowed in model artifacts: {relative}"
+        if path.is_file():
+            if relative == "provenance.json":
+                continue
+            if not safe_relative_path(relative):
+                return {}, f"unsafe model artifact path: {relative}"
+            files[relative] = path
+    return files, None
+
+
+def identity_matches(record: dict[str, Any], name: str, spec: dict[str, Any]) -> bool:
+    return (
+        record.get("schema") == PROVENANCE_SCHEMA
+        and record.get("model") == name
+        and record.get("hf_id") == spec["hf_id"]
+        and record.get("revision") == spec["revision"]
+    )
+
+
+def verify_directory(destination: Path, name: str, *, check_hashes: bool = True) -> tuple[bool, str]:
+    """Verify one model directory without contacting the network."""
+    spec = MODELS[name]
+    if not destination.is_dir() or destination.is_symlink():
+        return False, "model directory is missing"
+    provenance = destination / "provenance.json"
+    try:
+        record = json.loads(provenance.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"missing or invalid provenance.json: {exc}"
+    if not isinstance(record, dict) or not identity_matches(record, name, spec):
+        return False, "provenance identity or schema does not match the pinned checkpoint"
+
+    expected_files = record.get("expected_files")
+    if not isinstance(expected_files, dict) or not expected_files:
+        return False, "provenance has no file SHA-256 manifest"
+    if record.get("required_files") != spec["required_files"]:
+        return False, "provenance required-file contract does not match this runtime"
+
+    files, error = regular_files(destination)
+    if error:
+        return False, error
+    actual_names = set(files)
+    manifest_names = set(expected_files)
+    if actual_names != manifest_names:
+        missing = sorted(manifest_names - actual_names)
+        extra = sorted(actual_names - manifest_names)
+        detail = []
+        if missing:
+            detail.append("missing=" + ",".join(missing[:4]))
+        if extra:
+            detail.append("unrecorded=" + ",".join(extra[:4]))
+        return False, "manifest does not describe installed files (" + "; ".join(detail) + ")"
+
+    for relative in spec["required_files"]:
+        if relative not in expected_files:
+            return False, f"required file is absent from provenance: {relative}"
+    if not any(relative in expected_files for relative in WEIGHT_NAMES):
+        return False, "provenance does not cover a supported model weight"
+
+    for relative, expected in expected_files.items():
+        if not safe_relative_path(relative):
+            return False, f"unsafe manifest path: {relative!r}"
+        if not isinstance(expected, str) or len(expected) != 64 or any(
+            char not in "0123456789abcdef" for char in expected.lower()
+        ):
+            return False, f"invalid SHA-256 for {relative}"
+        path = files.get(relative)
+        if path is None or not path.is_file() or path.is_symlink():
+            return False, f"manifest file is not a regular file: {relative}"
+        if check_hashes and sha256_file(path) != expected.lower():
+            return False, f"SHA-256 mismatch for {relative}"
+    return True, "ready"
+
+
+def verify_model(models_dir: Path, name: str, *, check_hashes: bool = True) -> tuple[bool, str]:
+    return verify_directory(models_dir / name, name, check_hashes=check_hashes)
+
+
+def ensure_hf() -> Any:
     try:
         import huggingface_hub
-        return huggingface_hub
-    except ImportError:
-        print("huggingface_hub not installed. Run: pip install -U huggingface_hub", file=sys.stderr)
-        sys.exit(1)
+    except ImportError as exc:
+        raise ProvisioningError(
+            "huggingface_hub is not installed. Run scripts/setup_models.sh "
+            "or install the isolated provisioning runtime."
+        ) from exc
+    return huggingface_hub
 
-def expected_lfs_files(hf, spec):
-    """Return immutable Git-LFS content digests for a pinned revision."""
+
+def expected_lfs_files(hf: Any, spec: dict[str, Any]) -> dict[str, str]:
+    """Return Git-LFS SHA-256 digests for allowed files at the pin."""
     try:
         info = hf.HfApi().model_info(spec["hf_id"], revision=spec["revision"])
     except Exception as exc:
-        raise RuntimeError(
+        raise ProvisioningError(
             f"cannot resolve the pinned revision manifest for {spec['hf_id']}: {exc}"
         ) from exc
-    expected = {}
+    expected: dict[str, str] = {}
+    allow = set(spec["allow_patterns"])
     for sibling in getattr(info, "siblings", []) or []:
-        lfs = getattr(sibling, "lfs", None)
-        if isinstance(lfs, dict):
-            oid = lfs.get("oid")
-        else:
-            oid = getattr(lfs, "oid", None) if lfs is not None else None
         name = getattr(sibling, "rfilename", None)
-        if isinstance(name, str) and isinstance(oid, str) and len(oid) == 64:
-            expected[name] = oid
-    if not expected:
-        raise RuntimeError(
-            f"pinned revision {spec['revision'][:12]} for {spec['hf_id']} "
-            "did not expose a Git-LFS SHA-256 manifest"
-        )
+        if not isinstance(name, str) or not any(fnmatch.fnmatch(name, pattern) for pattern in allow):
+            continue
+        lfs = getattr(sibling, "lfs", None)
+        oid = lfs.get("oid") if isinstance(lfs, dict) else getattr(lfs, "oid", None)
+        if isinstance(oid, str) and len(oid) == 64:
+            expected[name] = oid.lower()
     return expected
 
-def download_one(name: str, verify_only: bool = False):
-    spec = MODELS[name]
-    hf = ensure_hf()
-    dest = MODELS_DIR / name
-    print(f"[{name}] {spec['hf_id']} ({spec['size']}) — {spec['note']}")
-    print(f"  license: {spec['license']}, revision: {spec['revision']}")
-    # Optional config digest can provide an additional local policy check.
-    expected = spec.get("expected_sha256")
-    if verify_only:
-        if not dest.exists():
-            print(f"  not present — run without --verify-only to download", file=sys.stderr)
-            return False
-        prov = dest / "provenance.json"
+
+@contextmanager
+def model_lock(root: Path) -> Iterator[None]:
+    """Serialize installs sharing one model root when flock is available."""
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".provision.lock"
+    with lock_path.open("a+") as handle:
         try:
-            rec = json.loads(prov.read_text())
-        except Exception as exc:
-            print(f"  missing or invalid provenance manifest: {exc}", file=sys.stderr)
-            return False
-        if rec.get("model") != name or rec.get("hf_id") != spec["hf_id"] or rec.get("revision") != spec["revision"]:
-            print("  provenance model identity does not match the pinned specification", file=sys.stderr)
-            return False
-        expected_files = rec.get("expected_files", {})
-        if not isinstance(expected_files, dict) or not expected_files:
-            print("  provenance has no trusted file SHA-256 manifest", file=sys.stderr)
-            return False
-        weights = ("pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack")
-        if "config.json" not in expected_files or not any(name in expected_files for name in weights):
-            print("  provenance does not cover config.json and a model weight", file=sys.stderr)
-            return False
-        root = dest.resolve()
-        for relative, expected_file_sha in expected_files.items():
-            file_path = dest / relative
-            if (
-                not isinstance(relative, str)
-                or not isinstance(expected_file_sha, str)
-                or len(expected_file_sha) != 64
-                or any(char not in "0123456789abcdef" for char in expected_file_sha.lower())
-            ):
-                print(f"  invalid manifest entry: {relative}", file=sys.stderr)
-                return False
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        try:
+            yield
+        finally:
             try:
-                file_path.resolve().relative_to(root)
-            except ValueError:
-                print(f"  manifest escapes model root: {relative}", file=sys.stderr)
-                return False
-            if not file_path.is_file():
-                print(f"  missing manifest file: {relative}", file=sys.stderr)
-                return False
-            actual_file_sha = sha256_file(file_path)
-            if actual_file_sha != expected_file_sha.lower():
-                print(
-                    f"  SHA mismatch for {relative}: expected "
-                    f"{expected_file_sha[:12]}…, got {actual_file_sha[:12]}…",
-                    file=sys.stderr,
-                )
-                return False
-        if expected:
-            cfg = dest / "config.json"
-            if cfg.exists() and sha256_file(cfg) != expected:
-                print(f"  config SHA mismatch: expected {expected[:12]}…", file=sys.stderr)
-                return False
-        print(f"  present at {dest}")
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except ImportError:
+                pass
+
+
+def archive_existing(destination: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    archive = destination.with_name(f".{destination.name}.previous-{stamp}-{os.getpid()}")
+    while archive.exists():
+        archive = destination.with_name(
+            f".{destination.name}.previous-{stamp}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+        )
+    destination.rename(archive)
+    return archive
+
+
+def download_one(name: str, models_dir: Path, *, force: bool = False) -> bool:
+    spec = MODELS[name]
+    destination = models_dir / name
+    ready, reason = verify_model(models_dir, name, check_hashes=True)
+    if ready and not force:
+        print(f"[{name}] ready: {destination}")
         return True
-    dest.mkdir(parents=True, exist_ok=True)
+
+    hf = ensure_hf()
+    models_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[{name}] downloading {spec['hf_id']} @ {spec['revision'][:12]} ({spec['size']})")
+    if destination.exists() or destination.is_symlink():
+        print(f"  existing directory is not usable ({reason}); it will be preserved after verification")
+
+    partial = models_dir / f".{name}.partial-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     try:
-        expected_lfs = expected_lfs_files(hf, spec)
-    except RuntimeError as exc:
-        print(f"  {exc}", file=sys.stderr)
+        partial.mkdir(parents=True)
+        remote_lfs = expected_lfs_files(hf, spec)
+        try:
+            hf.snapshot_download(
+                repo_id=spec["hf_id"],
+                revision=spec["revision"],
+                local_dir=str(partial),
+                allow_patterns=spec["allow_patterns"],
+            )
+        except TypeError as exc:
+            raise ProvisioningError(
+                "the installed huggingface_hub does not support pinned local downloads; "
+                "rerun scripts/setup_models.sh"
+            ) from exc
+
+        files, error = regular_files(partial)
+        if error:
+            raise ProvisioningError(error)
+        if not all(relative in files for relative in spec["required_files"]):
+            missing = [relative for relative in spec["required_files"] if relative not in files]
+            raise ProvisioningError("download is missing required files: " + ", ".join(missing))
+        if not any(relative in files for relative in WEIGHT_NAMES):
+            raise ProvisioningError("download has no supported model weight")
+
+        expected_files: dict[str, str] = {}
+        mismatches: list[str] = []
+        for relative, path in files.items():
+            digest = sha256_file(path)
+            expected_files[relative] = digest
+            remote_digest = remote_lfs.get(relative)
+            if remote_digest is not None and remote_digest != digest:
+                mismatches.append(relative)
+        if mismatches:
+            raise ProvisioningError("Git-LFS SHA-256 mismatch: " + ", ".join(sorted(mismatches)))
+
+        record = {
+            "schema": PROVENANCE_SCHEMA,
+            "model": name,
+            "hf_id": spec["hf_id"],
+            "revision": spec["revision"],
+            "license": spec["license"],
+            "required_files": spec["required_files"],
+            "expected_files": dict(sorted(expected_files.items())),
+        }
+        (partial / "provenance.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        ready, reason = verify_directory(partial, name, check_hashes=True)
+        if not ready:
+            raise ProvisioningError("post-download verification failed: " + reason)
+        if destination.exists() or destination.is_symlink():
+            archived = archive_existing(destination)
+            print(f"  preserved previous directory at {archived}")
+        partial.rename(destination)
+        print(f"[{name}] installed: {destination}")
+        return True
+    except (OSError, ProvisioningError) as exc:
+        print(f"[{name}] failed: {exc}", file=sys.stderr)
+        if partial.exists():
+            print(f"  partial download preserved for inspection: {partial}", file=sys.stderr)
         return False
-    hf.snapshot_download(
-        repo_id=spec["hf_id"],
-        revision=spec["revision"],
-        local_dir=str(dest),
-        local_dir_use_symlinks=False,
-    )
-    expected_files = {}
-    mismatches = []
-    for relative, expected_file_sha in expected_lfs.items():
-        file_path = dest / relative
-        if not file_path.is_file() or sha256_file(file_path) != expected_file_sha.lower():
-            mismatches.append(relative)
+
+
+def print_status(models_dir: Path) -> None:
+    print(f"Models directory: {models_dir}")
+    print("Only wired Python checkpoints are listed; MobileCLIP uses its separate Core ML provisioner.")
+    for name, spec in MODELS.items():
+        ready, reason = verify_model(models_dir, name, check_hashes=True)
+        if ready:
+            state = "ready"
+        elif (models_dir / name).exists():
+            state = "incomplete"
         else:
-            expected_files[relative] = expected_file_sha.lower()
+            state = "missing"
+        print(f"  {name:28s} {state:10s} {spec['note']}")
+        if state == "incomplete":
+            print(f"    {reason}")
 
-    # HF's small metadata files (notably config.json) are often not Git-LFS
-    # siblings. Hash every downloaded regular file so the runtime manifest
-    # covers both the model weights and the files that configure them.
-    for file_path in sorted(dest.rglob("*")):
-        if not file_path.is_file() or file_path.name == "provenance.json" or ".cache" in file_path.parts:
-            continue
-        if file_path.is_symlink():
-            mismatches.append(str(file_path.relative_to(dest)))
-            continue
-        relative = str(file_path.relative_to(dest))
-        actual = sha256_file(file_path)
-        pinned = expected_files.get(relative)
-        if pinned is not None and pinned != actual:
-            mismatches.append(relative)
-        expected_files[relative] = actual
 
-    weights = ("pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack")
-    if "config.json" not in expected_files or not any(name in expected_files for name in weights):
-        print("  downloaded snapshot lacks config.json or a root model weight", file=sys.stderr)
-        return False
-
-    prov_data = {
-        "model": name,
-        "hf_id": spec["hf_id"],
-        "revision": spec["revision"],
-        "license": spec["license"],
-        "path": str(dest),
-        "expected_files": expected_files,
-    }
-    cfg = dest / "config.json"
-    if cfg.exists():
-        prov_data["config_sha256"] = sha256_file(cfg)
-    if expected and prov_data.get("config_sha256") and prov_data["config_sha256"] != expected:
-        print(f"  !! downloaded config SHA {prov_data['config_sha256'][:12]}… != expected {expected[:12]}… (network/main moved)", file=sys.stderr)
-    if mismatches:
-        print(f"  !! downloaded files failed pinned SHA-256 verification: {mismatches}", file=sys.stderr)
-        return False
-    (dest / "provenance.json").write_text(json.dumps(prov_data, indent=2))
-    print(f"  downloaded to {dest}")
-    return True
-
-def main():
-    p = argparse.ArgumentParser(description="Provision image-sorting models")
-    p.add_argument("--list", action="store_true", help="List available models")
-    p.add_argument("--all", action="store_true", help="Download all models")
-    p.add_argument("--model", type=str, help="Download one model by name")
-    p.add_argument("--verify-only", action="store_true", help="Only verify presence, don't download")
-    args = p.parse_args()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Provision pinned local embedding checkpoints")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--list", action="store_true", help="Show model status without network access")
+    mode.add_argument("--all", action="store_true", help="Download or verify both wired Python models")
+    mode.add_argument("--model", choices=sorted(MODELS), help="Download or verify one wired model")
+    parser.add_argument("--verify-only", action="store_true", help="Verify local bytes only; never contact Hugging Face")
+    parser.add_argument("--force", action="store_true", help="Redownload a ready model and preserve the old directory")
+    parser.add_argument("--models-dir", type=Path, default=default_models_dir(), help="Model root (default: repo Models/ or LIBRARIAN_MODELS_DIR)")
+    args = parser.parse_args(argv)
+    models_dir = args.models_dir.expanduser().resolve()
 
     if args.list:
-        print("Available models:")
-        for name, spec in MODELS.items():
-            present = " [cached]" if (MODELS_DIR / name).exists() else ""
-            print(f"  {name:30s} {spec['size']:12s} {spec['license']:15s} {spec['note']}{present}")
-        return
+        print_status(models_dir)
+        return 0
 
-    if args.model:
-        if args.model not in MODELS:
-            print(f"Unknown model {args.model!r}. Use --list.", file=sys.stderr)
-            sys.exit(2)
-        ok = download_one(args.model, verify_only=args.verify_only)
-        sys.exit(0 if ok else 1)
+    names = sorted(MODELS) if args.all else [args.model]
+    assert all(name is not None for name in names)
+    ok = True
+    with model_lock(models_dir):
+        for name in names:
+            assert name is not None
+            if args.verify_only:
+                ready, reason = verify_model(models_dir, name, check_hashes=True)
+                print(f"[{name}] {'ready' if ready else 'NOT READY'}: {reason}")
+                ok = ok and ready
+            else:
+                ok = download_one(name, models_dir, force=args.force) and ok
+    return 0 if ok else 1
 
-    if args.all:
-        ok = True
-        for name in MODELS:
-            if not download_one(name, verify_only=args.verify_only):
-                ok = False
-        sys.exit(0 if ok else 1)
-
-    p.print_help()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

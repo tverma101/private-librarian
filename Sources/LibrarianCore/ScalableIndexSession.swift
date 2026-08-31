@@ -4,15 +4,31 @@ import Foundation
 /// Cancellation is checked between discovered files and before missing-file
 /// reconciliation. A currently executing atomic per-file commit is never torn.
 public final class IndexCancellationToken: @unchecked Sendable {
+    public enum CancellationReason: String, Sendable, Equatable {
+        case cancelled
+        case paused
+        case removed
+        case shutdown
+        case replaced
+    }
+
     private let lock = NSLock()
     private var cancelled = false
+    private var cancellationReason: CancellationReason?
 
     public init() {}
 
-    public func cancel() {
+    public func cancel(reason: CancellationReason = .cancelled) {
         lock.lock()
         cancelled = true
+        if cancellationReason == nil { cancellationReason = reason }
         lock.unlock()
+    }
+
+    public var reason: CancellationReason? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationReason
     }
 
     public var isCancelled: Bool {
@@ -46,18 +62,32 @@ public final class ScalableIndexSession: @unchecked Sendable {
         public init() {}
     }
 
+    public enum CompletionReason: String, Sendable, Equatable {
+        case completed
+        case cancelled
+        case paused
+        case limited
+        case rootUnavailable
+    }
+
     public struct Progress: Sendable, Equatable {
+        public let rootPath: String
         public let scanned: Int
         public let processed: Int
         public let lastPath: String
+        public let cancelled: Bool
+        public let paused: Bool
     }
 
     public struct Result: Sendable, Equatable {
+        public let rootPath: String
         public let scanned: Int
         public let processed: Int
         public let missingMarked: Int
         public let cancelled: Bool
+        public let paused: Bool
         public let unreadableDirectories: Int
+        public let completion: CompletionReason
     }
 
     private let broker: SourceBroker
@@ -84,6 +114,21 @@ public final class ScalableIndexSession: @unchecked Sendable {
         var processed = 0
         var missingMarked = 0
         var unreadableDirectories = 0
+        var rootUnavailable = false
+        var unreadablePrefixes = Set<String>()
+
+        func normalizedPrefix(_ path: String) -> String {
+            guard path.count > 1, path.hasSuffix("/") else { return path }
+            return String(path.dropLast())
+        }
+
+        func rememberUnreadablePrefix(_ path: String) {
+            // The set is deliberately capped and disposable. Catalog rows are
+            // the durable backoff state; this only prevents a failed subtree
+            // from being probed once per descendant during this pass.
+            guard unreadablePrefixes.count < 1_024 else { return }
+            unreadablePrefixes.insert(normalizedPrefix(path))
+        }
 
         let activeBackoff: [String]
         if options.respectAccessBackoff {
@@ -92,6 +137,19 @@ public final class ScalableIndexSession: @unchecked Sendable {
             // A user-triggered cleanup or reauthorization is an explicit retry.
             try? catalog.clearAccessBackoff(atOrUnder: root.path)
             activeBackoff = []
+        }
+        let normalizedRoot = root.path.count > 1 && root.path.hasSuffix("/")
+            ? String(root.path.dropLast()) : root.path
+        if activeBackoff.contains(where: {
+            let normalized = $0.count > 1 && $0.hasSuffix("/")
+                ? String($0.dropLast()) : $0
+            return normalized == normalizedRoot
+        }) {
+            // A persisted backoff on the authorized root itself means the
+            // lease is not currently usable, not merely that one subtree is
+            // noisy. Surface that state to the app instead of silently
+            // reporting a successful zero-entry scan.
+            rootUnavailable = true
         }
         let effectiveExcludedPrefixes = Array(Set(options.excludedPaths + activeBackoff)).sorted()
 
@@ -103,6 +161,7 @@ public final class ScalableIndexSession: @unchecked Sendable {
             return LocalModelBridge.PersistentWorker()
         }()
         defer { worker?.close() }
+        let sessionCatalog = catalog
 
         let discovered = try SourceBroker.enumerateBatches(
             root: root,
@@ -111,19 +170,31 @@ public final class ScalableIndexSession: @unchecked Sendable {
             excludedDirectoryNames: options.excludedDirectoryNames,
             maxItems: options.maxFiles,
             batchSize: options.batchSize,
-            onUnreadableDirectory: { [catalog] prefix, reason in
+            continuePredicate: { cancellation?.isCancelled != true },
+            onUnreadableDirectory: { [sessionCatalog] prefix, reason in
                 unreadableDirectories += 1
-                try? catalog.recordAccessBackoff(prefix: prefix, reason: reason)
+                rememberUnreadablePrefix(prefix)
+                try? sessionCatalog.recordAccessBackoff(prefix: prefix, reason: reason)
+            },
+            onRootUnavailable: { [sessionCatalog] prefix, reason in
+                rootUnavailable = true
+                if reason == "permission-denied" {
+                    rememberUnreadablePrefix(prefix)
+                    try? sessionCatalog.recordAccessBackoff(prefix: prefix, reason: reason)
+                }
             }
         ) { [self] batch in
             guard cancellation?.isCancelled != true else { return false }
             var changedIDs = Set<String>()
+            var seenPaths: [String] = []
+            seenPaths.reserveCapacity(batch.count)
 
             for item in batch {
                 guard cancellation?.isCancelled != true else { break }
                 scanned += 1
+                seenPaths.append(item.path)
                 do {
-                    let didProcess = try indexer.indexOne(
+                    let didProcess = try indexer.indexOneForScan(
                         path: item.path, worker: worker, updateSimilarity: false)
                     if didProcess {
                         processed += 1
@@ -136,8 +207,11 @@ public final class ScalableIndexSession: @unchecked Sendable {
                         opaqueRef: FileID.workerError(scanned), stage: "index",
                         message: String(describing: error).prefix(200).description)
                 }
-                onProgress?(Progress(scanned: scanned, processed: processed,
-                                     lastPath: (item.path as NSString).lastPathComponent))
+                let isPaused = cancellation?.reason == .paused
+                onProgress?(Progress(rootPath: root.path, scanned: scanned, processed: processed,
+                                     lastPath: (item.path as NSString).lastPathComponent,
+                                     cancelled: cancellation?.isCancelled == true,
+                                     paused: isPaused))
             }
 
             // Every discovered path is marked on disk, including unchanged
@@ -145,8 +219,8 @@ public final class ScalableIndexSession: @unchecked Sendable {
             // This prevents an incomplete analysis from masquerading as a
             // filesystem deletion during the later missing sweep.
             try catalog.markRootScanSeen(
-                generation: scanGeneration,
-                paths: batch.map(\.path))
+                    generation: scanGeneration,
+                paths: seenPaths)
 
             if options.updateSimilarity, !changedIDs.isEmpty,
                cancellation?.isCancelled != true {
@@ -160,7 +234,7 @@ public final class ScalableIndexSession: @unchecked Sendable {
         // performed only after a complete uncapped traversal.
         let hitExplicitLimit = options.maxFiles.map { discovered >= $0 } ?? false
         let cancelled = cancellation?.isCancelled == true
-        if !cancelled && !hitExplicitLimit {
+        if !cancelled && !rootUnavailable && !hitExplicitLimit {
             var cursor: String? = nil
             missingSweep: while true {
                 if cancellation?.isCancelled == true { break }
@@ -176,6 +250,8 @@ public final class ScalableIndexSession: @unchecked Sendable {
                     cursor = candidate.path
                     if cancellation?.isCancelled == true { break missingSweep }
                     if effectiveExcludedPrefixes.contains(where: {
+                        SourceBroker.isPath(candidate.path, under: $0)
+                    }) || unreadablePrefixes.contains(where: {
                         SourceBroker.isPath(candidate.path, under: $0)
                     }) { continue }
                     if candidate.path.split(separator: "/").contains(where: {
@@ -211,10 +287,30 @@ public final class ScalableIndexSession: @unchecked Sendable {
         if cancellation?.isCancelled != true {
             try? catalog.pruneUnusedVirtualCategories()
         }
-        return Result(scanned: scanned,
+        let finalCancelled = cancellation?.isCancelled == true
+        let completion: CompletionReason
+        if rootUnavailable {
+            completion = .rootUnavailable
+        } else if finalCancelled {
+            completion = cancellation?.reason == .paused ? .paused : .cancelled
+        } else if hitExplicitLimit {
+            completion = .limited
+        } else {
+            completion = .completed
+        }
+        // This is one aggregate SQL refresh, not a Swift-side snapshot of file
+        // text or vector rows. Partial, cancelled, and unavailable passes are
+        // retained with complete == false so project-level answers cannot
+        // overclaim coverage while a root needs resume/reauthorization.
+        _ = try? catalog.refreshProjectSemanticSummary(
+            root: root.path, complete: completion == .completed)
+        return Result(rootPath: root.path,
+                      scanned: scanned,
                       processed: processed,
                       missingMarked: missingMarked,
-                      cancelled: cancellation?.isCancelled == true,
-                      unreadableDirectories: unreadableDirectories)
+                      cancelled: finalCancelled,
+                      paused: cancellation?.reason == .paused,
+                      unreadableDirectories: unreadableDirectories,
+                      completion: completion)
     }
 }

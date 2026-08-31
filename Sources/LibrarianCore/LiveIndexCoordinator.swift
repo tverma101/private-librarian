@@ -201,6 +201,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
     // queue that performs indexing/reconciliation work.
     private let eventQueue = DispatchQueue(label: "librarian.live.events", qos: .utility)
     private let workQueue = DispatchQueue(label: "librarian.live.work", qos: .utility)
+    private let workQueueKey = DispatchSpecificKey<Void>()
     private let lock = NSLock()
 
     private var roots: [URL]
@@ -208,6 +209,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
     private var isRunning = false
     private var debounceWorkItem: DispatchWorkItem?
     private var deferredRescanWorkItem: DispatchWorkItem?
+    private var workCancellation: IndexCancellationToken?
     private var lastEventId: UInt64 = 0
     private var lastFullRescanTime: TimeInterval?
     private var fullReconciliationsValue = 0
@@ -215,6 +217,10 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
     public var testIndexOneHandler: ((String) throws -> Bool)?
     public var testMarkMissingHandler: ((String) throws -> Void)?
     public var testFullRescanHandler: (() throws -> Void)?
+    /// Called when a watched security-scoped root is no longer reachable.
+    /// The app maps this to its source-level reauthorization state; the core
+    /// coordinator never displays or persists the raw path as user content.
+    public var onRootAccessLost: ((String, String) -> Void)?
     public var onStateChange: (() -> Void)?
 
 #if canImport(CoreServices)
@@ -233,6 +239,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         self.queue = LiveCoalescingQueue(
             debounceInterval: options.debounceInterval,
             maxPendingPaths: options.maxPendingPaths)
+        self.workQueue.setSpecific(key: workQueueKey, value: ())
         self.exclusionPrefixes = LiveExclusions.prefixes(catalogPath: catalog.path)
         self.exclusionPrefixes.append(contentsOf: options.excludedPaths)
     }
@@ -243,6 +250,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         lock.lock()
         guard !isRunning else { lock.unlock(); return }
         isRunning = true
+        workCancellation = IndexCancellationToken()
         let snapshot = roots
         lock.unlock()
 
@@ -262,10 +270,23 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         lock.lock()
         guard isRunning else { lock.unlock(); return }
         isRunning = false
+        let cancellation = workCancellation
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
         deferredRescanWorkItem?.cancel()
         deferredRescanWorkItem = nil
+        lock.unlock()
+        cancellation?.cancel(reason: .shutdown)
+
+        // A manual cleanup may start immediately after stop(). Wait for the
+        // serialized live worker to finish its current atomic file and drain
+        // cancelled queued work so the two modes never index the same root at
+        // the same time. Never sync onto the worker from the worker itself.
+        if DispatchQueue.getSpecific(key: workQueueKey) == nil {
+            workQueue.sync {}
+        }
+        lock.lock()
+        if let cancellation, workCancellation === cancellation { workCancellation = nil }
         lock.unlock()
 
 #if canImport(CoreServices)
@@ -351,6 +372,16 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
             if SourceBroker.isPath(normalized, under: rootPath) { return true }
         }
         return false
+    }
+
+    private func isWatchedRoot(_ path: String) -> Bool {
+        let normalized = LiveCoalescingQueue.normalizedPath(path)
+        lock.lock()
+        let snapshot = roots
+        lock.unlock()
+        return snapshot.contains {
+            LiveCoalescingQueue.normalizedPath($0.path) == normalized
+        }
     }
 
     public func ingest(events: [LiveRawEvent]) {
@@ -463,9 +494,11 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
 
         var changedIDs = Set<String>()
         var removedIDs = Set<String>()
+        let cancellation = currentWorkCancellation()
         for path in paths {
+            if cancellation?.isCancelled == true { break }
             do {
-                let delta = try processSinglePath(path)
+                let delta = try processSinglePath(path, cancellation: cancellation)
                 if let changed = delta.changedID { changedIDs.insert(changed) }
                 if let removed = delta.removedID { removedIDs.insert(removed) }
             } catch {
@@ -474,11 +507,18 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
                     message: String(describing: error).prefix(200).description)
             }
         }
-        if !changedIDs.isEmpty || !removedIDs.isEmpty {
+        if !changedIDs.isEmpty || !removedIDs.isEmpty,
+           cancellation?.isCancelled != true {
             try? indexer.rebuildSimilarityGraph(changedFileIDs: changedIDs,
                                                 removedFileIDs: removedIDs)
         }
         onStateChange?()
+    }
+
+    private func currentWorkCancellation() -> IndexCancellationToken? {
+        lock.lock()
+        defer { lock.unlock() }
+        return workCancellation
     }
 
     private func automaticRootSession() -> ScalableIndexSession {
@@ -490,13 +530,26 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
             broker: broker, catalog: catalog, indexer: indexer, options: sessionOptions)
     }
 
-    private func processSinglePath(_ path: String) throws -> (changedID: String?, removedID: String?) {
+    private func processSinglePath(
+        _ path: String,
+        cancellation: IndexCancellationToken? = nil
+    ) throws -> (changedID: String?, removedID: String?) {
         let previousID = try? catalog.fileID(forPath: path)
         do {
             _ = try broker.identity(at: path)
         } catch BrokerError.statFailed(let error) where error == ENOENT || error == ENOTDIR {
             try markMissing(atOrUnder: path)
+            if isWatchedRoot(path) {
+                onRootAccessLost?(path, "root-unavailable")
+            }
             return (nil, previousID ?? nil)
+        } catch BrokerError.statFailed(let error)
+            where error == EACCES || error == EPERM {
+            try? catalog.recordAccessBackoff(prefix: path, reason: "permission-denied")
+            if isWatchedRoot(path) {
+                onRootAccessLost?(path, "permission-denied")
+            }
+            return (nil, nil)
         } catch {
             // Permission failures, symlink refusals, and transient filesystem
             // errors are not proof that a source vanished.
@@ -508,7 +561,11 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
             indexed = try handler(path)
         } else {
             if broker.isDirectory(at: path) {
-                _ = try automaticRootSession().indexRoot(URL(fileURLWithPath: path))
+                let result = try automaticRootSession().indexRoot(
+                    URL(fileURLWithPath: path), cancellation: cancellation)
+                if result.completion == .rootUnavailable, isWatchedRoot(path) {
+                    onRootAccessLost?(path, "root-unavailable")
+                }
                 return (nil, nil)
             }
             indexed = (try? indexer.indexOne(path: path, updateSimilarity: false)) ?? false
@@ -522,11 +579,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
             try handler(path)
             return
         }
-        try? catalog.markMissing(path: path)
-        for row in (try? catalog.allFiles()) ?? []
-            where row.status != "missing" && SourceBroker.isPath(row.path, under: path) {
-            try? catalog.markMissing(path: row.path)
-        }
+        try? catalog.markMissing(atOrUnder: path)
     }
 
     /// Expensive whole-root reconciliation is rate-limited independently from
@@ -567,6 +620,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         lastFullRescanTime = Date.timeIntervalSinceReferenceDate
         fullReconciliationsValue += 1
         lock.unlock()
+        if currentWorkCancellation()?.isCancelled == true { return }
         performFullRescan(reason: reason)
     }
 
@@ -575,13 +629,25 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
             try? handler()
             return
         }
+        let cancellation = currentWorkCancellation()
+        if cancellation?.isCancelled == true { return }
         try? catalog.recordError(opaqueRef: "live-rescan", stage: "live-reconcile",
                                  message: "full rescan: \(reason)")
         lock.lock()
         let snapshot = roots
         lock.unlock()
-        for root in snapshot where FileManager.default.fileExists(atPath: root.path) {
-            _ = try? automaticRootSession().indexRoot(root)
+        for root in snapshot {
+            if cancellation?.isCancelled == true { break }
+            do {
+                let result = try automaticRootSession().indexRoot(root, cancellation: cancellation)
+                if result.completion == .rootUnavailable {
+                    onRootAccessLost?(root.path, "root-unavailable")
+                }
+            } catch {
+                try? catalog.recordError(
+                    opaqueRef: "live-rescan-root", stage: "live-reconcile",
+                    message: String(describing: error).prefix(200).description)
+            }
         }
     }
 

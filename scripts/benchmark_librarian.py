@@ -178,7 +178,11 @@ def run_cli(binary: Path, catalog: Path, command: list[str], tier2: bool = False
         rss_peak = peak_rss_mb()
     indexed = None
     dupes = None
-    m = re.search(r"indexed\s+(\d+)\s+files", out)
+    # The CLI emits structured key=value status fields. Keep the legacy
+    # phrase as a fallback so older release binaries remain benchmarkable.
+    m = re.search(r"\bindexed=(\d+)\b", out)
+    if m is None:
+        m = re.search(r"indexed\s+(\d+)\s+files", out)
     if m:
         indexed = int(m.group(1))
     m2 = re.search(r"duplicate groups:\s*(\d+)", out)

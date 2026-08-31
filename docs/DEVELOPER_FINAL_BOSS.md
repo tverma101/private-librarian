@@ -48,3 +48,27 @@ Before calling huge developer trees production-ready, record:
 - live-event peak pending count during a synthetic compiler storm;
 - number of full reconciliations requested/executed;
 - search p50/p95 and peak RSS on a large semantic catalog.
+
+## Current implementation checkpoint
+
+The scalable path is implemented in SourceBroker.enumerateBatches,
+ScalableIndexSession, and the SQL-backed root-scan marker. Large sibling
+directories use a bounded in-memory fast path and a temporary-file external
+sort; recursive discovery emits bounded batches, preserves caller path spelling,
+does not follow arbitrary symlinks, treats packages as opaque, and stops at
+maxFiles before descending further. Missing reconciliation pages through
+catalog rows and proves deletion with a fresh no-follow identity check.
+
+Semantic indexing uses one bounded source capsule, a capped prose primary/chunk
+representation, and SQL aggregate project summaries. SearchService scans
+semantic and visual rows in fixed batches while retaining only top-K candidates.
+The catalog exposes embedding/chunk counts, per-file fanout maxima, vector bytes,
+and database/WAL size for release measurements.
+
+Live indexing now owns one cancellable work lane, drains it before manual
+cleanup starts, records bounded inaccessible-prefix backoff, and surfaces
+cancelled, paused, limited, and unavailable-root outcomes. The regression suite
+currently covers a 5,000-file deterministic directory, bounded batches,
+100,000-event live storms, permission backoff, cancellation/resume, semantic
+fanout, and SQL storage metrics. These are synthetic regression receipts, not a
+claim of a completed 24 GB RSS benchmark.

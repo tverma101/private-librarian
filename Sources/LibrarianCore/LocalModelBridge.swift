@@ -273,7 +273,12 @@ public struct LocalModelBridge: Sendable {
         let hasWeights = ["pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack"].contains {
             FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
         }
-        return hasConfig && hasWeights && hasTrustedProvenance(directory, model: model)
+        // This is a fast discovery predicate used by the app/UI and by the
+        // helper path selection. The helper's first --check/inference call
+        // performs the full manifest hash verification, so merely asking
+        // whether a model exists never re-hashes hundreds of megabytes.
+        return hasConfig && hasWeights && hasTrustedProvenance(
+            directory, model: model, verifyHashes: false)
     }
 
     /// Pick the installed model root for the helper instead of assuming that
@@ -297,9 +302,11 @@ public struct LocalModelBridge: Sendable {
     /// File bytes are hashed by the provisioning/verification command; this
     /// fast runtime gate verifies that every manifest entry is present, safe,
     /// and tied to the pinned model identity before a helper can load it.
-    private static func hasTrustedProvenance(_ directory: URL, model: Model) -> Bool {
+    private static func hasTrustedProvenance(_ directory: URL, model: Model,
+                                              verifyHashes: Bool = true) -> Bool {
         guard let data = try? Data(contentsOf: directory.appendingPathComponent("provenance.json")),
               let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              record["schema"] as? Int == 2,
               let modelName = record["model"] as? String,
               modelName == model.rawValue,
               let hfID = record["hf_id"] as? String,
@@ -321,8 +328,8 @@ public struct LocalModelBridge: Sendable {
                 .resolvingSymlinksInPath().standardizedFileURL
             guard path.path == root.path || path.path.hasPrefix(root.path + "/"),
                   let values = try? path.resourceValues(forKeys: [.isRegularFileKey]),
-                  values.isRegularFile == true,
-                  sha256File(path) == expected.lowercased() else { return false }
+                  values.isRegularFile == true else { return false }
+            if verifyHashes && sha256File(path) != expected.lowercased() { return false }
         }
         return true
     }
@@ -528,13 +535,38 @@ public struct LocalModelBridge: Sendable {
 
     struct RunResult { let stdout: String; let stderr: String; let exitCode: Int32 }
 
-    /// Pin a stable, non-shim python over the PATH-based `env python3`.
+    /// Locate the explicitly configured or locally provisioned Python runtime.
+    /// Packaged apps cannot rely on the user's shell PATH, so the optional
+    /// model runtime is also searched beside the app resources, in the repo's
+    /// ignored `.model-runtime`, and in Application Support.
     private static func pythonExecutable() -> URL? {
-        for candidate in ["/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python3"] {
-            if FileManager.default.isExecutableFile(atPath: candidate) { return URL(fileURLWithPath: candidate) }
+        var candidates: [String] = []
+        if let configured = ProcessInfo.processInfo.environment["LIBRARIAN_PYTHON"],
+           !configured.isEmpty {
+            candidates.append(configured)
         }
-        // Fallback only if none of the known candidates exist (still fixed, no shim dir injection).
-        return URL(fileURLWithPath: "/usr/bin/python3")
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent("model-runtime/bin/python3").path)
+        }
+        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            candidates.append(appSupport
+                .appendingPathComponent("PrivateLibrarian/model-runtime/bin/python3").path)
+        }
+        if let home = ProcessInfo.processInfo.environment["HOME"], !home.isEmpty {
+            candidates.append(URL(fileURLWithPath: home)
+                .appendingPathComponent("Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/model-runtime/bin/python3").path)
+        }
+        if let repo = repoRoot() {
+            candidates.append(repo.appendingPathComponent(".model-runtime/bin/python3").path)
+        }
+        candidates += ["/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python3"]
+        var seen = Set<String>()
+        for candidate in candidates where seen.insert(candidate).inserted {
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return URL(fileURLWithPath: candidate)
+            }
+        }
+        return nil
     }
 
     static func runPython(_ args: [String], input: Data? = nil, timeout: TimeInterval) -> RunResult {
@@ -663,7 +695,6 @@ public struct LocalModelBridge: Sendable {
         if let env = ProcessInfo.processInfo.environment["LIBRARIAN_MODELS_DIR"] {
             roots.append(URL(fileURLWithPath: env))
         }
-        if let repo = repoRoot() { roots.append(repo.appendingPathComponent("Models")) }
         if let res = Bundle.main.resourceURL?.appendingPathComponent("Models"),
            FileManager.default.fileExists(atPath: res.path) {
             roots.append(res)
@@ -676,6 +707,11 @@ public struct LocalModelBridge: Sendable {
         let asURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent("PrivateLibrarian/Models")
         if let asURL { roots.append(asURL) }
+        if let home = ProcessInfo.processInfo.environment["HOME"], !home.isEmpty {
+            roots.append(URL(fileURLWithPath: home)
+                .appendingPathComponent("Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models"))
+        }
+        if let repo = repoRoot() { roots.append(repo.appendingPathComponent("Models")) }
         return roots
     }
 

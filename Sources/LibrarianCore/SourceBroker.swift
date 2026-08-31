@@ -469,102 +469,25 @@ public struct SourceBroker: Sendable {
     /// root spelling (`root.path`) — FileManager canonicalizes `/var` →
     /// `/private/var` in the child URLs it hands back, and emitting those raw
     /// would put two spellings of the same tree into one index run.
-    /// Deterministic order (sorted per directory).
+    /// Compatibility API that retains the complete result array. Large scan
+    /// paths must use `enumerateBatches`; this wrapper exists for callers that
+    /// explicitly need a small, materialized snapshot and keeps its historical
+    /// deterministic final ordering.
     public static func enumerate(root: URL, maxDepth: Int = 16,
                                  excludedPrefixes: [String] = [],
                                  excludedDirectoryNames: Set<String> = []) throws -> [DiscoveredItem] {
         var out: [DiscoveredItem] = []
-        let fm = FileManager.default
-        let resolvedRoot: String
-        do {
-            resolvedRoot = try Self.noFollowPath(root.path)
-        } catch {
-            // A selected root with a non-system symlink in any component is
-            // not a traversal capability. The caller can re-authorize the
-            // canonical directory instead.
-            return []
-        }
-        var rootStat = stat()
-        guard lstat(resolvedRoot, &rootStat) == 0,
-              (rootStat.st_mode & S_IFMT) == S_IFDIR else {
-            // An explicitly selected symlink root must never become a
-            // traversal capability for its target.
-            return []
-        }
-        var baseDisplay = root.path
-        if baseDisplay.hasSuffix("/") && baseDisplay.count > 1 { baseDisplay = String(baseDisplay.dropLast()) }
-        let exclusions = excludedPrefixes.map { path in
-            path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
-        }
-        if exclusions.contains(where: { Self.isPath(baseDisplay, under: $0) }) { return [] }
-        if OnboardingExclusions.isExcludedDirectoryName(root.lastPathComponent,
-                                                        configured: excludedDirectoryNames) { return [] }
-        var enqueued: [(dir: URL, display: String, depth: Int)] = [
-            (URL(fileURLWithPath: resolvedRoot), baseDisplay, 0)
-        ]
-        while let (dir, display, depth) = enqueued.popLast() {
-            var directoryStat = stat()
-            guard lstat(dir.path, &directoryStat) == 0,
-                  (directoryStat.st_mode & S_IFMT) == S_IFDIR else {
-                continue
-            }
-            // An unreadable directory must not kill the whole scan (plan §42
-            // doctrine): skip the subtree; the missing-sweep's errno check
-            // keeps its already-indexed rows safely 'indexed'.
-            let contents: [URL]
-            do {
-                contents = try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [
-                    .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey, .totalFileAllocatedSizeKey,
-                ], options: [])
-            } catch {
-                continue
-            }
-            // Deterministic ordering regardless of filesystem order.
-            let sorted = contents.sorted { $0.lastPathComponent < $1.lastPathComponent }
-            for child in sorted {
-                // Reported path: caller-dialect join. Trim a trailing slash
-                // first so a bare "/" root yields "/name", never "//name".
-                // Disk checks below use the REAL child.url — only the
-                // spelling we emit differs.
-                let parentDisplay = display.hasSuffix("/")
-                    ? String(display.dropLast()) : display
-                let childDisplay = parentDisplay + "/" + child.lastPathComponent
-                if exclusions.contains(where: { Self.isPath(childDisplay, under: $0) }) { continue }
-                if OnboardingExclusions.isExcludedDirectoryName(child.lastPathComponent,
-                                                                configured: excludedDirectoryNames) { continue }
-                if OnboardingExclusions.isTransientOrSystemFile(path: childDisplay) { continue }
-                // lstat-level link check FIRST: a symlinked directory must be
-                // recorded as a link and never descended into (plan §40).
-                var lst = stat()
-                guard lstat(child.path, &lst) == 0 else {
-                    // A failed lstat is not evidence that a child is safe to
-                    // follow. Fail closed for this entry instead of allowing
-                    // FileManager metadata calls to resolve it.
-                    continue
-                }
-                if (lst.st_mode & S_IFMT) == S_IFLNK {
-                    out.append(DiscoveredItem(path: childDisplay, depth: depth))
-                    continue
-                }
-                let vals = try? child.resourceValues(forKeys: [.isSymbolicLinkKey, .isPackageKey, .isRegularFileKey])
-                if vals?.isSymbolicLink == true {
-                    out.append(DiscoveredItem(path: childDisplay, depth: depth))
-                    continue
-                }
-                if vals?.isPackage == true {
-                    // Opaque package: record it, never descend.
-                    out.append(DiscoveredItem(path: childDisplay, depth: depth))
-                    continue
-                }
-                var isDir: ObjCBool = false
-                if fm.fileExists(atPath: child.path, isDirectory: &isDir), isDir.boolValue {
-                    if depth < maxDepth {
-                        enqueued.append((child, childDisplay, depth + 1))
-                    }
-                    continue
-                }
-                out.append(DiscoveredItem(path: childDisplay, depth: depth))
-            }
+        _ = try enumerateBatches(
+            root: root,
+            maxDepth: maxDepth,
+            excludedPrefixes: excludedPrefixes,
+            excludedDirectoryNames: excludedDirectoryNames,
+            batchSize: 512,
+            onUnreadableDirectory: nil,
+            onRootUnavailable: nil
+        ) { batch in
+            out.append(contentsOf: batch)
+            return true
         }
         return out.sorted { $0.path < $1.path }
     }

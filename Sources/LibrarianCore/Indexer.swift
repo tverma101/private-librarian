@@ -12,6 +12,11 @@ public final class Indexer: @unchecked Sendable {
         public var maxReadBytes: Int64 = 8 * 1024 * 1024
         public var hashCandidatesOnly = true
         public var maxFiles: Int? = nil
+        /// Bounded discovery/commit window used by root scans. Keeping this in
+        /// the Indexer options makes the public root API use the same scalable
+        /// session as the app and live reconciler.
+        public var batchSize: Int = 512
+        public var maxDepth: Int = 16
         /// Tier-2 local embeddings (CLIP image + MiniLM text) — still 100% offline.
         /// Default OFF so Vision (zero-download) remains the baseline; enabling
         /// requires `Models/` provisioned and `scripts/embed.py` deps. When off,
@@ -133,20 +138,26 @@ public final class Indexer: @unchecked Sendable {
         else if let kind = options.embeddingProviderKind { self.embeddingProvider = EmbeddingProviderFactory.make(kind: kind) }
         else { self.embeddingProvider = LocalModelEmbeddingProvider() }
         let learnedRules = (try? catalog.listRules()) ?? []
+        // Preflight is a real subprocess/model-manifest check. Do not pay for
+        // it when Tier-2 is disabled; this also keeps the zero-download path
+        // independent of whatever optional host runtime is installed.
+        let embeddingRuntimeAvailable = options.enableLocalEmbeddings
+            && self.embeddingProvider.preflight.available
         self.processingVersion = Self.makeProcessingVersion(
             options: options, providerID: self.embeddingProvider.providerID,
+            embeddingRuntimeAvailable: embeddingRuntimeAvailable,
             asrProviderIdentity: TranscriptionProviderState.processingIdentity(transcriptionProvider),
             learnedRules: learnedRules)
         self.transcriptionProvider = transcriptionProvider
         self.pcmDecoder = pcmDecoder ?? BrokerPCMDecoder(maxSnapshotBytes: options.maxMediaSnapshotBytes)
-        self.embeddingAvailable = options.enableLocalEmbeddings && self.embeddingProvider.preflight.available
+        self.embeddingAvailable = options.enableLocalEmbeddings && embeddingRuntimeAvailable
         try? catalog.recordEmbeddingSpace(
             version: Self.embeddingSpaceVersion,
             details: [
                 "provider=\(self.embeddingProvider.providerID)",
                 "imageModel=\(self.embeddingProvider.imageModelID)",
                 "textModel=\(self.embeddingProvider.textModelID)",
-                "preflight=\(self.embeddingProvider.preflight.available)"
+                "preflight=\(embeddingRuntimeAvailable)"
             ].joined(separator: "|"))
     }
 
@@ -158,6 +169,7 @@ public final class Indexer: @unchecked Sendable {
     /// Includes embedding-space identity when Tier 2 is enabled so a model change
     /// forces at least one re-index of every file that carries an embedding.
     private static func makeProcessingVersion(options: Options, providerID: String? = nil,
+                                              embeddingRuntimeAvailable: Bool = false,
                                               asrProviderIdentity: String? = nil,
                                               learnedRules: [LearnedRule] = []) -> String {
         var parts = [
@@ -172,7 +184,8 @@ public final class Indexer: @unchecked Sendable {
             let clip = LocalModelBridge.isProvisioned(.clipImage) ? "clip:on" : "clip:off"
             let mini = LocalModelBridge.isProvisioned(.miniLMText) ? "minilm:on" : "minilm:off"
             let prov = providerID ?? options.embeddingProviderKind ?? LocalModelEmbeddingProvider().providerID
-            parts.append("tier2:\(clip),\(mini),\(embeddingSpaceVersion),provider:\(prov)")
+            let runtime = embeddingRuntimeAvailable ? "runtime:on" : "runtime:off"
+            parts.append("tier2:\(clip),\(mini),\(runtime),\(embeddingSpaceVersion),provider:\(prov)")
         } else {
             parts.append("tier2:off")
         }
@@ -200,107 +213,58 @@ public final class Indexer: @unchecked Sendable {
         return parts.joined(separator: "|")
     }
 
-    /// Index a security-scoped root folder.
-    /// Returns the number of entries that actually required processing; entries
-    /// skipped by incremental detection are not counted. Progress still reports
-    /// all discovered entries scanned so the UI can reach total/total.
+    /// Index a security-scoped root folder through the bounded session
+    /// coordinator. The previous implementation built both a complete
+    /// discovered-path array and a complete in-memory seen set; the session
+    /// keeps discovery and missing reconciliation on bounded SQL-backed
+    /// windows instead.
     @discardableResult
-    public func indexRoot(_ root: URL, onProgress: ((Progress) -> Void)? = nil) throws -> Int {
-        let items = try SourceBroker.enumerate(root: root,
-                                               excludedPrefixes: options.excludedPaths,
-                                               excludedDirectoryNames: options.excludedDirectoryNames)
-        var scanned = 0
-        var actuallyProcessed = 0
-        var similarityChangedIDs = Set<String>()
-        var similarityRemovedIDs = Set<String>()
-        let total = min(items.count, options.maxFiles ?? Int.max)
-        let rootPrefix = root.path.hasSuffix("/") ? String(root.path.dropLast()) : root.path
-        let queuedByPath: [String: String] = {
-            guard let entries = try? catalog.learnedReindexEntries() else { return [:] }
-            return Dictionary(uniqueKeysWithValues: entries.filter { entry in
-                SourceBroker.isPath(entry.path, under: rootPrefix)
-                    && !options.excludedPaths.contains {
-                        SourceBroker.isPath(entry.path, under: $0)
-                    }
-            }.map { ($0.path, $0.fileID) })
-        }()
-        // Session-scoped persistent worker — keeps models warm across many files.
-        let worker: LocalModelBridge.PersistentWorker? = {
-            guard options.enableLocalEmbeddings, embeddingAvailable,
-                  embeddingProvider is LocalModelEmbeddingProvider else { return nil }
-            guard LocalModelBridge.isProvisioned(.clipImage) || LocalModelBridge.isProvisioned(.miniLMText) else { return nil }
-            return LocalModelBridge.PersistentWorker()
-        }()
-        defer { worker?.close() }
+    public func indexRoot(
+        _ root: URL,
+        onProgress: ((Progress) -> Void)? = nil,
+        cancellation: IndexCancellationToken? = nil
+    ) throws -> Int {
+        var sessionOptions = ScalableIndexSession.Options()
+        sessionOptions.batchSize = max(1, options.batchSize)
+        sessionOptions.maxFiles = options.maxFiles
+        sessionOptions.maxDepth = max(0, options.maxDepth)
+        sessionOptions.excludedPaths = options.excludedPaths
+        sessionOptions.excludedDirectoryNames = options.excludedDirectoryNames
+        sessionOptions.enablePersistentEmbeddingWorker = options.enableLocalEmbeddings
+        sessionOptions.updateSimilarity = true
+        sessionOptions.respectAccessBackoff = false
 
-        for item in items.prefix(options.maxFiles ?? Int.max) {
-            do {
-                let classificationOnly = queuedByPath[item.path].flatMap { fileID in
-                    try? reindexQueuedClassification(fileID: fileID, path: item.path)
-                } == true
-                let didProcess: Bool
-                if classificationOnly {
-                    didProcess = true
-                } else {
-                    didProcess = try indexOne(path: item.path, worker: worker,
-                                              updateSimilarity: false)
-                }
-                if didProcess {
-                    actuallyProcessed += 1
-                    if let current = try? broker.identity(at: item.path) {
-                        similarityChangedIDs.insert(FileID.make(identity: current))
-                    }
-                }
-            } catch {
-                try? catalog.recordError(opaqueRef: FileID.workerError(scanned + 1),
-                                         stage: "index", message: String(describing: error).prefix(200).description)
-            }
-            scanned += 1
-            if let onProgress {
-                onProgress(Progress(processed: scanned, total: total,
-                                    lastPath: (item.path as NSString).lastPathComponent))
-            }
+        let session = ScalableIndexSession(
+            broker: broker, catalog: catalog, indexer: self, options: sessionOptions)
+        let result = try session.indexRoot(root, cancellation: cancellation) { progress in
+            onProgress?(Progress(
+                processed: progress.scanned,
+                total: 0,
+                lastPath: progress.lastPath))
         }
+        return result.processed
+    }
 
-        // Plan §34/§44: files that vanished since the last scan are marked
-        // missing in the catalog — never reconstructed, never deleted twice.
-        // The enumerator emits root.path-joined paths, so seen-set, this
-        // prefix, and every catalog row share one spelling by construction.
-        let seen = Set(items.map(\.path))
-        for stored in try catalog.allFiles()
-            where stored.status != "missing" && stored.status != "unscoped" {
-            guard SourceBroker.isPath(stored.path, under: rootPrefix) else { continue }
-            if options.excludedPaths.contains(where: { SourceBroker.isPath(stored.path, under: $0) }) { continue }
-            if seen.contains(stored.path) { continue }
-            // Depth-truncation guard: a file beyond maxDepth wasn't *seen*,
-            // but it didn't vanish either. Absence must be PROVEN: only
-            // ENOENT/ENOTDIR from the no-follow lstat count. EACCES, ELOOP,
-            // etc. mean "can't look right now" — never "gone".
-            do {
-                _ = try broker.identity(at: stored.path)
-                continue
-            } catch BrokerError.statFailed(let errno)
-                where errno == ENOENT || errno == ENOTDIR {
-                if stored.path.split(separator: "/").contains(where: {
-                    options.excludedDirectoryNames.contains(String($0))
-                }) {
-                    continue
-                }
-                try catalog.markMissing(path: stored.path)
-                similarityRemovedIDs.insert(stored.id)
-            } catch {
-                continue
-            }
+    /// Scan-only entry point used by `ScalableIndexSession`. Learned rule
+    /// invalidation is checked one path at a time so a huge root never needs a
+    /// full queue dictionary in memory.
+    @discardableResult
+    func indexOneForScan(
+        path: String,
+        worker: LocalModelBridge.PersistentWorker? = nil,
+        updateSimilarity: Bool = true
+    ) throws -> Bool {
+        let queued = try catalog.query("""
+            SELECT q.file_id
+            FROM learned_reindex_queue AS q
+            JOIN files AS f ON f.id = q.file_id
+            WHERE f.path=?
+            LIMIT 1
+            """, binds: [.text(path)]) { row in row.text(0) }.first ?? nil
+        if let queued, try reindexQueuedClassification(fileID: queued, path: path) {
+            return true
         }
-        if !similarityChangedIDs.isEmpty || !similarityRemovedIDs.isEmpty {
-            try? rebuildSimilarityGraph(changedFileIDs: similarityChangedIDs,
-                                        removedFileIDs: similarityRemovedIDs)
-        }
-        // Classification revisions can retire old taxonomy leaves. Once all
-        // memberships for this pass are current, remove catalog-only category
-        // nodes that no longer lead to any file. Originals are never touched.
-        try? catalog.pruneUnusedVirtualCategories()
-        return actuallyProcessed
+        return try indexOne(path: path, worker: worker, updateSimilarity: updateSimilarity)
     }
 
     /// Re-apply learned classification rules from the already stored
@@ -683,31 +647,38 @@ public final class Indexer: @unchecked Sendable {
         if options.enableLocalEmbeddings,
            let t = textContent, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            embeddingAvailable {
-            recordWork { $0.textEmbedCalls += 1 }
-            if let w = worker, embeddingProvider is LocalModelEmbeddingProvider,
-               let result = w.embedText(t, timeout: 10) {
-                stagedMiniLM = EmbeddingVector(spaceID: "text:\(embeddingProvider.providerID)",
-                                               dim: result.dim, data: result.data)
-            } else {
-                stagedMiniLM = scheduler.perform(as: .medium) { [embeddingProvider] in
-                    embeddingProvider.embedText(t)
+            func embedText(_ value: String, timeout: TimeInterval) -> EmbeddingVector? {
+                recordWork { $0.textEmbedCalls += 1 }
+                let vector: EmbeddingVector?
+                if let w = worker, embeddingProvider is LocalModelEmbeddingProvider,
+                   let result = w.embedText(value, timeout: timeout) {
+                    vector = EmbeddingVector(spaceID: "text:\(embeddingProvider.providerID)",
+                                             dim: result.dim, data: result.data)
+                } else {
+                    vector = scheduler.perform(as: .medium) { [embeddingProvider] in
+                        embeddingProvider.embedText(value)
+                    }
                 }
+                guard let vector, !vector.data.isEmpty else { return nil }
+                return vector
             }
-            if stagedMiniLM?.data.isEmpty == true { stagedMiniLM = nil }
-            // Pre-compute chunk embeddings *outside* the transaction so no
-            // Python/model call holds the DB commit open.
-            let chunks = LocalModelBridge.textChunks(t)
-            if chunks.count > 1 {
-                for (idx, chunk) in chunks.enumerated() {
-                    recordWork { $0.textEmbedCalls += 1 }
-                    if let w = worker, embeddingProvider is LocalModelEmbeddingProvider,
-                       let ce = w.embedText(chunk, timeout: 8), !ce.data.isEmpty {
-                        stagedChunks.append((idx, ce.data, ce.dim))
-                    } else if let ce = scheduler.perform(as: .medium, { [embeddingProvider] in
-                        embeddingProvider.embedText(chunk)
-                    }),
-                              !ce.data.isEmpty {
-                        stagedChunks.append((idx, ce.data, ce.dim))
+
+            // Compact before inference. Source-like files receive one bounded
+            // capsule, generated lock/map/minified output is excluded, and
+            // prose receives one primary representation plus a capped set of
+            // search chunks. Exact/FTS indexing still uses the original text.
+            switch SemanticCompaction.strategy(path: ident.path, text: t) {
+            case .skip:
+                break
+            case .single(let primary):
+                stagedMiniLM = embedText(primary, timeout: 10)
+            case .prose(let primary, let chunks):
+                stagedMiniLM = embedText(primary, timeout: 10)
+                if chunks.count > 1 {
+                    for (idx, chunk) in chunks.enumerated() {
+                        if let vector = embedText(chunk, timeout: 8) {
+                            stagedChunks.append((idx, vector.data, vector.dim))
+                        }
                     }
                 }
             }

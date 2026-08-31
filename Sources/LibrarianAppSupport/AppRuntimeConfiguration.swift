@@ -9,12 +9,14 @@ public final class SecurityScopedBookmarkLease: @unchecked Sendable {
         case missingBookmark
         case invalidBookmark
         case staleBookmark
+        case accessDenied
 
         public var errorDescription: String? {
             switch self {
             case .missingBookmark: return "Saved folder permission is missing. Re-authorize the folder."
             case .invalidBookmark: return "Saved folder permission could not be restored. Re-authorize the folder."
             case .staleBookmark: return "Saved folder permission is stale. Re-authorize the folder."
+            case .accessDenied: return "Saved folder permission could not be activated. Re-authorize the folder."
             }
         }
     }
@@ -55,8 +57,9 @@ public final class SecurityScopedBookmarkLease: @unchecked Sendable {
             throw LeaseError.invalidBookmark
         }
         guard !resolved.isStale else { throw LeaseError.staleBookmark }
+        guard beginAccess(resolved.url) else { throw LeaseError.accessDenied }
         self.url = resolved.url
-        self.started = beginAccess(resolved.url)
+        self.started = true
         self.endAccess = endAccess
     }
 

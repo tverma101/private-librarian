@@ -2,7 +2,7 @@ import Foundation
 import SQLCipher
 
 /// SQLCipher-backed catalog: the ONLY writable store in the system.
-/// Key lives in the macOS Keychain (see CatalogKeychain). All content —
+/// Key lives in the macOS data-protection Keychain (see CatalogKeychain). All content —
 /// filenames, OCR, transcripts, embeddings, classifications — is encrypted at
 /// rest. FTS5 provides local full-text search inside the encrypted file.
 public final class Catalog: @unchecked Sendable {
@@ -31,7 +31,7 @@ public final class Catalog: @unchecked Sendable {
     // MARK: - Lifecycle
 
     /// Open (creating if needed) an encrypted catalog at `path`.
-    /// - Parameter key: raw key material from the Keychain.
+    /// - Parameter key: raw key material from the data-protection Keychain.
     public init(path: String, key: Data) throws {
         queue.setSpecific(key: queueKey, value: ())
         self.path = path
@@ -229,6 +229,22 @@ public final class Catalog: @unchecked Sendable {
             PRIMARY KEY (file_id, model, chunk_index)
         );
 
+        -- Bounded project-level semantic rollups. These are aggregate catalog
+        -- facts, not a second copy of per-file text or source bytes.
+        CREATE TABLE IF NOT EXISTS project_summaries (
+            root TEXT PRIMARY KEY,
+            complete INTEGER NOT NULL,
+            file_count INTEGER NOT NULL,
+            indexed_file_count INTEGER NOT NULL,
+            text_file_count INTEGER NOT NULL,
+            embedding_file_count INTEGER NOT NULL,
+            chunk_row_count INTEGER NOT NULL,
+            vector_bytes INTEGER NOT NULL,
+            kind_counts_json TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            updated REAL NOT NULL
+        );
+
         -- Similarity is derivative, encrypted catalog state. The relation and
         -- signal are explicit so near-duplicate review never masquerades as
         -- semantic relevance, and providers can be replaced without a schema
@@ -378,6 +394,13 @@ public final class Catalog: @unchecked Sendable {
         let latestVersion = try query("SELECT v FROM meta WHERE k='schema_version'") { $0.text(0) ?? "1" }
         if (latestVersion.first ?? "1") == "3" {
             try run("UPDATE meta SET v='4' WHERE k='schema_version'")
+        }
+        // v4→v5: aggregate project-level semantic rollups. The CREATE TABLE
+        // above is idempotent so old catalogs converge even after a partial
+        // migration.
+        let summaryVersion = try query("SELECT v FROM meta WHERE k='schema_version'") { $0.text(0) ?? "1" }
+        if (summaryVersion.first ?? "1") == "4" {
+            try run("UPDATE meta SET v='5' WHERE k='schema_version'")
         }
     }
 
@@ -560,6 +583,24 @@ public final class Catalog: @unchecked Sendable {
         try run("UPDATE files SET status='missing' WHERE path=? AND status!='missing'", binds: [.text(path)])
     }
 
+    /// Mark a deleted file or directory subtree missing entirely in SQL. The
+    /// live coordinator uses this instead of loading every catalog row into a
+    /// Swift array during a directory deletion event.
+    public func markMissing(atOrUnder root: String) throws {
+        let normalized = root.count > 1 && root.hasSuffix("/")
+            ? String(root.dropLast()) : root
+        if normalized == "/" {
+            try run("UPDATE files SET status='missing' WHERE status!='missing' AND status!='unscoped' AND path LIKE '/%' ESCAPE '~'")
+            return
+        }
+        let childPattern = Self.escapeLikePattern(normalized) + "/%"
+        try run("""
+            UPDATE files SET status='missing'
+            WHERE status!='missing' AND status!='unscoped'
+              AND (path=? OR path LIKE ? ESCAPE '~')
+            """, binds: [.text(normalized), .text(childPattern)])
+    }
+
     /// Remove a source root from the visible catalog scope without touching
     /// any original. Re-adding the same root makes its rows eligible again;
     /// the next index pass refreshes their derived state.
@@ -568,6 +609,8 @@ public final class Catalog: @unchecked Sendable {
             ? String(root.dropLast()) : root
         if normalized == "/" {
             try run("UPDATE files SET status='unscoped' WHERE path LIKE '/%' ESCAPE '~'")
+            try run("DELETE FROM project_summaries WHERE root LIKE '/%' ESCAPE '~'")
+            try? clearAccessBackoff(atOrUnder: normalized)
             return
         }
         let childPattern = Self.escapeLikePattern(normalized) + "/%"
@@ -576,6 +619,8 @@ public final class Catalog: @unchecked Sendable {
             WHERE path=? OR path LIKE ?
             ESCAPE '~'
             """, binds: [.text(normalized), .text(childPattern)])
+        try run("DELETE FROM project_summaries WHERE root=?", binds: [.text(normalized)])
+        try? clearAccessBackoff(atOrUnder: normalized)
     }
 
     public func restoreRootScope(root: String) throws {
@@ -583,6 +628,7 @@ public final class Catalog: @unchecked Sendable {
             ? String(root.dropLast()) : root
         if normalized == "/" {
             try run("UPDATE files SET status='pending' WHERE status='unscoped' AND path LIKE '/%' ESCAPE '~'")
+            try? clearAccessBackoff(atOrUnder: normalized)
             return
         }
         let childPattern = Self.escapeLikePattern(normalized) + "/%"
@@ -590,6 +636,9 @@ public final class Catalog: @unchecked Sendable {
             UPDATE files SET status='pending'
             WHERE status='unscoped' AND (path=? OR path LIKE ? ESCAPE '~')
             """, binds: [.text(normalized), .text(childPattern)])
+        // Reauthorization is an explicit retry. Do not let stale automatic
+        // backoff keep the newly restored root silently skipped.
+        try? clearAccessBackoff(atOrUnder: normalized)
     }
 
     private static func escapeLikePattern(_ value: String) -> String {
