@@ -18,6 +18,7 @@ public struct ImageJunkAssessment: Sendable, Equatable {
 }
 
 public enum ImageJunkScorer {
+    public static let revision = "image-junk-1.0"
     public static let threshold = 0.85
 
     /// High-precision junk assessment. Useful text or a confident useful Vision
@@ -73,11 +74,17 @@ public enum ImageJunkScorer {
         }
 
         if let stats {
+            // A tiny thumbnail can alias a real icon, gradient or high-frequency
+            // graphic into something that looks blank. Thumbnail sparsity is
+            // therefore strong junk evidence only when the ORIGINAL image is
+            // objectively disposable-looking too (very small or extreme shape).
+            let objectivelyDisposableShape =
+                maxSide <= 128 || pixelCount <= 16_384 || aspect >= 10
             if stats.range <= 8 || stats.variance <= 4 {
-                score += 0.65
+                score += objectivelyDisposableShape ? 0.65 : 0.10
                 reasons.append("near-blank")
             } else if stats.occupiedBins <= 3 || stats.variance <= 18 {
-                score += 0.35
+                score += objectivelyDisposableShape ? 0.20 : 0.05
                 reasons.append("very-low-information")
             }
         }
