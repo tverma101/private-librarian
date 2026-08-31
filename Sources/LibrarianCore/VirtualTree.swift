@@ -13,7 +13,6 @@ public struct VirtualTree: Sendable {
     /// Build the tree from flat "A/B/C" category paths + memberships.
     public static func build(memberships: [(categoryPath: String, fileID: String)]) -> Node {
         let root = Node(name: "", children: [], fileIDs: [])
-        var index: [String: Node] = [:] // path -> node (value semantics via rebuild)
         var nodes: [String: Node] = [:]
 
         func ensure(_ path: String) -> String {
@@ -47,7 +46,6 @@ public struct VirtualTree: Sendable {
             }
         }
         result.children.sort { $0.name < $1.name }
-        index = [:]
         return result
     }
 }

@@ -1,0 +1,11 @@
+# Runtime for the optional, offline Python embedding provider.
+# Keep this separate from the Swift package: the default app does not need it.
+# These direct versions are the versions covered by the local inference smoke;
+# update them only with a fresh --check plus image/text inference validation.
+# NumPy is used by the torchvision-free CLIP image preprocessing path.
+huggingface_hub==1.29.0
+numpy==2.4.6
+Pillow==12.3.0
+torch==2.13.0
+transformers==5.16.1
+sentence-transformers==5.7.0

@@ -94,6 +94,31 @@ final class SymlinkEscapeTests: XCTestCase {
         XCTAssertThrowsError(try broker.boundedRead(linkPath, limit: 16))
     }
 
+    func testIsDirectoryUsesNoFollowMetadataForProtectedDirectories() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("directory-metadata-\(UUID().uuidString)")
+        let protected = root.appendingPathComponent("protected")
+        try FileManager.default.createDirectory(at: protected, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: protected.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        // Reading a directory is forbidden, but lstat of the directory entry is
+        // still safe metadata and must remain usable for traversal decisions.
+        try FileManager.default.setAttributes([.posixPermissions: 0],
+                                              ofItemAtPath: protected.path)
+        let broker = SourceBroker()
+        XCTAssertTrue(broker.isDirectory(at: protected.path))
+        XCTAssertFalse(broker.isDirectory(at: protected.appendingPathComponent("missing").path))
+
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: protected)
+        XCTAssertFalse(broker.isDirectory(at: alias.path),
+                      "directory checks must not follow a final symlink")
+    }
+
     func testTOCTOUSwapIsRejected() throws {
         // A file swapped to a symlink between lstat and open must not be read:
         // O_NOFOLLOW makes open fail with ELOOP -> BrokerError.isSymlink.
@@ -116,5 +141,75 @@ final class SymlinkEscapeTests: XCTestCase {
         XCTAssertThrowsError(try broker.boundedRead(victim.path, limit: 64))
         let now = try broker.identity(at: victim.path)
         XCTAssertFalse(ident.stillMatches(now), "identity must differ after swap")
+    }
+
+    func testIntermediateSymlinkPathIsNeverOpened() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("intermediate-link-\(UUID().uuidString)")
+        let outside = dir.appendingPathComponent("outside")
+        let link = dir.appendingPathComponent("link")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try "secret".write(to: outside.appendingPathComponent("secret.txt"),
+                           atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        XCTAssertThrowsError(try SourceBroker().boundedRead(
+            link.appendingPathComponent("secret.txt").path, limit: 64)) { error in
+            guard case BrokerError.isSymlink = error else {
+                return XCTFail("expected intermediate symlink refusal, got \(error)")
+            }
+        }
+    }
+
+    func testCompleteSnapshotRejectsReplacementDuringRead() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("snapshot-race-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let victim = dir.appendingPathComponent("payload.bin")
+        try Data(repeating: 0x41, count: 512 * 1024).write(to: victim)
+        var replaced = false
+        XCTAssertThrowsError(try SourceBroker(maxSnapshotBytes: 2 * 1024 * 1024)
+            .streamCompleteSnapshot(victim.path) { data, isLast in
+                guard !isLast, !replaced else { return }
+                replaced = true
+                try Data(repeating: 0x42, count: data.count)
+                    .write(to: victim, options: .atomic)
+            }) { error in
+                guard case BrokerError.changedDuringRead = error else {
+                    return XCTFail("expected changedDuringRead, got \(error)")
+                }
+            }
+    }
+
+    func testSymlinkRootIsNeverTraversed() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("symlink-root-\(UUID().uuidString)")
+        let target = root.appendingPathComponent("target")
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try "secret".write(to: target.appendingPathComponent("secret.txt"),
+                           atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertTrue(try SourceBroker.enumerate(root: alias).isEmpty)
+    }
+
+    func testIntermediateSymlinkInSelectedRootIsNeverTraversed() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("symlink-root-component-\(UUID().uuidString)")
+        let outside = root.appendingPathComponent("outside")
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try "secret".write(to: outside.appendingPathComponent("secret.txt"),
+                           atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: outside)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertTrue(try SourceBroker.enumerate(
+            root: alias.appendingPathComponent("nested")).isEmpty)
     }
 }

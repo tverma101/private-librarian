@@ -68,8 +68,6 @@ Use neutral synthetic examples such as `/Users/example/...` in tests and documen
 
 Do not publish exploit details in a normal issue. Follow the private reporting instructions in `SECURITY.md`.
 
-## License
+## License status
 
-Private Librarian is licensed under the Apache License 2.0. By submitting a contribution for inclusion in the project, you agree that it may be distributed under that project license unless you explicitly mark the submission otherwise.
-
-Third-party notices already stored under `ThirdParty/` must remain intact.
+A project-level license has not been selected yet. That owner decision is tracked in issue #48. Third-party notices already stored under `ThirdParty/` must remain intact.

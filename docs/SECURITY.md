@@ -1,47 +1,116 @@
-# Security Model
+# Security model
 
-## The one-sentence model
+## The short version
 
-Original files are readable, never writable: every component that can name a
-source path is restricted to open-once-`O_RDONLY|O_NOFOLLOW` semantics, and
-all "organization" is rows in an encrypted catalog — the system contains no
-code path that renames, moves, deletes, re-tags, permission-changes, or
-rewrites a source file.
+Private Librarian may read files inside folders the user authorizes, but it must never modify those source files. All organization, search data, corrections, relationships, and learned rules live in a separate encrypted catalog.
 
-## Threats and controls
+The packaged app is designed to run without runtime network access. Optional
+local model provisioning is an explicit setup step: `scripts/setup_models.sh`
+installs a local runtime and pinned weights under Application Support rather
+than allowing the app to silently download packages or model files.
 
-| Threat | Control | Verified by |
+## Hard boundaries
+
+### Source files are read-only
+
+`SourceBroker` is the source-access boundary. It opens regular files read-only, rejects symlink traversal, and checks file identity again after reads so a changed or replaced file is not silently accepted as the same generation.
+
+The source subsystem must not gain APIs for writing or truncating files, moving/renaming/deleting files, Finder tags/xattrs, chmod/chown-style changes, or handing write-capable source handles to models/parsers.
+
+### The catalog is the writable layer
+
+The catalog is SQLCipher-encrypted and its key is stored in an app-owned
+generic-password Keychain item under a dedicated stable service name. The
+profile-free packager does not invent restricted data-protection or
+Keychain-sharing entitlements without a matching provisioning profile. Virtual categories, search text, embeddings, transcripts, similarity
+relationships, review state, corrections, and learned rules belong in the
+catalog. The CLI never opens this item and requires an explicit
+`LIBRARIAN_CATALOG_KEY` for headless checks.
+
+An item created by an older unsigned development CLI may require one explicit
+macOS approval. Startup never probes that legacy item: the app renders first
+and exposes **Migrate Existing Catalog**. That action preserves the key, copies
+it once into the new app-owned item, and caches a denial for the rest of the
+process. It never rotates the key or deletes the old catalog to silence the
+prompt.
+
+Deleting or rebuilding the catalog must not alter originals.
+
+### Models do not own filesystem authority
+
+Image/text providers receive broker-owned bytes or derived text. Speech providers receive decoded PCM. Providers are not given source write authority.
+
+### Runtime stays local
+
+The packaged app is audited for sandbox entitlements and is expected to have no network client/server entitlement. The network-negative verification probe checks outbound, LAN, localhost, and listening attempts.
+
+Provisioning scripts may use the network only when the user explicitly runs a download command. That is separate from normal app runtime.
+
+## Current controls
+
+| Threat | Current control | Verification |
 |---|---|---|
-| Buggy model / malicious document tells the AI to delete or exfiltrate | No filesystem-writing capability exists in the source subsystem; classifier output must pass the schema contract wall or be discarded | PromptInjectionTests, ImmutabilityAndSymlinkTests |
-| Symlink breakout to files outside the scanned root | Enumeration lstat-checks every child, records links as metadata, never descends; all reads use `O_NOFOLLOW` (ELOOP on TOCTOU swap) | SymlinkEscapeTests (`Forbidden/` lives OUTSIDE the fixture root) |
-| Malformed file crashes the indexer (parser bombs) | Extraction is bounded and error-isolated per file; failures become opaque `errors` rows, indexing continues | ResilienceTests (truncated PDF, fake JPEG, corrupt ZIP) |
-| Catalog theft | SQLCipher 4.17.0 compiled into the binary (no system libsqlite3 fallback), key = 32 random bytes in the Keychain, never on disk next to the db | encryption tests + `status` header check |
-| Wrong key opens old catalog | SQLCipher refuses; tests assert failure, not silent plaintext | ResilienceTests |
-| Silent downgrade to unencrypted sqlite | `Catalog.onDiskHeaderIsPlaintextSQLite` checks the on-disk header; CLI prints `encrypted-on-disk=` every run | E2E receipts |
-| Duplicate detector deleting "copies" | Detector is report-only by construction — it has no delete API | BehaviorTests assert both copies still exist |
-| Deleted originals ghosting in search results | Missing-sweep marks rows `missing`; nothing is reconstructed or deleted twice | ResilienceTests.testOriginalLossIsRecordedNotRepaired |
-| Over-broad entitlements in packaged app | App Sandbox ON, `user-selected.read-only`, bookmarks app-scope; auditor fails on any write/network/audio/photos entitlement | scripts/audit_entitlements.py in CI |
-| Network exfiltration from the app | No network entitlements; network-negative probe expects all four connection classes DENIED | scripts/network_negative_probe.py |
-| Image inference leaks to cloud | All AI image sorting runs 100% on-device: Apple Vision (`VNClassifyImageRequest`/`VNGenerateImageFeaturePrintRequest`) + optional local models from `Models/`; no network entitlement, no download in CI, no telemetry | VisionImageAnalyzer + LocalModelBridge + scripts/embed.py |
-| Local embedding helper phones home | `scripts/embed.py` runs with `local_files_only=True` on checkpoints under `Models/`; Swift side is a timeout-bounded subprocess with no shell; index path is never added to catalog tree | Network-negative probe + LocalModelBridge.isProvisioned guard |
+| Source file changed by indexing | Read-only broker boundary; organization is catalog-only | immutability tests |
+| Symlink escapes selected tree | no-follow enumeration/direct reads and `openat` walk | symlink escape tests |
+| File swapped during read | opened-file + final-generation checks | TOCTOU tests |
+| Malformed input crashes whole index | bounded per-file failure handling | resilience/OCR/media tests |
+| Catalog readable as plain SQLite | vendored SQLCipher + encrypted-on-disk/wrong-key tests | CI + E2E |
+| Prompt/document content becomes an action | content remains evidence/data; classification contract is validated | prompt-injection tests |
+| Duplicate handling deletes originals | duplicate handling is virtual/report-only | behavior tests |
+| Pending generation exposes old transcript as current | search filters to current indexed state | ASR/search regressions |
+| Decoder receives truncated compressed container | complete bounded snapshot or fail closed | OCR/media snapshot tests |
+| Model/helper receives source authority | image providers receive bytes/text; ASR receives PCM | Tier-2/media tests |
+| Changed ASR provider/model is skipped | ASR processing identity includes provider/model generation and invalidates once | `ASRStateRegressionTests` |
+| Temporary ASR failure is treated as success | explicit success / no-transcript / failure state; failures remain pending/retryable | `ASRStateRegressionTests` |
+| Saved bookmark silently falls back to raw path | production app bookmark resolution fails closed and marks the source for reauthorization | app runtime/bookmark tests |
+| Live indexing drops bookmark permission | live coordinator retains security-scoped leases for watched roots and releases them on restart/stop/remove | app/runtime tests + final packaged smoke |
+| Old raw model labels become thousands of user-facing folders | bounded curated taxonomy + Smart Groups singleton suppression and per-lane caps | Smart Organization tests |
 
-## AI image sorting — privacy note
+## Local inference
 
-`VisionImageAnalyzer` uses the **on-device** Vision framework. The model lives in
-`/System/Library/Frameworks/Vision.framework`, runs on ANE/GPU via
-`VNImageRequestHandler(data:)`, never leaves the process, never hits the
-network. The app has **no** `network.client`/`network.server` entitlement —
-on-device Vision works without one. Downloaded models (`Models/clip-vit-base-patch32` + `Models/all-MiniLM-L6-v2`, gitignored, provisioned via
-`scripts/provision_image_models.py --all`) also run locally and offline via `scripts/embed.py` (`local_files_only=True`, `sentence_transformers` / `transformers` on CPU) bridged by `LocalModelBridge` (timeout-bounded subprocess, no shell, no network). `Models/` is outside the indexed tree.
+Tier 1 uses Apple's on-device Vision framework for image labels, feature prints, and OCR and requires no downloaded model.
 
-Tiering: **Tier 1 Vision** (zero-download, always on) handles image labels + feature-print dedup. **Tier 2 local embeddings** (opt-in, provisioned) add `clip-vit-base-patch32` 512-d image search (higher recall than Vision) and `all-MiniLM-L6-v2` 384-d semantic text search; when not provisioned every call returns `[]` and indexing/search never block.
+Tier 2 is optional. The repository includes a Python-backed local CLIP/MiniLM baseline, a Core ML MobileCLIP S0 provider, and an explicit specialist registry for SigLIP2/DINOv3 plus opt-in OCR/VLM escalation. Provisioning resolves pinned Hub revisions, stages downloads before activation, verifies every regular file against a SHA-256 manifest, and places artifacts under Application Support by default. The worker is offline-only, receives broker-owned bytes or bounded derived text, and checks the manifest again before loading. Indexing and query-time search use the same selected embedding space; an unavailable provider fails closed instead of silently switching spaces. PaddleOCR-VL is skipped on macOS because its upstream runtime currently excludes macOS CPU/Apple silicon, so native Vision OCR remains the supported path.
 
-## What is deliberately NOT here yet
+## Media and transcription
 
-- OCR / speech / video sampling (Stage E) — not started.
-- LLM-assisted classification — the seam exists (Scheduler slots +
-  ClassifierContract wall) but no LLM runs; tag quality is Vision + rules.
-- ANN index — `SearchService` linear-scans the encrypted `embeddings` table; fine for <100k docs, will need `sqlite-vec` or HNSW for larger libraries.
-- GUI folder-picker flow — SwiftUI shell builds; bookmark flow unexercised.
+Media containers cross the broker boundary as complete bounded snapshots. Audio is decoded to PCM before the speech provider sees it. Local Whisper is opt-in in the app and only activates when the configured executable/model passes preflight; the app does not silently download a model.
 
-Honest gaps are tracked in the README status table.
+The processing identity includes the ASR provider/model generation. Provider failures remain retryable, retained older transcripts are hidden while the file is pending, successful retries replace the transcript, and a definitive no-transcript result may clear the old generation.
+
+## Security-scoped folders
+
+The app stores user-selected read-only security-scoped bookmarks. Missing, corrupt, or stale bookmark data fails closed and the source is marked as needing reauthorization.
+
+For live indexing, the app resolves each active watched root before starting the coordinator and retains the resulting `SecurityScopedBookmarkLease` for the coordinator lifetime. Restarting, pausing, removing, or reauthorizing a root drops/replaces the old lease.
+
+One OS-level validation remains before a daily-use release: run the packaged sandboxed app with a real folder selected through `NSOpenPanel`, quit/relaunch, then confirm a later FSEvent can still reopen and reindex the folder. Hosted CI cannot manufacture the genuine App Sandbox extension token created by that human picker flow. This final smoke is tracked in #44.
+
+## Verification
+
+The normal verification stack includes:
+
+```bash
+swift build
+swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+swift test
+swift build -c release
+BUILD_DIR="$(swift build -c release --show-bin-path)"
+bash scripts/e2e_local.sh "$BUILD_DIR/librarian-cli"  # the fixture script creates a temporary key
+scripts/package_app.sh --xcode --install
+python3 scripts/audit_entitlements.py /Applications/PrivateLibrarian.app --expect-hardened
+sandbox-exec -f <(printf '(version 1)\n(allow default)\n(deny network*)\n') \
+  python3 scripts/network_negative_probe.py
+```
+
+See `docs/VERIFICATION.md` for the detailed checks and current receipts.
+
+## Still intentionally limited
+
+- The project is pre-1.0 and does not claim a hardened stable release yet.
+- Local semantic quality depends on the optional provider/model installed on the host.
+- The real Whisper integration test is host-conditional because hosted CI does not ship the local runtime/model.
+- Search currently uses straightforward catalog scans for vectors rather than a dedicated ANN index at very large scale.
+- The final packaged-app bookmark relaunch/FSEvent smoke in #44 is still required before calling the sandbox permission lifecycle fully proven.
+
+Security bugs should be reported through the private process described in the repository-root `SECURITY.md`, not through a public issue containing exploit details.

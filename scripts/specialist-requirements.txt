@@ -1,0 +1,11 @@
+# Shared isolated runtime for the optional specialist stack.
+# The base model-requirements file supplies torch, transformers, Pillow, NumPy,
+# and huggingface_hub; these additions cover Transformers loading/offload APIs.
+-r model-requirements.txt
+accelerate==1.12.0
+safetensors==0.8.0
+
+# PaddleOCR-VL is intentionally not installed by this macOS package. The
+# upstream runtime currently requires supported GPU/architecture combinations
+# that exclude macOS CPU/Apple silicon; setup_models.sh skips that checkpoint
+# on macOS and the app keeps native Vision OCR as its supported path.

@@ -39,3 +39,4 @@ __pycache__/
 
 # Downloaded ML models. Provision them locally with the scripts in scripts/.
 Models/
+.model-runtime/

@@ -11,14 +11,18 @@ import AppKit
 ///  1. VNClassifyImageRequest — ~1k ImageNet-style labels (e.g. "cat", "beach")
 ///  2. VNGenerateImageFeaturePrintRequest — compact embedding for visual dedup / similarity
 ///
-/// Both are bounded reads through SourceBroker (O_RDONLY|O_NOFOLLOW) so
-/// symlinks are never followed. Failures return nil — never crash indexing.
+/// The broker supplies complete image-container bytes using
+/// O_RDONLY|O_NOFOLLOW and an explicit fail-closed cap. Failures return nil —
+/// never crash indexing.
 public struct VisionImageAnalyzer: Sendable {
 
-    public static let revision = "vision-1.0"
-    /// Max bytes to read for Vision. 8 MiB default covers most photos;
-    /// larger images are truncated — Vision still classifies the header window.
-    public static let maxVisionBytes: Int64 = 8 * 1024 * 1024
+    public static let revision = "vision-1.2-classify-feature"
+    /// Maximum compressed image-container size accepted by the decoder path.
+    /// This is deliberately above the old 8 MiB evidence-read cap; containers
+    /// are either passed whole or rejected, never prefix-decoded.
+    public static let maxImageContainerBytes: Int64 = 256 * 1024 * 1024
+    @available(*, deprecated, message: "Use maxImageContainerBytes; decoder inputs are complete containers")
+    public static let maxVisionBytes: Int64 = maxImageContainerBytes
 
     public struct Result: Sendable {
         /// Top labels sorted by confidence desc, filtered to confidence >= threshold.
@@ -27,14 +31,16 @@ public struct VisionImageAnalyzer: Sendable {
         public let featurePrint: Data?
         /// VNFeaturePrint revision string for invalidation.
         public let featureRevision: String
+        /// Bounded OCR text from the same broker-supplied image bytes.
+        public let recognizedText: String?
     }
 
     public init() {}
 
-    /// Analyze an image file through the read-only broker.
-    /// Returns nil if the file cannot be read or Vision produces no result.
+    /// Compatibility wrapper for existing source-path callers. The path is
+    /// consumed only by SourceBroker; Vision receives broker-owned bytes.
     public func analyze(path: String, broker: SourceBroker) -> Result? {
-        guard let data = try? broker.boundedRead(path, limit: Self.maxVisionBytes), !data.isEmpty else {
+        guard let data = try? broker.completeSnapshot(path, maxBytes: Self.maxImageContainerBytes), !data.isEmpty else {
             return nil
         }
         return analyze(data: data)
@@ -42,13 +48,22 @@ public struct VisionImageAnalyzer: Sendable {
 
     /// Analyze raw image data (for tests / in-memory callers).
     /// Batched: single VNImageRequestHandler decode for both classify + feature-print (halves ANE work).
-    public func analyze(data: Data) -> Result? {
-        guard !data.isEmpty else { return nil }
+    public func analyze(data: Data, includeOCR: Bool = true) -> Result? {
+        guard !data.isEmpty, data.count <= Self.maxImageContainerBytes else { return nil }
         let handler = VNImageRequestHandler(data: data, options: [:])
         let classifyReq = VNClassifyImageRequest()
         let fpReq = VNGenerateImageFeaturePrintRequest()
+        let textReq: VNRecognizeTextRequest? = {
+            guard includeOCR else { return nil }
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .fast
+            request.usesLanguageCorrection = false
+            return request
+        }()
+        var requests: [VNRequest] = [classifyReq, fpReq]
+        if let textReq { requests.append(textReq) }
         do {
-            try handler.perform([classifyReq, fpReq])
+            try handler.perform(requests)
         } catch {
             return nil
         }
@@ -71,15 +86,21 @@ public struct VisionImageAnalyzer: Sendable {
             }
             return nil
         }()
-        if classifications.isEmpty && fp == nil { return nil }
+        let recognizedText = (textReq?.results?.compactMap { $0.topCandidates(1).first?.string }
+            .joined(separator: " ") ?? "").prefix(20_000)
+        let text = recognizedText.isEmpty ? nil : String(recognizedText)
+        if classifications.isEmpty && fp == nil && text == nil { return nil }
         return Result(classifications: classifications,
                       featurePrint: fp?.data,
-                      featureRevision: fp?.revision ?? Self.revision)
+                      featureRevision: fp?.revision ?? Self.revision,
+                      recognizedText: text)
     }
 
     // MARK: - Vision requests (single-request helpers for SearchService.visualSearch + tests)
 
     static func classify(data: Data, topK: Int = 8, threshold: Float = 0.08) -> [(String, Float)] {
+        guard !data.isEmpty, data.count <= maxImageContainerBytes, topK > 0,
+              threshold.isFinite else { return [] }
         let handler = VNImageRequestHandler(data: data, options: [:])
         let req = VNClassifyImageRequest()
         do {
@@ -97,6 +118,7 @@ public struct VisionImageAnalyzer: Sendable {
     struct FPBox { let data: Data; let revision: String }
 
     static func featurePrint(data: Data) -> FPBox? {
+        guard !data.isEmpty, data.count <= maxImageContainerBytes else { return nil }
         let handler = VNImageRequestHandler(data: data, options: [:])
         let req = VNGenerateImageFeaturePrintRequest()
         do {
