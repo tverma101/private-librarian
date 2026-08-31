@@ -13,23 +13,30 @@ struct PrivateLibrarianApp: App {
 
     var body: some Scene {
         WindowGroup("Private Librarian", id: "main") {
-            MagicContentView()
+            CleanerHomeView()
                 .environmentObject(model)
-                .frame(minWidth: 900, minHeight: 560)
+                .frame(minWidth: 720, minHeight: 600)
                 .onReceive(NotificationCenter.default.publisher(
                     for: NSApplication.willTerminateNotification)) { _ in
                     model.shutdown()
                 }
         }
-        .defaultSize(width: 1100, height: 720)
+        .defaultSize(width: 820, height: 760)
         .commands {
             CommandGroup(after: .sidebar) {
                 Button("Add Source Folder…") { model.addSourceFolder() }
                     .keyboardShortcut("o")
             }
         }
+        WindowGroup("Advanced Library", id: "advanced-library") {
+            MagicContentView()
+                .environmentObject(model)
+                .frame(minWidth: 900, minHeight: 560)
+        }
+        .defaultSize(width: 1100, height: 720)
+
         Settings {
-            LibrarianSettingsView()
+            SimpleSettingsView()
                 .environmentObject(model)
         }
     }
