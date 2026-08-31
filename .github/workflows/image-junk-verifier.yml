@@ -27,6 +27,7 @@ jobs:
           else
             python3 scripts/apply_image_junk_integration.py
           fi
+          python3 scripts/tune_image_junk.py
 
       - name: Validate diff
         run: git diff --check
