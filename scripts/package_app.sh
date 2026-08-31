@@ -21,14 +21,17 @@ VERSION="${APP_VERSION:-}"
 BUILD_VERSION="${APP_BUILD_VERSION:-1}"
 APP_SUPPORT_DIR="${LIBRARIAN_APP_SUPPORT_DIR:-$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian}"
 MODEL_SOURCE="${LIBRARIAN_MODELS_DIR:-$APP_SUPPORT_DIR/Models}"
+SPECIALIST_MODEL_SOURCE="${LIBRARIAN_SPECIALIST_MODELS_DIR:-$MODEL_SOURCE/specialists}"
 RUNTIME_SOURCE="${LIBRARIAN_MODEL_RUNTIME_DIR:-$APP_SUPPORT_DIR/model-runtime}"
 INCLUDE_MODELS=0
+INCLUDE_SPECIALISTS=0
 INCLUDE_RUNTIME=0
 MAKE_DMG=1
 INSTALL_APP=0
 OPEN_APP=0
 POSITIONAL_BUILD_DIR=0
 BUILD_SYSTEM_EXPLICIT=0
+SPECIALIST_DIR_EXPLICIT=0
 if [ -n "${LIBRARIAN_BUILD_SYSTEM:-}" ]; then
     BUILD_SYSTEM_EXPLICIT=1
 fi
@@ -59,6 +62,8 @@ Options:
   --build-version VALUE   CFBundleVersion (default: 1)
   --models-dir PATH       verified model root to bundle with --include-models
   --include-models        include both verified wired Python checkpoints
+  --specialists-dir PATH  verified specialist root to bundle with --include-specialists
+  --include-specialists    include every verified specialist checkpoint found there
   --runtime-dir PATH      isolated Python runtime to bundle with --include-runtime
   --include-runtime       include the optional Python runtime in Resources
   --no-dmg                 keep the signed .app in .build/package-stage
@@ -70,6 +75,7 @@ Environment:
   CODESIGN_IDENTITY, DEVELOPMENT_TEAM, APP_VERSION, APP_BUILD_VERSION,
   LIBRARIAN_BUILD_SYSTEM, LIBRARIAN_DIST_DIR, LIBRARIAN_PACKAGE_STAGE_DIR,
   LIBRARIAN_APP_SUPPORT_DIR,
+  LIBRARIAN_MODELS_DIR, LIBRARIAN_SPECIALIST_MODELS_DIR,
   LIBRARIAN_XCODE_DERIVED_DATA_DIR, LIBRARIAN_XCODE_ARCHIVE_DIR,
   LIBRARIAN_XCODE_CONFIGURATION, LIBRARIAN_XCODE_DESTINATION,
   LIBRARIAN_XCODE_DEVELOPMENT_TEAM
@@ -121,10 +127,23 @@ while (($#)); do
         --models-dir)
             [ "$#" -ge 2 ] || { echo "--models-dir needs a path" >&2; exit 2; }
             MODEL_SOURCE="$2"
+            if [ "$SPECIALIST_DIR_EXPLICIT" -eq 0 ]; then
+                SPECIALIST_MODEL_SOURCE="$MODEL_SOURCE/specialists"
+            fi
             shift 2
             ;;
         --include-models)
             INCLUDE_MODELS=1
+            shift
+            ;;
+        --specialists-dir)
+            [ "$#" -ge 2 ] || { echo "--specialists-dir needs a path" >&2; exit 2; }
+            SPECIALIST_MODEL_SOURCE="$2"
+            SPECIALIST_DIR_EXPLICIT=1
+            shift 2
+            ;;
+        --include-specialists)
+            INCLUDE_SPECIALISTS=1
             shift
             ;;
         --runtime-dir)
@@ -237,6 +256,10 @@ case "$MODEL_SOURCE" in
     /*) ;;
     *) MODEL_SOURCE="$ROOT_DIR/$MODEL_SOURCE" ;;
 esac
+case "$SPECIALIST_MODEL_SOURCE" in
+    /*) ;;
+    *) SPECIALIST_MODEL_SOURCE="$ROOT_DIR/$SPECIALIST_MODEL_SOURCE" ;;
+esac
 case "$RUNTIME_SOURCE" in
     /*) ;;
     *) RUNTIME_SOURCE="$ROOT_DIR/$RUNTIME_SOURCE" ;;
@@ -326,28 +349,41 @@ fi
     exit 1
 }
 
-mkdir -p "$OUT_DIR" "$STAGE_DIR"
+mkdir -p "$ROOT_DIR/.build" "$OUT_DIR" "$STAGE_DIR"
 APP_BUNDLE="$STAGE_DIR/$APP_BUNDLE_NAME"
 RESOURCES="$APP_BUNDLE/Contents/Resources"
 MACOS="$APP_BUNDLE/Contents/MacOS"
 DMG_PATH="$OUT_DIR/PrivateLibrarian-$VERSION.dmg"
+DMG_SOURCE_DIR=""
+
+cleanup_dmg_source() {
+    if [ -n "$DMG_SOURCE_DIR" ] && [ -d "$DMG_SOURCE_DIR" ]; then
+        rm -rf "$DMG_SOURCE_DIR"
+    fi
+}
+trap cleanup_dmg_source EXIT
 
 # `dist/` is a release-output directory, not a second installation location.
-# Move only exact generated app names from the old packager to an ignored,
-# recoverable archive before creating the new DMG.
+# Move any old app with this bundle identifier from the old packager to an
+# ignored, recoverable archive before creating the new DMG. Names are not a
+# safe discriminator because Finder copies and older scripts used variants.
 LEGACY_ARCHIVE_DIR=""
-for stale_app in "$OUT_DIR/$APP_BUNDLE_NAME" "$OUT_DIR/LibrarianApp.app"; do
-    if [ -e "$stale_app" ]; then
+while IFS= read -r -d '' stale_app; do
+    [ "$stale_app" = "$APP_BUNDLE" ] && continue
+    bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+        "$stale_app/Contents/Info.plist" 2>/dev/null || true)"
+    if [ "$bundle_id" = "$BUNDLE_IDENTIFIER" ]; then
         if [ -z "$LEGACY_ARCHIVE_DIR" ]; then
             LEGACY_ARCHIVE_DIR="$(mktemp -d "$ROOT_DIR/.build/private-librarian-legacy-dist.XXXXXX")"
         fi
         mv "$stale_app" "$LEGACY_ARCHIVE_DIR/"
         echo "moved stale generated bundle to: $LEGACY_ARCHIVE_DIR/$(basename "$stale_app")"
     fi
-done
+done < <(find "$OUT_DIR" -maxdepth 1 \( -type d -o -type l \) -name '*.app' -print0)
 
 MODEL_PYTHON=""
-if [ "$INCLUDE_MODELS" -eq 1 ]; then
+SPECIALIST_MODELS=()
+if [ "$INCLUDE_MODELS" -eq 1 ] || [ "$INCLUDE_SPECIALISTS" -eq 1 ]; then
     MODEL_PYTHON="${LIBRARIAN_MODEL_PYTHON:-}"
     if [ -z "$MODEL_PYTHON" ] && [ -x "$RUNTIME_SOURCE/bin/python3" ]; then
         MODEL_PYTHON="$RUNTIME_SOURCE/bin/python3"
@@ -359,9 +395,44 @@ if [ "$INCLUDE_MODELS" -eq 1 ]; then
         echo "cannot verify models: set LIBRARIAN_MODEL_PYTHON or install Python 3" >&2
         exit 1
     }
-    # Validate all large inputs before replacing the current generated app.
-    "$MODEL_PYTHON" "$ROOT_DIR/scripts/provision_image_models.py" \
-        --all --verify-only --models-dir "$MODEL_SOURCE"
+    # Validate all requested large inputs before replacing the current
+    # generated app.
+    if [ "$INCLUDE_MODELS" -eq 1 ]; then
+        "$MODEL_PYTHON" "$ROOT_DIR/scripts/provision_image_models.py" \
+            --all --verify-only --models-dir "$MODEL_SOURCE"
+    fi
+    if [ "$INCLUDE_SPECIALISTS" -eq 1 ]; then
+        for model in \
+            siglip2-so400m-naflex \
+            dinov3-vitb16-lvd1689m \
+            paddleocr-vl-1.6 \
+            minicpm-v-4.6 \
+            ling-3.0-tiny \
+            lfm2.5-vl-3b \
+            internvl3.5-4b \
+            mimo-vl-7b-rl-2508; do
+            model_path="$SPECIALIST_MODEL_SOURCE/$model"
+            if [ ! -e "$model_path" ] && [ ! -L "$model_path" ]; then
+                continue
+            fi
+            if [ "$(uname -s)" = "Darwin" ] && [ "$model" = "paddleocr-vl-1.6" ]; then
+                echo "skipping unsupported macOS specialist checkpoint: $model" >&2
+                continue
+            fi
+            if [ ! -d "$model_path" ] || [ -L "$model_path" ]; then
+                echo "specialist checkpoint is not a real directory: $model_path" >&2
+                exit 1
+            fi
+            "$MODEL_PYTHON" "$ROOT_DIR/scripts/provision_specialist_models.py" \
+                --model "$model" --verify-only --models-dir "$SPECIALIST_MODEL_SOURCE"
+            SPECIALIST_MODELS+=("$model")
+        done
+        if [ "${#SPECIALIST_MODELS[@]}" -eq 0 ]; then
+            echo "--include-specialists requested, but no specialist checkpoints were found in: $SPECIALIST_MODEL_SOURCE" >&2
+            echo "Provision one with: scripts/setup_models.sh --specialist-profile embeddings" >&2
+            exit 1
+        fi
+    fi
 fi
 
 if [ "$INCLUDE_RUNTIME" -eq 1 ]; then
@@ -376,6 +447,9 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$MACOS" "$RESOURCES/scripts"
 install -m 0555 "$BUILD_BINARY" "$MACOS/$APP_EXECUTABLE"
 install -m 0444 "$ROOT_DIR/scripts/embed.py" "$RESOURCES/scripts/embed.py"
+if [ -f "$ROOT_DIR/scripts/specialist.py" ]; then
+    install -m 0444 "$ROOT_DIR/scripts/specialist.py" "$RESOURCES/scripts/specialist.py"
+fi
 
 # SwiftPM emits the target resource bundle beside the executable. Keep it in
 # the app even though the current UI only needs the executable; this preserves
@@ -389,6 +463,13 @@ if [ "$INCLUDE_MODELS" -eq 1 ]; then
     mkdir -p "$RESOURCES/Models"
     for model in clip-vit-base-patch32 all-MiniLM-L6-v2; do
         ditto "$MODEL_SOURCE/$model" "$RESOURCES/Models/$model"
+    done
+fi
+
+if [ "$INCLUDE_SPECIALISTS" -eq 1 ]; then
+    mkdir -p "$RESOURCES/Models/specialists"
+    for model in "${SPECIALIST_MODELS[@]}"; do
+        ditto "$SPECIALIST_MODEL_SOURCE/$model" "$RESOURCES/Models/specialists/$model"
     done
 fi
 
@@ -434,9 +515,16 @@ codesign --force --sign "$IDENTITY" --timestamp=none --options runtime \
 codesign --verify --deep --strict "$APP_BUNDLE"
 
 if [ "$MAKE_DMG" -eq 1 ]; then
+    DMG_SOURCE_DIR="$(mktemp -d "$ROOT_DIR/.build/private-librarian-dmg.XXXXXX")"
+    # Keep the app and the Applications alias at the volume root so Finder
+    # presents the conventional drag-to-install release surface. The signed
+    # bundle itself remains the only app payload and is removed from staging
+    # after the image is verified.
+    ditto "$APP_BUNDLE" "$DMG_SOURCE_DIR/$APP_BUNDLE_NAME"
+    ln -s /Applications "$DMG_SOURCE_DIR/Applications"
     rm -f "$DMG_PATH"
     hdiutil create -quiet -volname "Private Librarian $VERSION" \
-        -srcfolder "$APP_BUNDLE" -ov -format UDZO "$DMG_PATH" >/dev/null
+        -srcfolder "$DMG_SOURCE_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
     hdiutil verify -quiet "$DMG_PATH" >/dev/null
 fi
 

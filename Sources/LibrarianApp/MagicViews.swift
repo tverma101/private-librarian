@@ -147,6 +147,13 @@ struct MagicContentView: View {
                     Toggle("Local embeddings", isOn: $model.localEmbeddingsEnabled)
                         .help(model.isTier2Provisioned ? "On-device only — no network; runtime is checked before use" : "Run scripts/setup_models.sh first")
                         .disabled(!model.isTier2Provisioned)
+                    Picker("Model profile", selection: $model.localModelProfile) {
+                        Text("Fast · embeddings only").tag(LocalModelProfile.fast)
+                        Text("Balanced · specialist fallback").tag(LocalModelProfile.balanced)
+                        Text("Quality · heavy fallback allowed").tag(LocalModelProfile.quality)
+                    }
+                    .pickerStyle(.menu)
+                    .help("Models are local-only and never downloaded automatically. Heavy models run only on ambiguous files.")
                     Toggle("Local transcription", isOn: $model.localTranscriptionEnabled)
                         .help("Opt-in whisper.cpp transcription. Nothing is downloaded automatically.")
                         .disabled(!model.isLocalTranscriptionAvailable)
@@ -175,7 +182,16 @@ struct MagicContentView: View {
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { model.runSearch() }
                     Button("Search") { model.runSearch() }
-                    Button { model.refreshDashboard() } label: {
+                        .disabled(model.isSearching)
+                    if model.isSearching {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityLabel("Searching")
+                    }
+                    Button {
+                        model.refreshDashboard()
+                        model.refreshModelStatus()
+                    } label: {
                         Image(systemName: "arrow.clockwise")
                     }.help("Refresh catalog dashboard")
                         .accessibilityLabel("Refresh catalog dashboard")
@@ -198,6 +214,16 @@ struct MagicContentView: View {
                     CatalogMigrationBanner()
                         .padding(.horizontal, 20)
                         .padding(.top, 4)
+                }
+                if !model.searchResults.isEmpty {
+                    GroupBox("Search results") {
+                        ForEach(Array(model.searchResults.enumerated()), id: \.offset) { _, result in
+                            Text(result).textSelection(.enabled)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
                 }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
@@ -310,12 +336,6 @@ private struct OverviewView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            if !model.searchResults.isEmpty {
-                GroupBox("Search results") {
-                    ForEach(model.searchResults, id: \.self) { Text($0).textSelection(.enabled) }
-                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             LearnedRulesView()

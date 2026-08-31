@@ -16,6 +16,10 @@ import Darwin
 /// is verified offline by `embed --check`. Swift side is a thin, timeout-bounded
 /// subprocess wrapper with no path interpolation or shell.
 public struct LocalModelBridge: Sendable {
+    /// Keep helper requests bounded even when a caller bypasses SourceBroker.
+    /// The broker normally supplies a smaller complete snapshot for images.
+    public static let maxImageInputBytes = 64 * 1024 * 1024
+
     private final class BoundedDataBox: @unchecked Sendable {
         private let lock = NSLock()
         private let limit: Int
@@ -221,6 +225,7 @@ public struct LocalModelBridge: Sendable {
         }
 
         public func embedImageBytes(_ bytes: Data, timeout: TimeInterval = 20) -> (dim: Int, data: Data)? {
+            guard !bytes.isEmpty, bytes.count <= LocalModelBridge.maxImageInputBytes else { return nil }
             let b64 = bytes.base64EncodedString()
             guard let obj = call(["op": "image_b64", "data": b64], timeout: timeout),
                   let dim = obj["dim"] as? Int, dim == LocalModelBridge.expectedDimension(.clipImage),
@@ -269,6 +274,8 @@ public struct LocalModelBridge: Sendable {
     }
 
     private static func modelHasArtifacts(_ directory: URL, model: Model) -> Bool {
+        guard let values = try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              values.isDirectory == true, values.isSymbolicLink != true else { return false }
         let hasConfig = FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.json").path)
         let hasWeights = ["pytorch_model.bin", "model.safetensors", "tf_model.h5", "flax_model.msgpack"].contains {
             FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
@@ -320,18 +327,42 @@ public struct LocalModelBridge: Sendable {
               weightNames.contains(where: { expectedFiles[$0] != nil }) else { return false }
 
         let root = directory.resolvingSymlinksInPath().standardizedFileURL
+        var actualFiles = Set<String>()
         for (relative, value) in expectedFiles {
             guard let expected = value as? String,
                   expected.count == 64,
-                  expected.allSatisfy({ $0.isHexDigit }) else { return false }
+                  expected.allSatisfy({ $0.isHexDigit }),
+                  isSafeRelativePath(relative) else { return false }
             let path = directory.appendingPathComponent(relative)
                 .resolvingSymlinksInPath().standardizedFileURL
             guard path.path == root.path || path.path.hasPrefix(root.path + "/"),
                   let values = try? path.resourceValues(forKeys: [.isRegularFileKey]),
                   values.isRegularFile == true else { return false }
             if verifyHashes && sha256File(path) != expected.lowercased() { return false }
+            actualFiles.insert(relative)
         }
-        return true
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory.standardizedFileURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: []) else { return false }
+        let basePath = directory.standardizedFileURL.path
+        for case let file as URL in enumerator {
+            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isSymbolicLink != true else { return false }
+            guard values.isRegularFile == true else { continue }
+            let relative = String(file.standardizedFileURL.path.dropFirst(basePath.count + 1))
+            if relative == "provenance.json" || file.pathComponents.contains(".cache") { continue }
+            actualFiles.insert(relative)
+        }
+        return actualFiles == Set(expectedFiles.keys)
+    }
+
+    private static func isSafeRelativePath(_ relative: String) -> Bool {
+        guard !relative.isEmpty, !relative.hasPrefix("/"), !relative.contains("\\") else { return false }
+        let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+        return !components.isEmpty && components.allSatisfy { component in
+            !component.isEmpty && component != "." && component != ".."
+        }
     }
 
     static func sha256File(_ path: URL) -> String? {
@@ -365,7 +396,8 @@ public struct LocalModelBridge: Sendable {
     /// Embed raw image bytes via stdin (broker-only; helper never sees a raw path).
     /// Returned FileIdentity-agnostic: bytes already produced by SourceBroker.
     public static func embedImageBytes(_ bytes: Data, model: Model = .clipImage, timeout: TimeInterval = 20) -> (dim: Int, data: Data)? {
-        guard model == .clipImage, isProvisioned(model), !bytes.isEmpty else { return nil }
+        guard model == .clipImage, isProvisioned(model), !bytes.isEmpty,
+              bytes.count <= maxImageInputBytes else { return nil }
         guard let scriptsDir = scriptsDir() else { return nil }
         let embed = scriptsDir.appendingPathComponent("embed.py").path
         let result = runPython([embed, "--stdin-image", "--model", model.rawValue], input: bytes, timeout: timeout)
@@ -539,7 +571,10 @@ public struct LocalModelBridge: Sendable {
     /// Packaged apps cannot rely on the user's shell PATH, so the optional
     /// model runtime is also searched beside the app resources, in the repo's
     /// ignored `.model-runtime`, and in Application Support.
-    private static func pythonExecutable() -> URL? {
+    /// Resolve the same isolated runtime for every Python-backed capability.
+    /// SpecialistModelBridge uses this instead of falling back to a shell
+    /// Python that may not contain the installed model dependencies.
+    static func pythonExecutable() -> URL? {
         var candidates: [String] = []
         if let configured = ProcessInfo.processInfo.environment["LIBRARIAN_PYTHON"],
            !configured.isEmpty {

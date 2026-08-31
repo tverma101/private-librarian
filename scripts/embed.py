@@ -20,6 +20,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+import warnings
 from pathlib import Path
 
 import os
@@ -38,6 +39,10 @@ MODEL_HANDLERS = {
 }
 MODEL_DIMS = {"clip-vit-base-patch32": 512, "all-MiniLM-L6-v2": 384}
 PROVENANCE_SCHEMA = 2
+MAX_IMAGE_BYTES = 64 * 1024 * 1024
+MAX_IMAGE_PIXELS = 50_000_000
+MAX_IMAGE_EDGE = 16_384
+MAX_TEXT_BYTES = 256 * 1024
 MODEL_PROVENANCE = {
     "clip-vit-base-patch32": {
         "hf_id": "openai/clip-vit-base-patch32",
@@ -64,12 +69,21 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _safe_relative_path(relative: str) -> bool:
+    if not relative or relative.startswith("/") or "\\" in relative:
+        return False
+    parts = relative.split("/")
+    return all(part not in {"", ".", ".."} for part in parts)
+
+
 def _provenance_valid(model: str, verify_hashes: bool = False) -> bool:
     """Validate a provisioner's identity manifest before loading a checkpoint."""
     spec = MODEL_PROVENANCE.get(model)
     if spec is None:
         return False
     destination = MODELS_DIR / model
+    if not destination.is_dir() or destination.is_symlink():
+        return False
     try:
         record = json.loads((destination / "provenance.json").read_text())
     except Exception:
@@ -90,7 +104,8 @@ def _provenance_valid(model: str, verify_hashes: bool = False) -> bool:
         return False
     root = destination.resolve()
     for relative, expected in expected_files.items():
-        if not isinstance(relative, str) or not isinstance(expected, str):
+        if (not isinstance(relative, str) or not _safe_relative_path(relative)
+                or not isinstance(expected, str)):
             return False
         if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected.lower()):
             return False
@@ -103,6 +118,21 @@ def _provenance_valid(model: str, verify_hashes: bool = False) -> bool:
             return False
         if verify_hashes and _sha256_file(path) != expected.lower():
             return False
+    actual_files = set()
+    try:
+        for path in destination.rglob("*"):
+            if path.is_symlink():
+                return False
+            if not path.is_file():
+                continue
+            relative = path.relative_to(destination).as_posix()
+            if relative == "provenance.json" or ".cache" in path.relative_to(destination).parts:
+                continue
+            actual_files.add(relative)
+    except OSError:
+        return False
+    if actual_files != set(expected_files):
+        return False
     return True
 
 
@@ -173,6 +203,8 @@ def _embed_image_bytes(data: bytes, model: str = "clip-vit-base-patch32"):
         return {"error": f"unknown image model {model!r}"}
     if not data:
         return {"error": "empty stdin for image"}
+    if len(data) > MAX_IMAGE_BYTES:
+        return {"error": "image payload exceeds the 64 MiB embedding ceiling"}
     if not _require_model(model):
         return {"error": f"model is not provenance-verified: {model} — run provision_image_models.py --verify-only"}
     try:
@@ -182,7 +214,17 @@ def _embed_image_bytes(data: bytes, model: str = "clip-vit-base-patch32"):
 
         clip_model, clip_proc = _load_clip()
         try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                img = Image.open(io.BytesIO(data))
+                width, height = img.size
+                if width <= 0 or height <= 0 or width > MAX_IMAGE_EDGE or height > MAX_IMAGE_EDGE:
+                    raise ValueError("image dimensions exceed the embedding ceiling")
+                if width * height > MAX_IMAGE_PIXELS:
+                    raise ValueError("image pixel count exceeds the embedding ceiling")
+                img.load()
+                img = img.convert("RGB")
+                img.load()
         except Exception as e:
             return {"error": f"cannot decode image bytes: {e}"}
         with torch.no_grad():
@@ -205,6 +247,8 @@ def _embed_text_bytes(data: bytes, model: str = "all-MiniLM-L6-v2"):
     """Embed text supplied on stdin (argv-safe)."""
     if model != "all-MiniLM-L6-v2":
         return {"error": f"unknown text model {model!r}"}
+    if len(data) > MAX_TEXT_BYTES:
+        return {"error": "text payload exceeds the 256 KiB embedding ceiling"}
     if not _require_model(model):
         return {"error": f"model is not provenance-verified: {model} — run provision_image_models.py --verify-only"}
     text = data.decode("utf-8", errors="replace").strip()
@@ -224,6 +268,8 @@ def _embed_clip_text_bytes(data: bytes):
     dest = MODELS_DIR / "clip-vit-base-patch32"
     if not _require_model("clip-vit-base-patch32"):
         return {"error": "model is not provenance-verified: clip-vit-base-patch32 — run provision_image_models.py --verify-only"}
+    if len(data) > MAX_TEXT_BYTES:
+        return {"error": "text payload exceeds the 256 KiB embedding ceiling"}
     text = data.decode("utf-8", errors="replace").strip()
     if not text:
         return {"error": "empty text on stdin"}
@@ -279,13 +325,13 @@ def main():
 
     if args.stdin_image:
         model = args.model or "clip-vit-base-patch32"
-        data = sys.stdin.buffer.read()
+        data = sys.stdin.buffer.read(MAX_IMAGE_BYTES + 1)
         res = _embed_image_bytes(data, model=model)
         print(json.dumps(res))
         sys.exit(0 if "vector" in res else 1)
 
     if args.stdin_clip_text:
-        data = sys.stdin.buffer.read()
+        data = sys.stdin.buffer.read(MAX_TEXT_BYTES + 1)
         res = _embed_clip_text_bytes(data)
         print(json.dumps(res))
         sys.exit(0 if "vector" in res else 1)
@@ -317,7 +363,7 @@ def main():
             data_field = req.get("data", "")
             if op == "image_b64":
                 try:
-                    b = base64.b64decode(data_field)
+                    b = base64.b64decode(data_field, validate=True)
                 except Exception as e:
                     print(json.dumps({"error": f"bad base64: {e}"}), flush=True)
                     continue
@@ -335,7 +381,7 @@ def main():
 
     if args.stdin_text:
         model = args.model or "all-MiniLM-L6-v2"
-        data = sys.stdin.buffer.read()
+        data = sys.stdin.buffer.read(MAX_TEXT_BYTES + 1)
         res = _embed_text_bytes(data, model=model)
         print(json.dumps(res))
         sys.exit(0 if "vector" in res else 1)

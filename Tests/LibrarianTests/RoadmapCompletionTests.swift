@@ -235,7 +235,7 @@ final class RoadmapCompletionTests: XCTestCase {
     func testRootSlashScopeOperationsHandleAllAbsoluteRows() throws {
         let catalog = try TestSupport.makeCatalog()
         try seedFile(catalog, id: "absolute-a", path: "/tmp/absolute-a")
-        try seedFile(catalog, id: "absolute-b", path: "/Users/absolute-b")
+        try seedFile(catalog, id: "absolute-b", path: "/Users/example/absolute-b")
 
         try catalog.markRootUnscoped(root: "/")
         XCTAssertTrue(try catalog.allFiles().allSatisfy { $0.status == "unscoped" })

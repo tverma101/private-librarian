@@ -167,6 +167,32 @@ are written atomically, retain a SHA-256 provenance manifest, and omit unused
 TensorFlow/Flax/ONNX exports. `--verify-only` is offline and never contacts
 Hugging Face. The app itself never downloads or installs anything.
 
+For the final local specialist stack, use an explicit profile:
+
+```bash
+# SigLIP2 semantic search + DINOv3 visual similarity
+./scripts/setup_models.sh --specialist-profile embeddings
+
+# Add the first local VLM fallback (large download)
+./scripts/setup_models.sh --specialist-profile balanced
+
+# Check installed specialist snapshots and runtime without network access
+SPECIALIST_PYTHON="$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/model-runtime/bin/python3"
+LIBRARIAN_SPECIALIST_MODELS_DIR="$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models/specialists" \
+  "$SPECIALIST_PYTHON" scripts/specialist.py --check
+```
+
+`embeddings` is the recommended starting profile. `balanced` and `quality` are
+explicit larger downloads; `quality` is never selected automatically. On the
+macOS target, setup skips PaddleOCR-VL because its upstream runtime currently
+does not support macOS CPU/Apple silicon, so native Vision OCR remains the
+document-OCR path. Use `--specialist-runtime-only` to repair/update the shared
+runtime without downloading checkpoints, `--specialist-models-only` only when
+the runtime already exists, and `--force` when a verified checkpoint must be
+replaced deliberately. Specialist downloads are pinned to the revisions in the
+registry, verified with SHA-256 manifests, staged before activation, and kept
+offline after provisioning.
+
 Local transcription is opt-in in the app. It only becomes available when the configured local Whisper executable and model pass preflight. Nothing is downloaded automatically.
 
 ## One remaining release validation

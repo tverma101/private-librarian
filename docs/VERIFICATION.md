@@ -142,6 +142,26 @@ into place. Existing incomplete or superseded directories are preserved with
 a `.previous-*` name. The app sets the Hugging Face and Transformers offline
 flags for every helper process.
 
+The specialist setup is separate and explicit:
+
+```bash
+./scripts/setup_models.sh --specialist-profile embeddings
+./scripts/setup_models.sh --specialist-profile balanced
+SPECIALIST_PYTHON="$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/model-runtime/bin/python3"
+LIBRARIAN_SPECIALIST_MODELS_DIR="$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models/specialists" \
+  "$SPECIALIST_PYTHON" scripts/specialist.py --check
+"$SPECIALIST_PYTHON" scripts/specialist.py --runtime-check siglip2-so400m-naflex
+python3 scripts/test_specialist_contract.py
+```
+
+The embeddings profile is the recommended macOS baseline. Balanced and quality
+are larger explicit downloads; quality is never automatic. PaddleOCR-VL is
+reported and skipped on macOS because its [upstream runtime documentation](https://paddlepaddle.github.io/PaddleX/3.3/en/pipeline_usage/tutorials/ocr_pipelines/PaddleOCR-VL.html)
+currently excludes CPU and Arm, so this app uses native Vision OCR there. A
+specialist `--check` is structural and offline; the app's specialist preflight
+also imports the required runtime modules before enabling a provider. A
+verified checkpoint is not downloaded again unless `--force` is supplied.
+
 Useful commands include:
 
 ```bash
@@ -207,14 +227,16 @@ A green hosted CI run verifies the code paths and synthetic regression suite. It
 
 ## Current local audit receipt
 
-On 2026-08-30, the canonical fix/tier2-incremental-ci checkout passed the full
-local Swift suite with 159 tests and 0 failures after the scalable discovery,
-semantic-compaction, access-backoff, cancellation, and Keychain lifecycle
-changes. Targeted live coordinator coverage passed all 19 tests. The scale
-receipts use synthetic data: a 5,000-file large-directory traversal, bounded
-discovery batches, and the existing 100,000-event live-storm test. No 24 GB
-browser-tree RSS run was completed in this audit, so the project does not claim
-that benchmark.
+On 2026-08-30, the integrated PR #57 review checkout passed the full local
+Swift suite with 169 tests and 0 failures after the scalable discovery,
+semantic-compaction, access-backoff, cancellation, Keychain lifecycle, and
+specialist-router changes. The specialist bridge tests cover configured-root
+selection, exact-manifest rejection, and the unsupported macOS Paddle path;
+the specialist contract fixture suite passed separately. Targeted live
+coordinator coverage passed all 19 tests. The scale receipts use synthetic
+data: a 5,000-file large-directory traversal, bounded discovery batches, and
+the existing 100,000-event live-storm test. No 24 GB browser-tree RSS run was
+completed in this audit, so the project does not claim that benchmark.
 
 The Xcode-backed packaging path also passed: `xcodebuild archive` produced a
 generic macOS universal (`arm64` + `x86_64`) `LibrarianApp` executable and dSYM;

@@ -8,19 +8,24 @@ public struct SearchService: Sendable {
 
     let catalog: Catalog
     private let enableLocalEmbeddings: Bool
+    public let localModelProfile: LocalModelProfile
     public let embeddingProvider: any EmbeddingProvider
     private static let vectorBatchSize: Int64 = 512
 
-    public init(catalog: Catalog, enableLocalEmbeddings: Bool? = nil, embeddingProvider: (any EmbeddingProvider)? = nil) {
+    public init(catalog: Catalog, enableLocalEmbeddings: Bool? = nil,
+                localModelProfile: LocalModelProfile = .fast,
+                embeddingProviderKind: String? = nil,
+                embeddingProvider: (any EmbeddingProvider)? = nil) {
         self.catalog = catalog
         let enabled = enableLocalEmbeddings ?? UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
         self.enableLocalEmbeddings = enabled
+        self.localModelProfile = localModelProfile
         if let p = embeddingProvider {
             self.embeddingProvider = p
-        } else if enabled, CoreMLMobileCLIPProvider.isAvailable {
-            self.embeddingProvider = CoreMLMobileCLIPProvider()
         } else {
-            self.embeddingProvider = LocalModelEmbeddingProvider()
+            self.embeddingProvider = LocalEmbeddingProviderSelection.make(
+                enabled: enabled,
+                requestedProviderKind: embeddingProviderKind)
         }
     }
 

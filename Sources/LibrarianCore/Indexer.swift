@@ -29,6 +29,9 @@ public final class Indexer: @unchecked Sendable {
         /// random access. Oversize media is analyzed no further.
         public var maxMediaSnapshotBytes: Int64 = 256 * 1024 * 1024
         public var embeddingProviderKind: String? = nil
+        /// Cheap-first specialist routing. Fast never uses generative models;
+        /// balanced/quality may escalate only ambiguous files.
+        public var localModelProfile: LocalModelProfile = .fast
         /// Absolute source prefixes that are intentionally outside this scan.
         /// Exclusions affect enumeration and missing-file reconciliation but
         /// never delete or mutate existing catalog rows.
@@ -96,6 +99,9 @@ public final class Indexer: @unchecked Sendable {
     private let pcmDecoder: any PCMDecoding
     public let embeddingProvider: any EmbeddingProvider
     private let embeddingAvailable: Bool
+    private let specialistBridge: SpecialistModelBridge?
+    private let specialistRouter: LocalModelRouter
+    private let availableSpecialistModelIDs: Set<String>
     private let metricsLock = NSLock()
     private var metrics = WorkMetrics()
     private var lastSimilarityMetrics = SimilarityMetrics()
@@ -134,9 +140,24 @@ public final class Indexer: @unchecked Sendable {
         self.scheduler = scheduler
         self.options = options
         self.evidence = EvidenceExtractor(broker: broker)
-        if let p = embeddingProvider { self.embeddingProvider = p }
-        else if let kind = options.embeddingProviderKind { self.embeddingProvider = EmbeddingProviderFactory.make(kind: kind) }
-        else { self.embeddingProvider = LocalModelEmbeddingProvider() }
+        // Specialist inference is strictly opt-in with local embeddings. Do
+        // not start a Python worker merely because model files happen to be
+        // installed on disk, and keep the zero-download path deterministic.
+        let availableSpecialists = options.enableLocalEmbeddings
+            ? SpecialistModelBridge.availableModelIDs() : []
+        let specialistBridge = options.enableLocalEmbeddings && !availableSpecialists.isEmpty
+            ? SpecialistModelBridge() : nil
+        self.specialistBridge = specialistBridge
+        self.specialistRouter = LocalModelRouter(profile: options.localModelProfile)
+        self.availableSpecialistModelIDs = availableSpecialists
+        if let p = embeddingProvider {
+            self.embeddingProvider = p
+        } else {
+            self.embeddingProvider = LocalEmbeddingProviderSelection.make(
+                enabled: options.enableLocalEmbeddings,
+                requestedProviderKind: options.embeddingProviderKind,
+                specialistBridge: specialistBridge)
+        }
         let learnedRules = (try? catalog.listRules()) ?? []
         // Preflight is a real subprocess/model-manifest check. Do not pay for
         // it when Tier-2 is disabled; this also keeps the zero-download path
@@ -164,7 +185,7 @@ public final class Indexer: @unchecked Sendable {
     /// Embedding-space version — derived from pinned HF SHAs + pipeline
     /// contract (processor revision, dim, poisoning prevention). Bump when any
     /// checkpoint SHA or embedding pipeline changes.
-    public static let embeddingSpaceVersion = "emb-v2:clip-3d74acf9|siglip-7fd15f06|mclip-71aa3e13|dino-ed25f3a3|minilm-1110a243|dim-512+384"
+    public static let embeddingSpaceVersion = "emb-v3:mclip-s0|siglip2-cc24074:1152|dinov3-5931719:768|minilm-1110a243:384"
     /// Full identity of the processing pipeline used for incremental invalidation.
     /// Includes embedding-space identity when Tier 2 is enabled so a model change
     /// forces at least one re-index of every file that carries an embedding.
@@ -181,11 +202,12 @@ public final class Indexer: @unchecked Sendable {
             parts.append("ocr:\(VisionOCR.revision)")
         }
         if options.enableLocalEmbeddings {
+            let prov = providerID ?? options.embeddingProviderKind ?? LocalModelEmbeddingProvider().providerID
             let clip = LocalModelBridge.isProvisioned(.clipImage) ? "clip:on" : "clip:off"
             let mini = LocalModelBridge.isProvisioned(.miniLMText) ? "minilm:on" : "minilm:off"
-            let prov = providerID ?? options.embeddingProviderKind ?? LocalModelEmbeddingProvider().providerID
             let runtime = embeddingRuntimeAvailable ? "runtime:on" : "runtime:off"
-            parts.append("tier2:\(clip),\(mini),\(runtime),\(embeddingSpaceVersion),provider:\(prov)")
+            let specialists = SpecialistModelBridge.availableModelIDs().sorted().joined(separator: ",")
+            parts.append("tier2:\(clip),\(mini),\(runtime),\(embeddingSpaceVersion),provider:\(prov),profile:\(options.localModelProfile.rawValue),specialists:\(specialists)")
         } else {
             parts.append("tier2:off")
         }
@@ -469,9 +491,10 @@ public final class Indexer: @unchecked Sendable {
 
         switch ident.kind {
         case .pdf:
-            if let pdfData = try? broker.completeSnapshot(path, maxBytes: 64 * 1024 * 1024),
-               let pdfText = PDFText.extract(data: pdfData) {
-                textContent = String(pdfText.prefix(200_000))
+            if let pdfData = try? broker.completeSnapshot(path, maxBytes: 64 * 1024 * 1024) {
+                if let pdfText = PDFText.extract(data: pdfData) {
+                    textContent = String(pdfText.prefix(200_000))
+                }
             }
         case .text:
             break
@@ -542,6 +565,46 @@ public final class Indexer: @unchecked Sendable {
                 metadata: metadata,
                 ocrText: textContent,
                 visionLabels: visionLabels.map { $0.0 })
+        }
+
+        // Optional specialist OCR is an escalation only. Native text/Vision OCR wins when
+        // it already produced useful text, and source paths are never sent to the model helper.
+        if options.enableLocalEmbeddings, options.localModelProfile != .fast,
+           let specialistBridge,
+           availableSpecialistModelIDs.contains(LocalModelStack.paddleOCR.id) {
+            let nativeText = textContent?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let documentLikeImage = ident.kind == .image && (
+                screenshotAssessment?.isScreenshot == true
+                || visionLabels.contains { label, _ in
+                    let lower = label.lowercased()
+                    return lower.contains("text") || lower.contains("document") || lower.contains("paper")
+                })
+            let pdfNeedsOCR = ident.kind == .pdf && VisionOCR.needsOCR(pdfText: textContent)
+            let nativeOCRSucceeded = !nativeText.isEmpty && !pdfNeedsOCR
+            let route = specialistRouter.route(
+                context: LocalModelRouteContext(
+                    kind: ident.kind, confidence: 0, hasUsefulText: !nativeText.isEmpty,
+                    nativeOCRSucceeded: nativeOCRSucceeded,
+                    isDocumentLikeImage: documentLikeImage),
+                availableModelIDs: availableSpecialistModelIDs)
+            if route.contains(where: { $0.id == LocalModelStack.paddleOCR.id }),
+               let bytes = imageBytes, !bytes.isEmpty {
+                recordWork { $0.ocrCalls += 1 }
+                let extensionName = (ident.path as NSString).pathExtension
+                let suffix = extensionName.isEmpty ? ".png" : ".\(extensionName)"
+                if let specialist = scheduler.perform(as: .heavy, {
+                    specialistBridge.recognizeDocument(bytes, suffix: suffix, timeout: 90)
+                }) {
+                    let recovered = specialist.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !recovered.isEmpty {
+                        if nativeText.isEmpty { textContent = recovered }
+                        else if !nativeText.contains(String(recovered.prefix(256))) {
+                            textContent = nativeText + "\n" + recovered
+                        }
+                        ocrExtractor = "paddleocr-vl-1.6"
+                    }
+                }
+            }
         }
 
         // MARK: Media lane — audio/video probe + gating + sparse video frames
@@ -642,6 +705,18 @@ public final class Indexer: @unchecked Sendable {
             }
             if stagedClip?.data.isEmpty == true { stagedClip = nil }
         }
+        var stagedDINO: EmbeddingVector? = nil
+        if options.enableLocalEmbeddings, ident.kind == .image,
+           let bytes = imageBytes, !bytes.isEmpty,
+           let specialistBridge,
+           availableSpecialistModelIDs.contains(LocalModelStack.dinov3.id) {
+            recordWork { $0.clipCalls += 1 }
+            stagedDINO = scheduler.perform(as: .medium) {
+                specialistBridge.embedDINOImage(bytes, timeout: 25)
+            }
+            if stagedDINO?.data.isEmpty == true { stagedDINO = nil }
+        }
+
         var stagedMiniLM: EmbeddingVector? = nil
         var stagedChunks: [(index: Int, data: Data, dim: Int)] = []
         if options.enableLocalEmbeddings,
@@ -662,11 +737,6 @@ public final class Indexer: @unchecked Sendable {
                 guard let vector, !vector.data.isEmpty else { return nil }
                 return vector
             }
-
-            // Compact before inference. Source-like files receive one bounded
-            // capsule, generated lock/map/minified output is excluded, and
-            // prose receives one primary representation plus a capped set of
-            // search chunks. Exact/FTS indexing still uses the original text.
             switch SemanticCompaction.strategy(path: ident.path, text: t) {
             case .skip:
                 break
@@ -682,6 +752,7 @@ public final class Indexer: @unchecked Sendable {
                     }
                 }
             }
+            if stagedMiniLM?.data.isEmpty == true { stagedMiniLM = nil }
         }
 
         // 3b. Classify (deterministic v1 + vision labels) under MEDIUM slot.
@@ -716,6 +787,69 @@ public final class Indexer: @unchecked Sendable {
                 }
             }
         }
+        // Only ambiguous results can wake generative specialists. Execute candidates in
+        // cheap-first order and stop as soon as one produces a good schema-valid answer.
+        if options.enableLocalEmbeddings,
+           var current = validatedClass,
+           current.confidence < 0.72,
+           let specialistBridge,
+           !availableSpecialistModelIDs.isEmpty {
+            let usefulText = !(textContent?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            let documentLikeImage = current.categories.contains("Image/Documents")
+                || screenshotAssessment?.isScreenshot == true
+            let route = specialistRouter.route(
+                context: LocalModelRouteContext(
+                    kind: ident.kind, confidence: current.confidence,
+                    hasUsefulText: usefulText,
+                    nativeOCRSucceeded: usefulText,
+                    isDocumentLikeImage: documentLikeImage),
+                availableModelIDs: availableSpecialistModelIDs)
+            let specialistEvidence = SpecialistEvidence(
+                kind: ident.kind.rawValue,
+                filename: (ident.path as NSString).lastPathComponent,
+                deterministicCategories: current.categories,
+                deterministicConfidence: current.confidence,
+                textSample: textContent,
+                visionLabels: visionLabels.map(\.0))
+            for model in route where current.confidence < 0.72 {
+                let result: SpecialistClassification?
+                switch model.capability {
+                case .textReasoning:
+                    result = scheduler.perform(as: .heavy) {
+                        specialistBridge.classifyText(model: model, evidence: specialistEvidence)
+                    }
+                case .visionFallback, .visionHeavyFallback:
+                    guard let bytes = imageBytes, !bytes.isEmpty else { continue }
+                    result = scheduler.perform(as: .heavy) {
+                        specialistBridge.classifyImage(bytes, model: model, evidence: specialistEvidence)
+                    }
+                case .imageSemantic, .visualSimilarity, .documentOCR:
+                    continue
+                }
+                guard let result else { continue }
+                var categories = current.categories
+                for category in result.categories
+                    where !categories.contains(category) && categories.count < ClassifierContract.maxCategories {
+                    categories.append(category)
+                }
+                let reasons = Array((current.reasonCodes
+                    + ["specialist:\(result.modelID)"]
+                    + result.reasons.map { "model:\($0)" })
+                    .prefix(ClassifierContract.maxReasonCodes))
+                let trial = Classification(
+                    fileID: current.fileID,
+                    categories: categories,
+                    description: result.description.isEmpty ? current.description : result.description,
+                    confidence: max(current.confidence, result.confidence),
+                    reasonCodes: reasons)
+                if let data = try? trial.jsonData(),
+                   let validated = ClassifierContract.validate(data) {
+                    current = validated
+                    validatedClass = validated
+                }
+            }
+        }
+
         let hashToRecord: Data? = {
             guard (try? Self.shouldHashCandidate(fileID: id, identity: ident, catalog: catalog)) == true else { return nil }
             return try? DuplicateDetector.sha256(path: ident.path, broker: broker)
@@ -819,6 +953,13 @@ public final class Indexer: @unchecked Sendable {
                         ON CONFLICT(file_id, model) DO UPDATE SET dim=excluded.dim, vector=excluded.vector
                         """, binds: [.text(id), .text(embeddingProvider.imageModelID), .int(Int64(emb.dim)), .blob(emb.data)])
                 }
+                if let dino = stagedDINO {
+                    try catalog.txRun("""
+                        INSERT INTO embeddings(file_id, model, dim, vector) VALUES(?,?,?,?)
+                        ON CONFLICT(file_id, model) DO UPDATE SET dim=excluded.dim, vector=excluded.vector
+                        """, binds: [.text(id), .text("image:\(SpecialistModelBridge.dinoSpaceID)"),
+                                      .int(Int64(dino.dim)), .blob(dino.data)])
+                }
                 if let tr = stagedTranscript, !tr.segments.isEmpty {
                     // Atomic replacement: the old generation's rows (and FTS
                     // entries) are deleted and the new ones inserted inside
@@ -882,7 +1023,7 @@ public final class Indexer: @unchecked Sendable {
                                     minimumScore: 0.50)
         ]
         let models = Set(nodes.flatMap { $0.embeddings.keys }).sorted()
-        for model in models {
+        for model in models where !model.contains("dinov3-visual") {
             adapters.append(EmbeddingEdgeAdapter(model: model,
                                                  scorer: CatalogEmbeddingSimilarityScorer(),
                                                  minimumScore: 0.75))

@@ -44,6 +44,13 @@ final class LibrarianModel: ObservableObject {
         let bookmarkData: Data?
     }
 
+    private struct Tier2Readiness: Sendable {
+        let coreML: Bool
+        let legacyClip: Bool
+        let legacyMiniLM: Bool
+        let specialistIDs: Set<String>
+    }
+
     @Published var sources: [SourceFolder] = []
     @Published var statusLines: [String] = []
     @Published var searchResults: [String] = []
@@ -65,6 +72,9 @@ final class LibrarianModel: ObservableObject {
     @Published private(set) var sourcesNeedingReauthorization: Set<String> = []
     @Published private(set) var catalogMigrationRequired = false
     @Published private(set) var catalogMigrationAttempted = false
+    @Published private(set) var isTier2Provisioned = false
+    @Published private(set) var tier2Status = "Checking local model readiness…"
+    @Published private(set) var isSearching = false
     @Published var localTranscriptionEnabled: Bool {
         didSet {
             UserDefaults.standard.set(localTranscriptionEnabled, forKey: AppLocalTranscription.enabledDefaultsKey)
@@ -80,25 +90,14 @@ final class LibrarianModel: ObservableObject {
             refreshDashboard()
         }
     }
+    @Published var localModelProfile: LocalModelProfile {
+        didSet {
+            UserDefaults.standard.set(localModelProfile.rawValue, forKey: "local-model-profile-v1")
+            restartLiveCoordinator()
+            refreshDashboard()
+        }
+    }
     @Published var searchMode: String = "auto" // auto | exact | semantic | visual | clipText
-
-    var isTier2Provisioned: Bool {
-        CoreMLMobileCLIPProvider.isAvailable
-            || LocalModelBridge.isProvisioned(.clipImage)
-            || LocalModelBridge.isProvisioned(.miniLMText)
-    }
-
-    var tier2Status: String {
-        if CoreMLMobileCLIPProvider.isAvailable {
-            return "Tier-2 ready — Core ML MobileCLIP"
-        }
-        let clip = LocalModelBridge.isProvisioned(.clipImage)
-        let mini = LocalModelBridge.isProvisioned(.miniLMText)
-        if clip || mini {
-            return "Model files ready; runtime is checked when indexing starts"
-        }
-        return "Tier-2 not provisioned — run scripts/setup_models.sh"
-    }
 
     var isLocalTranscriptionAvailable: Bool { AppLocalTranscription.isAvailable }
     var localTranscriptionStatus: String { AppLocalTranscription.statusText }
@@ -109,6 +108,10 @@ final class LibrarianModel: ObservableObject {
     private var liveAccessLeases: [String: SecurityScopedBookmarkLease] = [:]
     private var activeIndexCancellation: IndexCancellationToken?
     private var hasStarted = false
+    private var modelStatusTask: Task<Void, Never>?
+    private var modelStatusGeneration = 0
+    private var searchTask: Task<Void, Never>?
+    private var searchGeneration = 0
 
     static var appSupportDir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -121,10 +124,13 @@ final class LibrarianModel: ObservableObject {
         self.localTranscriptionEnabled = UserDefaults.standard.bool(forKey: AppLocalTranscription.enabledDefaultsKey)
             && AppLocalTranscription.isAvailable
         self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
+        self.localModelProfile = LocalModelProfile(
+            rawValue: UserDefaults.standard.string(forKey: "local-model-profile-v1") ?? "fast") ?? .fast
         if let m = UserDefaults.standard.string(forKey: "tier2-search-mode-v1") { self.searchMode = m }
         loadBookmarks()
         loadExclusions()
         loadPausedPaths()
+        refreshModelStatus()
     }
 
     // MARK: - Catalog
@@ -135,8 +141,45 @@ final class LibrarianModel: ObservableObject {
     func start() {
         guard !hasStarted else { return }
         hasStarted = true
+        refreshModelStatus()
         openCatalogIfNeeded()
         refreshDashboard()
+    }
+
+    /// Readiness checks can enumerate large model snapshots and invoke a small
+    /// dependency probe. Keep that work off the main actor and cache the result
+    /// until the user explicitly refreshes it or changes the model setup.
+    func refreshModelStatus() {
+        modelStatusTask?.cancel()
+        modelStatusGeneration += 1
+        let generation = modelStatusGeneration
+        tier2Status = "Checking local model readiness…"
+        let work = Task.detached(priority: .utility) {
+            Tier2Readiness(
+                coreML: CoreMLMobileCLIPProvider.isAvailable,
+                legacyClip: LocalModelBridge.isProvisioned(.clipImage),
+                legacyMiniLM: LocalModelBridge.isProvisioned(.miniLMText),
+                specialistIDs: SpecialistModelBridge.availableModelIDs())
+        }
+        modelStatusTask = Task { @MainActor [weak self] in
+            let readiness = await work.value
+            guard let self, self.modelStatusGeneration == generation else { return }
+            self.isTier2Provisioned = readiness.coreML
+                || readiness.legacyClip
+                || readiness.legacyMiniLM
+                || !readiness.specialistIDs.isEmpty
+            if readiness.specialistIDs.contains(LocalModelStack.siglip2.id) {
+                self.tier2Status = "Tier-2 ready — local SigLIP2 specialist"
+            } else if readiness.coreML {
+                self.tier2Status = "Tier-2 ready — Core ML MobileCLIP"
+            } else if readiness.legacyClip || readiness.legacyMiniLM {
+                self.tier2Status = "Model files ready; runtime is checked when indexing starts"
+            } else if !readiness.specialistIDs.isEmpty {
+                self.tier2Status = "Specialist files found; install SigLIP2 or legacy CLIP/MiniLM embeddings"
+            } else {
+                self.tier2Status = "Tier-2 not provisioned — run scripts/setup_models.sh"
+            }
+        }
     }
 
     private func openCatalogIfNeeded() {
@@ -342,6 +385,7 @@ final class LibrarianModel: ObservableObject {
         var options = Indexer.Options()
         options.enableLocalEmbeddings = localEmbeddingsEnabled
         options.embeddingProviderKind = CoreMLMobileCLIPProvider.isAvailable ? "coreml-mobileclip" : nil
+        options.localModelProfile = localModelProfile
         options.excludedPaths = effectiveExcludedPaths
 
         let transcriptionProvider: any SpeechTranscriptionProvider
@@ -431,6 +475,8 @@ final class LibrarianModel: ObservableObject {
 
     func shutdown() {
         activeIndexCancellation?.cancel(reason: .shutdown)
+        modelStatusTask?.cancel()
+        searchTask?.cancel()
         stopLiveCoordinator()
     }
 
@@ -559,7 +605,7 @@ final class LibrarianModel: ObservableObject {
         case .screenshots:
             let plural = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshots", limit: 200)) ?? []
             let singular = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshot", limit: 200)) ?? []
-            return Array(Dictionary(uniqueKeysWithValues: (plural + singular).map { ($0.id, $0) })
+            return Array(Dictionary((plural + singular).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                 .values.sorted { $0.path < $1.path }.prefix(200))
         case .school:
             return (try? catalog.boundedFileSummaries(categoryPrefix: "School", limit: 200)) ?? []
@@ -646,49 +692,75 @@ final class LibrarianModel: ObservableObject {
 
     func runSearch() {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        searchTask?.cancel()
+        searchGeneration += 1
+        let generation = searchGeneration
         guard let catalog, !normalizedQuery.isEmpty else {
             searchResults = []
+            isSearching = false
             return
         }
-        let svc = SearchService(catalog: catalog, enableLocalEmbeddings: localEmbeddingsEnabled)
+        isSearching = true
+        searchResults = []
+        let enabled = localEmbeddingsEnabled
+        let profile = localModelProfile
         let mode = searchMode
-        var lines: [String] = []
-        switch mode {
-        case "exact":
-            lines = ((try? svc.search(normalizedQuery)) ?? []).map { h in
-                let evidence = h.snippet.map { "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))" } ?? ""
-                return "\(h.fileID) — \((h.path as NSString).lastPathComponent)\(evidence)"
-            }
-        case "semantic":
-            lines = ((try? svc.semanticSearch(query: normalizedQuery)) ?? []).map { h in
-                "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format:"%.2f", h.score))"
-            }
-        case "clipText":
-            lines = ((try? svc.clipTextToImageSearch(query: normalizedQuery)) ?? []).map { h in
-                "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format:"%.2f", h.score))"
-            }
-        default:
-            let sem = (try? svc.semanticSearch(query: normalizedQuery)) ?? []
-            if !sem.isEmpty {
-                lines = sem.map { h in
-                    "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format:"%.2f", h.score))"
-                }
-            } else {
-                let clip = (try? svc.clipTextToImageSearch(query: normalizedQuery)) ?? []
-                if !clip.isEmpty {
-                    lines = clip.map { h in
-                        "\(h.fileID) — \((h.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format:"%.2f", h.score))"
-                    }
-                } else {
-                    lines = ((try? svc.search(normalizedQuery)) ?? []).map { h in
-                        let evidence = h.snippet.map { "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))" } ?? ""
-                        return "\(h.fileID) — \((h.path as NSString).lastPathComponent)\(evidence)"
-                    }
-                }
+        let providerKind = CoreMLMobileCLIPProvider.isAvailable ? "coreml-mobileclip" : nil
+        let work = Task.detached(priority: .userInitiated) {
+            Self.searchLines(catalog: catalog, query: normalizedQuery, mode: mode,
+                             enableLocalEmbeddings: enabled, localModelProfile: profile,
+                             embeddingProviderKind: providerKind)
+        }
+        searchTask = Task { @MainActor [weak self] in
+            let lines = await work.value
+            guard let self, self.searchGeneration == generation else { return }
+            self.isSearching = false
+            self.searchResults = lines.isEmpty ? ["No results"] : lines
+        }
+    }
+
+    private nonisolated static func searchLines(
+        catalog: Catalog,
+        query: String,
+        mode: String,
+        enableLocalEmbeddings: Bool,
+        localModelProfile: LocalModelProfile,
+        embeddingProviderKind: String?
+    ) -> [String] {
+        let service = SearchService(
+            catalog: catalog,
+            enableLocalEmbeddings: enableLocalEmbeddings,
+            localModelProfile: localModelProfile,
+            embeddingProviderKind: embeddingProviderKind)
+        func exactLines() -> [String] {
+            ((try? service.search(query)) ?? []).map { hit in
+                let evidence = hit.snippet.map {
+                    "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))"
+                } ?? ""
+                return "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\(evidence)"
             }
         }
-        if lines.isEmpty { lines = ["No results"] }
-        searchResults = lines
+        func semanticLines() -> [String] {
+            ((try? service.semanticSearch(query: query)) ?? []).map { hit in
+                "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format: "%.2f", hit.score))"
+            }
+        }
+        func clipLines() -> [String] {
+            ((try? service.clipTextToImageSearch(query: query)) ?? []).map { hit in
+                "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format: "%.2f", hit.score))"
+            }
+        }
+
+        switch mode {
+        case "exact": return exactLines()
+        case "semantic": return semanticLines()
+        case "clipText": return clipLines()
+        default:
+            let semantic = semanticLines()
+            if !semantic.isEmpty { return semantic }
+            let clip = clipLines()
+            return clip.isEmpty ? exactLines() : clip
+        }
     }
 
     /// Privacy indicators derived from ACTUAL state where possible (plan §45).

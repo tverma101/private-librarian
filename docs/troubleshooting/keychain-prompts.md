@@ -13,7 +13,7 @@ There were two separate causes:
    on each rebuild. macOS then saw the rebuilt bundle as a different client
    even though the bundle identifier and catalog item were unchanged.
 2. The existing item was created by the old unsigned CLI. Its login-keychain
-   ACL names `/Users/tejas/Code/private-librarian/.build/arm64-apple-macosx/debug/librarian-cli`
+   ACL names `/Users/example/Code/private-librarian/.build/arm64-apple-macosx/debug/librarian-cli`
    and a stale code hash; that path no longer exists, so the signed app cannot
    silently inherit the old authorization.
 

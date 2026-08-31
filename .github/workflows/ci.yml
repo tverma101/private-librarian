@@ -63,6 +63,14 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
+      - name: Local specialist runtime and memory contract
+        run: |
+          python3 -m py_compile scripts/specialist.py scripts/provision_specialist_models.py
+          python3 scripts/test_specialist_contract.py
+          python3 scripts/specialist.py --syntax-check | tee specialist-contract.json
+          grep -q 'warm-encoders-only; transient-exclusive; disk-offload-available' specialist-contract.json
+          python3 scripts/provision_specialist_models.py --list >/dev/null
+
       - name: Vendored SQLCipher provenance
         run: |
           test -f ThirdParty/sqlcipher/sqlite3.c
@@ -112,8 +120,10 @@ jobs:
         run: |
           DEVELOPER_DIR=/Applications/Xcode_16.app/Contents/Developer swift build -c release
           scripts/e2e_local.sh .build/release/librarian-cli
-          scripts/package_app.sh .build/release
-          test ! -e dist/PrivateLibrarian.app/Contents/MacOS/librarian-cli
-          python3 scripts/audit_entitlements.py dist/PrivateLibrarian.app --expect-hardened
+          scripts/package_app.sh --xcode --no-dmg
+          test -x .build/package-stage/PrivateLibrarian.app/Contents/MacOS/LibrarianApp
+          test ! -e .build/package-stage/PrivateLibrarian.app/Contents/MacOS/librarian-cli
+          test ! -e dist/PrivateLibrarian.app
+          python3 scripts/audit_entitlements.py .build/package-stage/PrivateLibrarian.app --expect-hardened
           sandbox-exec -f <(printf '(version 1)\n(allow default)\n(deny network*)\n') \
             python3 scripts/network_negative_probe.py

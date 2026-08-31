@@ -1,8 +1,20 @@
 # Codex turn log
 
+## 2026-08-30 — PR #57 deep review and release hardening checkpoint
+
+- `scope`: review PR #57's final local specialist router, resolve the remaining macOS launch/keychain/packaging problems, and tighten the app's UI and offline model lifecycle before merge.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; integrated review tree for `feat/final-local-model-router` against `fix/tier2-incremental-ci`.
+- `review_fixes`: added the specialist manifest/runtime trust boundary and bounded JSONL bridge; kept PDFs out of image-only OCR; made specialist setup profiles explicit and models-only truly runtime-preserving; skipped unsupported PaddleOCR-VL on macOS; removed duplicate generated app bundles from `dist/`; staged only one signed app in the versioned DMG/install path; stopped legacy Keychain lookup during startup; added visible migration and model-readiness UI; fixed duplicate search/result and screenshot-category UI identity hazards.
+- `validation`: strict Swift 6 warnings-as-errors build passed; full Swift suite passed 169 tests with 0 failures; specialist provisioning fixtures passed 2 tests; specialist contract fixtures passed 4 tests; local E2E passed all ten checks; fixture quality schema passed; shell/Python syntax, diff, path, credential-name, model-payload, and unmerged-path audits passed.
+- `evidence_state`: implementation=yes; local tests/static audits=yes; PR merge and post-merge Xcode package/install/launch verification pending.
+- `residual_gap`: genuine user approval for one-time legacy Keychain migration and the real App Sandbox bookmark/relaunch lifecycle remain human-confirmed steps; public distribution still requires Developer ID Application signing, notarization, and stapling; specialist inference remains artifact/runtime dependent and fixture quality is not live model-quality evidence.
+- `next_action`: commit the integrated tree, push the isolated PR head, mark PR #57 ready, wait for its existing checks, merge it, then fast-forward the canonical checkout and rebuild the installed app.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-30.
+
 ## 2026-08-30 — local update, packaging, and model setup
 
-- `scope`: canonical `/Users/tejas/Projects/private-librarian`; update the local branch, finish the macOS distributable, and make optional Python model setup repeatable and offline at runtime.
+- `scope`: canonical `/Users/example/Projects/private-librarian`; update the local branch, finish the macOS distributable, and make optional Python model setup repeatable and offline at runtime.
 - `project`: `git@github.com:tverma101/private-librarian.git`, branch `fix/tier2-incremental-ci`, fast-forwarded to `169ad9140c978a6093f00277dca29151b832d285` (`origin/fix/tier2-incremental-ci`).
 - `status`: implementation complete for this requested boundary; changes remain uncommitted and were not pushed.
 - `changed_files`: `VERSION`, `.gitignore`, `README.md`, `docs/SECURITY.md`, `docs/VERIFICATION.md`, `docs/codex/turn-log.md`, `script/build_and_run.sh`, `scripts/embed.py`, `scripts/model-requirements.txt`, `scripts/package_app.sh`, `scripts/provision_image_models.py`, `scripts/setup_models.sh`, `scripts/test_model_provisioning.py`, `Sources/LibrarianCore/LocalModelBridge.swift`, `Sources/LibrarianCore/Indexer.swift`, `Sources/LibrarianApp/PrivateLibrarianApp.swift`, and `Sources/LibrarianApp/MagicViews.swift`.
@@ -18,7 +30,7 @@
 ## 2026-08-30 — remove duplicate app staging from the release path
 
 - `scope`: resolve the user-visible duplicate app and launch failure caused by leaving both the generated `dist/PrivateLibrarian.app` and installed app in place.
-- `project`: canonical `/Users/tejas/Projects/private-librarian`, `fix/tier2-incremental-ci`; changes remain uncommitted and unpushed.
+- `project`: canonical `/Users/example/Projects/private-librarian`, `fix/tier2-incremental-ci`; changes remain uncommitted and unpushed.
 - `changed_files`: `scripts/package_app.sh`, `script/build_and_run.sh`, `README.md`, `docs/VERIFICATION.md`, `docs/SECURITY.md`, `docs/troubleshooting/keychain-prompts.md`, and this turn log.
 - `packaging_fix`: normal packaging now keeps only the versioned DMG in `dist/`; the app is staged in ignored `.build/package-stage/`, installed only when requested, and removed after DMG/install. The Run button installs and opens only `/Applications/PrivateLibrarian.app`. Exact old generated app names in `dist/` are moved to a recoverable `.build/private-librarian-legacy-dist.*` directory.
 - `validation`: before this change, the filesystem inventory showed exactly two matching bundle IDs (`dist/PrivateLibrarian.app` and `/Applications/PrivateLibrarian.app`) and no other Private Librarian install; the final archive/package verification is pending after this staging change.
@@ -29,8 +41,8 @@
 ## 2026-08-30 — stable Xcode signing and legacy Keychain migration
 
 - `scope`: stop repeated Apple Keychain prompts while preserving the existing encrypted catalog, complete the Xcode-backed package, and keep model/CLI setup prompt-free.
-- `project`: canonical `/Users/tejas/Projects/private-librarian`, `fix/tier2-incremental-ci`, remote `git@github.com:tverma101/private-librarian.git`; HEAD remains aligned with `origin/fix/tier2-incremental-ci` and changes remain uncommitted/unpushed.
-- `root_cause`: the matching login-keychain item was inspected and its ACL names the removed `/Users/tejas/Code/private-librarian/.build/arm64-apple-macosx/debug/librarian-cli` plus a stale code hash. Earlier ad-hoc rebuilds therefore appeared as new Keychain clients.
+- `project`: canonical `/Users/example/Projects/private-librarian`, `fix/tier2-incremental-ci`, remote `git@github.com:tverma101/private-librarian.git`; HEAD remains aligned with `origin/fix/tier2-incremental-ci` and changes remain uncommitted/unpushed.
+- `root_cause`: the matching login-keychain item was inspected and its ACL names the removed `/Users/example/Code/private-librarian/.build/arm64-apple-macosx/debug/librarian-cli` plus a stale code hash. Earlier ad-hoc rebuilds therefore appeared as new Keychain clients.
 - `changed_files`: `Sources/LibrarianCore/CatalogKeychain.swift`, `Sources/LibrarianCore/Catalog.swift`, `Sources/LibrarianApp/PrivateLibrarianApp.swift`, `Sources/LibrarianApp/MagicViews.swift`, `Sources/librarian-cli/main.swift`, `scripts/package_app.sh`, `README.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/VERIFICATION.md`, `docs/troubleshooting/keychain-prompts.md`, and this turn log.
 - `keychain_fix`: the GUI now queries the signed app-owned data-protection item first; if the item is absent it reads the legacy item once, preserves the same 32-byte key, writes the app-owned item, and caches one result/failure per process. The final package carries the certificate team identifier, application identifier, and team-scoped Keychain group. The CLI requires `LIBRARIAN_CATALOG_KEY` and never opens the GUI item.
 - `catalog_recovery`: the legacy `catalog.db`, `catalog.db-shm`, and `catalog.db-wal` were copied without modification into the sandbox Application Support directory; the original files remain in place.
@@ -44,7 +56,7 @@
 ## 2026-08-30 — make startup launchable and remove restricted entitlement failure
 
 - `scope`: resolve the remaining inability to open the installed app after the duplicate-app packaging fix, stop automatic legacy Keychain prompts, and leave one usable distributable.
-- `project`: canonical `/Users/tejas/Projects/private-librarian`, `fix/tier2-incremental-ci`; changes remain uncommitted and unpushed.
+- `project`: canonical `/Users/example/Projects/private-librarian`, `fix/tier2-incremental-ci`; changes remain uncommitted and unpushed.
 - `root_cause`: AMFI rejected the prior bundle at spawn time because the packager manually injected restricted `application-identifier`, team, and Keychain-group entitlements without an embedded provisioning profile. `codesign --verify` passed, but launch logs reported `No matching profile found`; Launch Services returned RBS code 5 / POSIX error 163 and direct execution exited 137.
 - `changed_files`: `Sources/LibrarianCore/CatalogKeychain.swift`, `Sources/LibrarianApp/PrivateLibrarianApp.swift`, `Sources/LibrarianApp/MagicViews.swift`, `scripts/package_app.sh`, `scripts/embed.py`, `README.md`, `docs/SECURITY.md`, `docs/VERIFICATION.md`, `docs/troubleshooting/keychain-prompts.md`, `docs/troubleshooting/packaging-launch.md`, and this turn log.
 - `keychain_startup_fix`: the GUI no longer performs legacy login-Keychain lookup in model initialization. New catalogs use `createAppOwned()`, existing catalogs render a visible **Migrate Existing Catalog** action, and that action is the only legacy lookup and is disabled after one attempt. The encrypted catalog key is never rotated or deleted.

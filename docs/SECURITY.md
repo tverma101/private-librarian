@@ -70,7 +70,7 @@ Provisioning scripts may use the network only when the user explicitly runs a do
 
 Tier 1 uses Apple's on-device Vision framework for image labels, feature prints, and OCR and requires no downloaded model.
 
-Tier 2 is optional. The repository includes a Python-backed local CLIP/MiniLM path, a Core ML MobileCLIP S0 provider, explicit provisioning/verification scripts, and provider/preprocessing provenance. The Python setup keeps only the two wired checkpoints, verifies every file against a manifest, and places them under Application Support by default. An unavailable requested provider reports unavailable rather than silently switching embedding spaces.
+Tier 2 is optional. The repository includes a Python-backed local CLIP/MiniLM baseline, a Core ML MobileCLIP S0 provider, and an explicit specialist registry for SigLIP2/DINOv3 plus opt-in OCR/VLM escalation. Provisioning resolves pinned Hub revisions, stages downloads before activation, verifies every regular file against a SHA-256 manifest, and places artifacts under Application Support by default. The worker is offline-only, receives broker-owned bytes or bounded derived text, and checks the manifest again before loading. Indexing and query-time search use the same selected embedding space; an unavailable provider fails closed instead of silently switching spaces. PaddleOCR-VL is skipped on macOS because its upstream runtime currently excludes macOS CPU/Apple silicon, so native Vision OCR remains the supported path.
 
 ## Media and transcription
 
