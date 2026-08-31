@@ -1,5 +1,17 @@
 # Codex turn log
 
+## 2026-08-31 — PR #9 merged with local repair
+
+- `scope`: integrate the canonical local packaging/catalog/model repair into the newly surfaced pull request and synchronize local `main` after merge.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; PR #9 `Integrate the local organizer behind the read-only source boundary`; local topic head `19379249e7c428d0653006a73f46a87a7a4cc48e`.
+- `integration`: the PR was initially a draft at `48d4d778`; the clean local branch contained exactly two additional audited commits. Those commits were pushed to the isolated PR head, the draft was marked ready, and GitHub merged it as `cbe7627e8579436edd059d68cc4521203b48c07c`.
+- `validation`: local `swift test --disable-sandbox` passed 169 tests with 0 failures; packaged app/model/signing/launch checks were already green on the exact merged head. GitHub `test` and `quality` completed successfully for `1937924`; `entitlement-audit` was still `IN_PROGRESS` at handoff even though the PR merge completed.
+- `evidence_state`: local implementation=yes; local tests/package/live checks=yes; PR merged=yes; local `main` synchronized=yes; remote test/quality=yes; remote entitlement audit=pending; user-confirmed folder/bookmark/indexing=no; public notarization=no.
+- `cleanup`: no topic branch was deleted; local `main` and the remote `main` merge commit match. No default app association, source data, Keychain item, model/runtime, or GitHub workflow was changed outside the requested PR integration.
+- `next_action`: monitor the already-running entitlement-audit result if a remote CI receipt is needed; otherwise the merged implementation is available locally and the installed app remains open for the user’s authorized folder/index step.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-31.
+
 ## 2026-08-31 — final package and catalog persistence audit
 
 - `scope`: verify the repaired installed app and distributable after the confirmed stale-catalog reset, model-runtime repair, and profile-free Keychain change.
