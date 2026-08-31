@@ -1,0 +1,72 @@
+name: Simple cleaner UI verifier
+
+on:
+  push:
+    branches:
+      - feat/simple-cleaner-ui
+
+permissions:
+  contents: write
+
+jobs:
+  wire-and-verify:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/simple-cleaner-ui
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: Apply exact UI/package patch once
+        run: |
+          if grep -q 'CleanerHomeView()' Sources/LibrarianApp/PrivateLibrarianApp.swift; then
+            echo 'simple UI already integrated'
+          else
+            python3 scripts/apply_simple_ui_integration.py
+          fi
+
+      - name: Validate diff
+        run: git diff --check
+
+      - name: Build
+        run: swift build
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Swift 6
+        run: swift build -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -warnings-as-errors
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Full tests
+        run: swift test
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Package and release audit
+        run: |
+          DEVELOPER_DIR=/Applications/Xcode_16.app/Contents/Developer swift build -c release
+          scripts/e2e_local.sh .build/release/librarian-cli
+          LIBRARIAN_BUILD_SYSTEM=swiftpm scripts/package_app.sh .build/release --no-dmg
+          APP=.build/package-stage/PrivateLibrarian.app
+          test -x "$APP/Contents/Resources/scripts/setup_models.sh"
+          test -f "$APP/Contents/Resources/scripts/provision_image_models.py"
+          test -f "$APP/Contents/Resources/scripts/provision_specialist_models.py"
+          test -f "$APP/Contents/Resources/scripts/model-requirements.txt"
+          test -f "$APP/Contents/Resources/scripts/specialist-requirements.txt"
+          python3 scripts/audit_entitlements.py "$APP" --expect-hardened
+
+      - name: Commit verified production integration if needed
+        run: |
+          git add Sources/LibrarianApp/PrivateLibrarianApp.swift scripts/package_app.sh
+          if git diff --cached --quiet; then
+            echo 'no production patch to commit'
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: make simple cleaner the default app"
+          git push origin HEAD:feat/simple-cleaner-ui
