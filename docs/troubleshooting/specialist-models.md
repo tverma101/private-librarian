@@ -66,7 +66,11 @@ in memory or produce a live inference result on the current Mac.
 ## Residual boundary
 
 DINOv3 remains gated upstream and requires accepted access before provisioning.
-Large quality-tier VLMs are opt-in and may require substantial unified memory;
-they are transient and are released after an escalation. Public distribution still
-needs a separately provisioned, licensed runtime/model policy; the normal DMG keeps
+The Quality profile's largest offered fallback is LFM2.5-VL-3B. Ling 3.0 Tiny,
+InternVL3.5-4B, and MiMo-VL-7B are intentionally not exposed on the target 16 GB
+Mac because the product enforces an 11.50 GB per-model working-set ceiling rather
+than relying on swap or CPU offload to hide an oversized model. Supported
+specialists are transient, run one at a time during escalation, and are released
+before the normal embedding path resumes. Public distribution still needs a
+separately provisioned, licensed runtime/model policy; the normal DMG keeps
 user-specific weights in Application Support.
