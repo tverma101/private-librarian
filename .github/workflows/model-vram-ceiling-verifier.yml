@@ -34,6 +34,9 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+
+          # Force transient VLMs to half precision on Apple MPS. Without this,
+          # even a 3B model could load FP32 and consume the 11.50 GiB ceiling by itself.
           path = Path('scripts/specialist.py')
           text = path.read_text()
           old = '''def _large_model_load_kwargs(model_id: str) -> dict:\n    kwargs = {"low_cpu_mem_usage": True}\n'''
@@ -42,6 +45,17 @@ jobs:
               path.write_text(text.replace(old, new, 1))
           elif 'kwargs["torch_dtype"] = torch.float16' not in text:
               raise SystemExit('could not enforce MPS half-precision loading')
+
+          # Keep the generic bridge seam compilable without retaining Ling as
+          # a product model or default. No router route can select textReasoning now.
+          path = Path('Sources/LibrarianCore/SpecialistModelBridge.swift')
+          text = path.read_text()
+          old = '    public func classifyText(model: LocalModelDescriptor = LocalModelStack.ling,\n'
+          new = '    public func classifyText(model: LocalModelDescriptor,\n'
+          if old in text:
+              path.write_text(text.replace(old, new, 1))
+          elif 'LocalModelStack.ling' in text:
+              raise SystemExit('unexpected Ling reference remains in SpecialistModelBridge.swift')
           PY
 
       - name: Assert oversized models are absent
@@ -49,6 +63,7 @@ jobs:
           for model in ling-3.0-tiny internvl3.5-4b mimo-vl-7b-rl-2508; do
             if grep -R --line-number --fixed-strings "$model" \
               Sources/LibrarianCore/LocalModelRouter.swift \
+              Sources/LibrarianCore/SpecialistModelBridge.swift \
               Sources/LibrarianApp/SimpleSettingsView.swift \
               scripts/provision_specialist_models.py \
               scripts/specialist.py \
@@ -57,6 +72,11 @@ jobs:
               exit 1
             fi
           done
+          if grep -R --line-number --fixed-strings 'LocalModelStack.ling' \
+            Sources/LibrarianCore Sources/LibrarianApp; then
+            echo 'Ling symbol still referenced by product code' >&2
+            exit 1
+          fi
           grep -F 'kwargs["torch_dtype"] = torch.float16' scripts/specialist.py
           python3 scripts/specialist.py --syntax-check
           python3 scripts/provision_specialist_models.py --list
@@ -95,6 +115,7 @@ jobs:
         run: |
           git add \
             Sources/LibrarianCore/LocalModelRouter.swift \
+            Sources/LibrarianCore/SpecialistModelBridge.swift \
             Sources/LibrarianApp/SimpleSettingsView.swift \
             Tests/LibrarianTests/LocalModelRouterTests.swift \
             scripts/provision_specialist_models.py \
