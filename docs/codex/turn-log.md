@@ -1,5 +1,18 @@
 # Codex turn log
 
+## 2026-08-31 — synchronize local main after remote cleaner update
+
+- `scope`: update the canonical local checkout after `origin/main` advanced, validate the new cleaner UI/source changes, and refresh the installed macOS artifact.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; `origin/main` advanced from `cbe7627` to `278ece0` (`Make Private Librarian feel like a simple Mac cleaner`). Local `main` was clean and carried only two local documentation receipts, so they were rebased without conflicts.
+- `changed_scope`: the remote update adds the cleaner home/settings UI, image-junk scoring and regression coverage, plus related indexer/router/specialist/package changes. No local source edits were discarded.
+- `validation`: strict Swift 6 warnings-as-errors build passed; current-tree `swift test --disable-sandbox` passed 178 tests with 0 failures; shell/Python syntax and diff checks passed. `scripts/package_app.sh --xcode --install` produced DMG SHA-256 `2c606cd6e8b22eef717adbaf412c62cfdb84e703a4126b9405dbd249d29e0732`; deep signing, hardened entitlement audit, universal `x86_64 arm64`, and `hdiutil verify` passed. The packaged offline helper reports both pinned models ready.
+- `live`: `/Applications/PrivateLibrarian.app` was explicitly relaunched and checked in as a foreground ARM64 sandboxed process. Startup logs show only the expected Keychain lookup; no crash, `errSecMissingEntitlement`, or prompt-loop evidence. The encrypted catalog and its WAL/SHM sidecars remain intact.
+- `evidence_state`: local main synchronized=yes; implementation=yes; tested=yes; packaged=yes; installed=yes; live launch=yes; user-confirmed folder/bookmark/indexing=no; public notarization=no.
+- `cleanup`: no default app association changed; only the installed app was replaced by the requested fresh package. Model/runtime data, source bookmarks, Keychain items, topic branch, and user source data were preserved.
+- `next_action`: the current app is ready for the user to choose an authorized folder and run the first index; local `main` is intentionally three documentation commits ahead of remote `origin/main`.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-31.
+
 ## 2026-08-31 — PR #9 merged with local repair
 
 - `scope`: integrate the canonical local packaging/catalog/model repair into the newly surfaced pull request and synchronize local `main` after merge.
