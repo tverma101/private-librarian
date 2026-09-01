@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: model-vram-ceiling-feat-simple-cleaner-ui
+  cancel-in-progress: true
+
 jobs:
   enforce-and-verify:
     runs-on: macos-15
@@ -28,6 +32,18 @@ jobs:
             echo '11.50 GiB ceiling already applied'
           fi
 
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/specialist.py')
+          text = path.read_text()
+          old = '''def _large_model_load_kwargs(model_id: str) -> dict:\n    kwargs = {"low_cpu_mem_usage": True}\n'''
+          new = '''def _large_model_load_kwargs(model_id: str) -> dict:\n    # The target Mac has an 11.50 GiB model working-set ceiling. Force half\n    # precision on Apple MPS so a supported 3B fallback cannot silently load\n    # FP32 and consume the entire budget before activations are allocated.\n    import torch\n    kwargs = {"low_cpu_mem_usage": True}\n    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():\n        kwargs["torch_dtype"] = torch.float16\n'''
+          if old in text:
+              path.write_text(text.replace(old, new, 1))
+          elif 'kwargs["torch_dtype"] = torch.float16' not in text:
+              raise SystemExit('could not enforce MPS half-precision loading')
+          PY
+
       - name: Assert oversized models are absent
         run: |
           for model in ling-3.0-tiny internvl3.5-4b mimo-vl-7b-rl-2508; do
@@ -41,6 +57,7 @@ jobs:
               exit 1
             fi
           done
+          grep -F 'kwargs["torch_dtype"] = torch.float16' scripts/specialist.py
           python3 scripts/specialist.py --syntax-check
           python3 scripts/provision_specialist_models.py --list
 
