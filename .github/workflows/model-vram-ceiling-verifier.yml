@@ -1,0 +1,93 @@
+name: Model VRAM ceiling verifier
+
+on:
+  push:
+    branches:
+      - feat/simple-cleaner-ui
+
+permissions:
+  contents: write
+
+jobs:
+  enforce-and-verify:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/simple-cleaner-ui
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: Apply 11.50 GiB ceiling once
+        run: |
+          if grep -q 'ling-3.0-tiny' Sources/LibrarianCore/LocalModelRouter.swift; then
+            python3 scripts/apply_model_vram_ceiling.py
+          else
+            echo '11.50 GiB ceiling already applied'
+          fi
+
+      - name: Assert oversized models are absent
+        run: |
+          for model in ling-3.0-tiny internvl3.5-4b mimo-vl-7b-rl-2508; do
+            if grep -R --line-number --fixed-strings "$model" \
+              Sources/LibrarianCore/LocalModelRouter.swift \
+              Sources/LibrarianApp/SimpleSettingsView.swift \
+              scripts/provision_specialist_models.py \
+              scripts/specialist.py \
+              scripts/package_app.sh; then
+              echo "oversized model still exposed: $model" >&2
+              exit 1
+            fi
+          done
+          python3 scripts/specialist.py --syntax-check
+          python3 scripts/provision_specialist_models.py --list
+
+      - name: Validate diff
+        run: git diff --check
+
+      - name: Build
+        run: swift build
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Swift 6
+        run: swift build -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -warnings-as-errors
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Model router tests
+        run: swift test --filter LocalModelRouterTests
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Full tests
+        run: swift test
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Package and entitlement audit
+        run: |
+          DEVELOPER_DIR=/Applications/Xcode_16.app/Contents/Developer swift build -c release
+          scripts/e2e_local.sh .build/release/librarian-cli
+          LIBRARIAN_BUILD_SYSTEM=swiftpm scripts/package_app.sh .build/release --no-dmg
+          python3 scripts/audit_entitlements.py .build/package-stage/PrivateLibrarian.app --expect-hardened
+
+      - name: Commit verified ceiling
+        run: |
+          git add \
+            Sources/LibrarianCore/LocalModelRouter.swift \
+            Sources/LibrarianApp/SimpleSettingsView.swift \
+            Tests/LibrarianTests/LocalModelRouterTests.swift \
+            scripts/provision_specialist_models.py \
+            scripts/specialist.py \
+            scripts/package_app.sh
+          if git diff --cached --quiet; then
+            echo 'no production model-ceiling diff to commit'
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: enforce 11.5 GiB model ceiling"
+          git push origin HEAD:feat/simple-cleaner-ui
