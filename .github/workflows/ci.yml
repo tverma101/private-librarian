@@ -58,18 +58,39 @@ jobs:
       - name: Suite must be green
         run: grep -q "Executed .* tests, with 0 failures" test.log
 
+      - name: Folder explosion regression
+        run: swift test --filter FolderExplosionRegressionTests
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+
       - name: Tier-2 provider contract
         run: swift test --filter Tier2IntegrationTests
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
       - name: Local specialist runtime and memory contract
+        shell: bash
         run: |
+          set -euo pipefail
           python3 -m py_compile scripts/specialist.py scripts/provision_specialist_models.py
           python3 scripts/test_specialist_contract.py
           python3 scripts/specialist.py --syntax-check | tee specialist-contract.json
-          grep -q 'warm-encoders-only; transient-exclusive; disk-offload-available' specialist-contract.json
+          grep -q '11.50-GB-ceiling; warm-encoders-only; transient-exclusive; MPS-fp16' specialist-contract.json
+          grep -F 'kwargs["torch_dtype"] = torch.float16' scripts/specialist.py
           python3 scripts/provision_specialist_models.py --list >/dev/null
+
+          for model in ling-3.0-tiny internvl3.5-4b mimo-vl-7b-rl-2508; do
+            if grep -R --line-number --fixed-strings "$model" \
+              Sources/LibrarianCore/LocalModelRouter.swift \
+              Sources/LibrarianCore/SpecialistModelBridge.swift \
+              Sources/LibrarianApp/SimpleSettingsView.swift \
+              scripts/provision_specialist_models.py \
+              scripts/specialist.py \
+              scripts/package_app.sh; then
+              echo "Model above the target Mac ceiling is exposed by production code: $model" >&2
+              exit 1
+            fi
+          done
 
       - name: Vendored SQLCipher provenance
         run: |
