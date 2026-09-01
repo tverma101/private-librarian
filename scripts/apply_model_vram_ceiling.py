@@ -25,11 +25,13 @@ def replace_once(text: str, old: str, new: str, *, path: str) -> str:
 
 
 def remove_swift_descriptor(text: str, name: str, next_marker: str, *, path: str) -> str:
-    pattern = rf"\n    public static let {re.escape(name)} = LocalModelDescriptor\(.*?\n    \)\n(?=\n    {re.escape(next_marker)})"
-    text, count = re.subn(pattern, "", text, count=1, flags=re.S)
-    if count != 1:
+    start_marker = f"\n    public static let {name} = LocalModelDescriptor("
+    start = text.find(start_marker)
+    end_marker = "\n\n    " + next_marker
+    end = text.find(end_marker, start + len(start_marker)) if start >= 0 else -1
+    if start < 0 or end < 0:
         raise SystemExit(f"failed to remove Swift descriptor {name} from {path}")
-    return text
+    return text[:start] + text[end:]
 
 
 def remove_python_dict_entry(text: str, key: str, *, path: str) -> str:
@@ -75,11 +77,9 @@ write(path, text)
 path = "scripts/specialist.py"
 text = read(path)
 for key in ("ling-3.0-tiny", "internvl3.5-4b", "mimo-vl-7b-rl-2508"):
-    # MODEL_SPECS tuple entries and RUNTIME_MODULES tuple entries are both one-line dict entries.
     text = re.sub(rf'^    "{re.escape(key)}": .*\n', "", text, flags=re.M)
     text = re.sub(rf'^    "{re.escape(key)}",\n', "", text, flags=re.M)
 
-# Remove text-generator path entirely: no oversized text generator remains in the supported stack.
 start = text.find("\ndef _load_text_generator(model_id: str):")
 end = text.find("\ndef _vlm_classify(model_id: str, image, existing: dict) -> dict:")
 if start < 0 or end < 0 or end <= start:
@@ -126,7 +126,6 @@ for line in (
 ):
     if line not in text:
         raise SystemExit(f"missing package model line: {line!r}")
-# Keep LFM as the final loop item after removing the larger candidates.
 text = text.replace("            ling-3.0-tiny \\\n", "")
 text = text.replace("            lfm2.5-vl-3b \\\n            internvl3.5-4b \\\n            mimo-vl-7b-rl-2508; do\n", "            lfm2.5-vl-3b; do\n")
 write(path, text)
@@ -163,7 +162,6 @@ text = replace_once(
 )
 write(path, text)
 
-# Final guard: forbidden models must not remain in product registry, provisioner, worker, packager or UI.
 for path in (
     "Sources/LibrarianCore/LocalModelRouter.swift",
     "scripts/provision_specialist_models.py",
