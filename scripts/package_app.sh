@@ -409,10 +409,7 @@ if [ "$INCLUDE_MODELS" -eq 1 ] || [ "$INCLUDE_SPECIALISTS" -eq 1 ]; then
             dinov3-vitb16-lvd1689m \
             paddleocr-vl-1.6 \
             minicpm-v-4.6 \
-            ling-3.0-tiny \
-            lfm2.5-vl-3b \
-            internvl3.5-4b \
-            mimo-vl-7b-rl-2508; do
+            lfm2.5-vl-3b; do
             model_path="$SPECIALIST_MODEL_SOURCE/$model"
             if [ ! -e "$model_path" ] && [ ! -L "$model_path" ]; then
                 continue

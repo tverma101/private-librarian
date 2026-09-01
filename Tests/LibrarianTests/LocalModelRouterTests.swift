@@ -69,10 +69,15 @@ final class LocalModelRouterTests: XCTestCase {
                                             nativeOCRSucceeded: true,
                                             isDocumentLikeImage: false),
             availableModelIDs: available)
-        XCTAssertTrue(ambiguous.contains { $0.id == LocalModelStack.ling.id })
         XCTAssertTrue(ambiguous.contains { $0.id == LocalModelStack.lfm.id })
-        XCTAssertTrue(ambiguous.contains { $0.id == LocalModelStack.internVL.id })
-        XCTAssertTrue(ambiguous.contains { $0.id == LocalModelStack.mimo.id })
+        XCTAssertEqual(ambiguous.filter { $0.cost == .heavy }.map(\.id), [LocalModelStack.lfm.id])
+    }
+
+    func testRegistryExcludesModelsThatCannotRespectMacMemoryCeiling() {
+        let ids = Set(LocalModelStack.all.map(\.id))
+        XCTAssertFalse(ids.contains("ling-3.0-tiny"))
+        XCTAssertFalse(ids.contains("internvl3.5-4b"))
+        XCTAssertFalse(ids.contains("mimo-vl-7b-rl-2508"))
     }
 
     func testUnavailableModelsAreNeverSubstituted() {

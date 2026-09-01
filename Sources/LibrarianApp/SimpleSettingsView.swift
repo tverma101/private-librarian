@@ -180,7 +180,7 @@ struct SimpleSettingsView: View {
         case .balanced:
             return "Recommended. SigLIP2 + DINOv3 for most images; PaddleOCR and MiniCPM wake only when needed, then unload."
         case .quality:
-            return "For hard libraries. Adds Ling and optional larger VLM fallbacks. Models run one-at-a-time and unload between stages."
+            return "For hard libraries. Adds LFM2.5-VL 3B as the largest fallback. Every offered model is bounded for an 11.50 GB Mac ceiling and unloads between stages."
         }
     }
 
@@ -283,10 +283,7 @@ struct SimpleSettingsView: View {
         case LocalModelStack.dinov3.id: return "DINOv3 ViT-B"
         case LocalModelStack.paddleOCR.id: return "PaddleOCR-VL 1.6"
         case LocalModelStack.miniCPM.id: return "MiniCPM-V 4.6"
-        case LocalModelStack.ling.id: return "Ling 3.0 Tiny"
         case LocalModelStack.lfm.id: return "LFM2.5-VL 3B"
-        case LocalModelStack.internVL.id: return "InternVL3.5 4B"
-        case LocalModelStack.mimo.id: return "MiMo-VL 7B"
         default: return descriptor.id
         }
     }
