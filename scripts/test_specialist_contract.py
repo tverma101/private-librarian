@@ -47,6 +47,22 @@ def write_snapshot(root: Path, extra: str | None = None) -> Path:
 
 
 class SpecialistContractTests(unittest.TestCase):
+    def test_transformers_pooling_output_is_unwrapped_before_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = load_worker(Path(directory))
+            marker = object()
+
+            class PoolingOutput:
+                pooler_output = marker
+
+            self.assertIs(module._embedding_tensor(PoolingOutput()), marker)
+
+            class FullSiglipOutput:
+                image_embeds = marker
+                pooler_output = object()
+
+            self.assertIs(module._embedding_tensor(FullSiglipOutput()), marker)
+
     def test_full_verification_detects_mutation_after_status_probe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

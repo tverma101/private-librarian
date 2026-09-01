@@ -351,7 +351,35 @@ def _decode_image(value: str):
         raise ValueError("invalid or oversized image payload") from exc
 
 
+def _embedding_tensor(value):
+    """Extract a tensor from the output variants used by Transformers.
+
+    Transformers 5 changed SigLIP's ``get_*_features`` helpers to return
+    ``BaseModelOutputWithPooling`` instead of a raw tensor.  Older releases
+    and the full ``SiglipOutput`` use different field names, so keep the
+    compatibility handling in one place before normalisation.
+    """
+    for attribute in ("image_embeds", "text_embeds", "pooler_output"):
+        candidate = getattr(value, attribute, None)
+        if candidate is not None:
+            return candidate
+    if isinstance(value, dict):
+        for key in ("image_embeds", "text_embeds", "pooler_output"):
+            candidate = value.get(key)
+            if candidate is not None:
+                return candidate
+    if isinstance(value, (tuple, list)):
+        if not value:
+            return value
+        return value[-1]
+    hidden = getattr(value, "last_hidden_state", None)
+    if hidden is not None:
+        return hidden[:, 0]
+    return value
+
+
 def _normalize_tensor(vector) -> list[float]:
+    vector = _embedding_tensor(vector)
     if hasattr(vector, "detach"):
         vector = vector.detach()
     if getattr(vector, "ndim", 1) > 1:

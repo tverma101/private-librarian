@@ -73,7 +73,7 @@ struct SimpleSettingsView: View {
                     Button {
                         copySetupCommand(openTerminal: true)
                     } label: {
-                        Label(copiedCommand ? "Command Copied" : "Install in Terminal", systemImage: "terminal")
+                        Label(copiedCommand ? "Command Copied" : "Open Terminal + Copy", systemImage: "terminal")
                     }
                     .buttonStyle(.borderedProminent)
 
@@ -223,6 +223,9 @@ struct SimpleSettingsView: View {
                 Text("\(roleText(descriptor)) · \(costText(descriptor.cost)) · \(descriptor.license)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text(modelStatusText(descriptor, provisioned: provisioned))
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(modelStatusColor(descriptor, provisioned: provisioned))
             }
 
             Spacer()
@@ -297,6 +300,26 @@ struct SimpleSettingsView: View {
         case .visionFallback: return "image fallback"
         case .visionHeavyFallback: return "hard image fallback"
         }
+    }
+
+    private func modelStatusText(_ descriptor: LocalModelDescriptor, provisioned: Bool) -> String {
+        #if os(macOS)
+        if descriptor.id == LocalModelStack.paddleOCR.id {
+            return "Unsupported on macOS · native Vision OCR is used"
+        }
+        #endif
+        if provisioned { return "Checkpoint ready · runtime checked above" }
+        if descriptor.gated { return "Not installed · accepted gated access is required" }
+        return "Not installed · run the setup command above"
+    }
+
+    private func modelStatusColor(_ descriptor: LocalModelDescriptor, provisioned: Bool) -> Color {
+        #if os(macOS)
+        if descriptor.id == LocalModelStack.paddleOCR.id { return .orange }
+        #endif
+        if provisioned { return .green }
+        if descriptor.gated { return .orange }
+        return .secondary
     }
 
     private func costText(_ cost: LocalModelCostClass) -> String {

@@ -1,5 +1,21 @@
 # Codex turn log
 
+## 2026-08-31 — provision specialist models and repair live inference
+
+- `scope`: install the required local embedding runtime/models, exercise the installed bundle headlessly, fix concrete runtime/UI defects, and preserve default-app behavior.
+- `project`: canonical repository `git@github.com:tverma101/private-librarian.git`; `origin/main` is `278ece0`; local `main` is rebased on it and remains ahead by local receipts plus this follow-up. No push was performed.
+- `changed_files`: `scripts/specialist.py`, `scripts/test_specialist_contract.py`, `Sources/LibrarianApp/SimpleSettingsView.swift`, `docs/troubleshooting/specialist-models.md`, and this turn log. User-specific model/runtime data was installed only under app-container Application Support.
+- `model_state`: installed and verified SigLIP2 `google/siglip2-so400m-patch16-naflex@cc24074f717b612951c2dead130904ab9b65a81e` (9 files, about 4.3 GiB); installed `accelerate==1.12.0` and `psutil==7.2.2`; legacy CLIP/MiniLM remain verified. DINOv3 is not installed because upstream returned 401 gated access and this machine has no Hugging Face auth. PaddleOCR-VL is unsupported on macOS CPU/Apple silicon; MiniCPM and LFM remain optional larger profiles.
+- `root_cause`: Transformers 5 returned `BaseModelOutputWithPooling` from SigLIP `get_*_features`, but the helper assumed a raw tensor; this caused real inference to fail.
+- `implementation`: added output unwrapping and regression coverage; made settings report checkpoint state (ready/gated/unsupported/missing) and corrected the copy/open-Terminal label.
+- `validation`: strict Swift 6 build passed; Swift tests passed 178/0; Python contract tests passed 5/5 and model-provisioning tests 2/2; real offline SigLIP image+text inference returned 1152-dimensional vectors; the Swift bridge smoke against the packaged helper indexed 2 files and persisted 2 embeddings plus 6 chunks; local E2E passed all ten checks; Xcode package/install passed; DMG SHA-256 is `e3b1430322ae66893529b6f675062034a98194d23f4b78c609dc53f279b755a5`; code-sign, entitlement, universal-binary, and DMG audits passed; Computer Use accessibility inspection confirmed the live foreground app and settings with no prompt sheet. No screenshot-based inspection was used.
+- `evidence_state`: implementation=yes; tested=yes; models/runtime=yes for SigLIP/legacy; DINO=no (upstream gated-auth blocker); packaged=yes; installed=yes; live=yes; user-confirmed folder/bookmark/indexing=no; public notarization=no.
+- `blocker`: DINOv3 requires the user to accept upstream terms and authenticate (for example, `hf auth login`) before `./scripts/setup_models.sh --specialist-model dinov3-vitb16-lvd1689m`; no gated-access bypass was attempted. Balanced/quality optional VLM downloads were not installed.
+- `cleanup`: no catalog reset, source data, bookmarks, Keychain item, default association, LaunchServices state, PR, workflow, or user app state was deleted/changed outside scope. Temporary inference fixtures are under `/tmp/private-librarian-*`; no repository build artifacts are tracked.
+- `next_action`: choose an authorized source folder in the open app and run the first explicit index; if visual DINO clustering is wanted, authenticate/accept its terms and rerun the exact specialist model command.
+- `memory_decision`: existing canonical-checkout/Private Librarian memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-08-31.
+
 ## 2026-08-31 — synchronize local main after remote cleaner update
 
 - `scope`: update the canonical local checkout after `origin/main` advanced, validate the new cleaner UI/source changes, and refresh the installed macOS artifact.

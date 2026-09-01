@@ -15,6 +15,14 @@ set all agree. The runtime then checks the Python modules needed by that specifi
 model before loading it. A directory copied from an older cache, a partial download,
 an extra file, or an incomplete runtime is therefore intentionally unavailable.
 
+The pinned Transformers runtime can also change the return type of a model
+helper without changing the checkpoint. In Transformers 5, SigLIP2's
+`get_image_features` and `get_text_features` helpers return a
+`BaseModelOutputWithPooling` object; the bridge must unwrap `pooler_output`
+(or the equivalent full-output embedding field) before normalizing it. A
+raw `.float()` call on that wrapper is a runtime failure even though the
+snapshot and Python dependencies are valid.
+
 PaddleOCR-VL is a separate platform case: its upstream runtime documentation
 currently excludes CPU and Arm, so the macOS app reports it as unsupported and
 continues with native Vision OCR. macOS provisioning and packaging skip that
