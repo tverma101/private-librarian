@@ -90,7 +90,7 @@ struct CleanerHomeView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Private Librarian")
                     .font(.headline)
-                Text("Local cleanup · originals stay untouched")
+                Text("Local cleanup · originals stay put until you apply a plan")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -304,9 +304,65 @@ struct CleanerHomeView: View {
 
                 Spacer()
             }
+
+            if let report = model.lastCleanupReport {
+                cleanupSummary(report)
+            }
         }
         .padding(18)
         .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    /// Answers "what folder did it just sort, and what came out of it?" —
+    /// per-folder scan counts plus the groups this cleanup created or grew.
+    private func cleanupSummary(_ report: LibrarianModel.CleanupReport) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Divider()
+            HStack {
+                Label("Last cleanup · \(report.finishedAt.formatted(date: .abbreviated, time: .shortened))", systemImage: "checkmark.seal")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+            }
+
+            ForEach(report.folders) { folder in
+                HStack(spacing: 8) {
+                    Image(systemName: "folder.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+                    Text(folder.displayName)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .help(folder.rootPath)
+                    Text(folder.completion == "completed" ? "" : "· \(folder.completion)")
+                        .font(.caption)
+                        .foregroundStyle(folder.completion == "completed" ? .clear : .orange)
+                    Spacer()
+                    Text("\(folder.scanned) scanned · \(folder.processed) updated · \(folder.missingMarked) missing")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+
+            if !model.changedGroupIDs.isEmpty {
+                let changed = model.smartGroups.filter { model.changedGroupIDs.contains($0.id) }
+                if !changed.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Organized now")
+                            .font(.caption.weight(.medium))
+                        FlowChips(items: changed.prefix(8).map { group in
+                            "\(group.title) (\(group.fileIDs.count))"
+                        })
+                        if changed.count > 8 {
+                            Text("+ \(changed.count - 8) more groups in the Library")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private func compactMetric(_ title: String, value: Int, icon: String) -> some View {
@@ -416,6 +472,26 @@ extension LocalModelProfile {
         case .fast: return "Fast"
         case .balanced: return "Balanced"
         case .quality: return "Quality"
+        }
+    }
+}
+
+/// Simple wrapping row of capsule chips for compact summaries.
+struct FlowChips: View {
+    let items: [String]
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 6)],
+                  alignment: .leading, spacing: 6) {
+            ForEach(items, id: \.self) { item in
+                Text(item)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(.background.opacity(0.7), in: Capsule())
+                    .help(item)
+            }
         }
     }
 }

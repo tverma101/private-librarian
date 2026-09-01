@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import LibrarianCore
+import LibrarianAppSupport
 
 enum LibrarySection: String, CaseIterable, Identifiable {
     case overview
@@ -211,6 +212,7 @@ struct MagicContentView: View {
                         .onAppear { proxy.scrollTo("detail-top", anchor: .top) }
                         .onChange(of: model.selectedSection) { _, _ in
                             proxy.scrollTo("detail-top", anchor: .top)
+                            model.reloadSectionFiles()
                         }
                     }
                 }
@@ -236,15 +238,15 @@ struct MagicContentView: View {
         case .smart:
             SmartGroupsView()
         case .screenshots:
-            FileExplorerView(title: "Screenshot explorer", subtitle: "Images stay in place; these are catalog memberships.", files: model.files(for: .screenshots))
+            FileExplorerView(title: "Screenshot explorer", subtitle: "Images stay in place; these are catalog memberships.", files: model.sectionFiles)
         case .school:
-            FileExplorerView(title: "School", subtitle: "Course and assignment labels are virtual catalog memberships.", files: model.files(for: .school))
+            FileExplorerView(title: "School", subtitle: "Course and assignment labels are virtual catalog memberships.", files: model.sectionFiles)
         case .projects:
-            FileExplorerView(title: "Projects", subtitle: "Project labels remain virtual and source-safe.", files: model.files(for: .projects))
+            FileExplorerView(title: "Projects", subtitle: "Project labels remain virtual and source-safe.", files: model.sectionFiles)
         case .documents:
-            FileExplorerView(title: "Documents", subtitle: "Text, PDF, and office content with searchable evidence.", files: model.files(for: .documents))
+            FileExplorerView(title: "Documents", subtitle: "Text, PDF, and office content with searchable evidence.", files: model.sectionFiles)
         case .media:
-            FileExplorerView(title: "Audio & Video", subtitle: "Media remains in place; transcripts and labels stay in the encrypted catalog.", files: model.files(for: .media))
+            FileExplorerView(title: "Audio & Video", subtitle: "Media remains in place; transcripts and labels stay in the encrypted catalog.", files: model.sectionFiles)
         case .similarity:
             SimilarityMapView(
                 clusters: model.similarityClusters,
@@ -253,9 +255,9 @@ struct MagicContentView: View {
         case .review:
             ReviewInboxView()
         case .duplicates:
-            FileExplorerView(title: "Duplicate candidates", subtitle: "Report-only results. Nothing is deleted.", files: model.files(for: .duplicates))
+            FileExplorerView(title: "Duplicate candidates", subtitle: "Report-only results. Nothing is deleted.", files: model.sectionFiles)
         case .missing:
-            FileExplorerView(title: "Missing originals", subtitle: "Catalog records remain; originals are never reconstructed.", files: model.files(for: .missing))
+            FileExplorerView(title: "Missing originals", subtitle: "Catalog records remain; originals are never reconstructed.", files: model.sectionFiles)
         }
     }
 }
@@ -373,6 +375,11 @@ private struct FileExplorerView: View {
                         }
                         Divider()
                     }
+                    if files.count >= 200 {
+                        Text("Showing the first 200 files; run a search to find anything specific.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -387,7 +394,7 @@ private struct SmartGroupsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("A small set of useful virtual groups. Singleton model labels are hidden, related items are consolidated, and originals stay exactly where they are.")
+            Text("A small set of useful virtual groups. Singleton model labels are hidden, related items are consolidated, and originals stay exactly where they are — unless you explicitly apply a group below.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -398,43 +405,83 @@ private struct SmartGroupsView: View {
                     description: Text("Index a folder first. Groups appear only when there is enough evidence to be useful."))
             } else {
                 ForEach(model.smartGroups) { group in
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 7) {
-                            HStack {
-                                Label(group.title, systemImage: icon(for: group.kind))
-                                    .font(.headline)
-                                Spacer()
-                                Text("\(group.fileIDs.count) items")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(group.subtitle)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            if group.kind != .category {
-                                Text("confidence \(String(format: "%.0f%%", group.confidence * 100))")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            ForEach(Array(group.fileIDs.prefix(6)), id: \.self) { id in
-                                HStack(spacing: 8) {
-                                    Image(systemName: "doc")
-                                        .foregroundStyle(.secondary)
-                                    Text((model.filePath(for: id) as NSString).lastPathComponent)
-                                        .lineLimit(1)
-                                }
-                                .font(.caption)
-                            }
-                            if group.fileIDs.count > 6 {
-                                Text("+ \(group.fileIDs.count - 6) more")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                    SmartGroupCard(group: group)
                 }
             }
+
+            if model.canUndoApply || model.lastApplyMessage != nil {
+                HStack(spacing: 10) {
+                    if model.canUndoApply {
+                        Button("Undo Last Apply") { model.undoLastApply() }
+                    }
+                    if let message = model.lastApplyMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    Spacer()
+                }
+            }
+        }
+        .sheet(item: $model.pendingApplyPlan) { plan in
+            ApplyPlanConfirmationSheet(plan: plan)
+        }
+    }
+}
+
+private struct SmartGroupCard: View {
+    @EnvironmentObject private var model: LibrarianModel
+    let group: SmartOrganizationGroup
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Label(group.title, systemImage: icon(for: group.kind))
+                        .font(.headline)
+                    Spacer()
+                    Text("\(group.fileIDs.count) items")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Text(group.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if group.kind != .category {
+                    Text("confidence \(String(format: "%.0f%%", group.confidence * 100))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(Array(group.fileIDs.prefix(6)), id: \.self) { id in
+                    HStack(spacing: 8) {
+                        Image(systemName: "doc")
+                            .foregroundStyle(.secondary)
+                        Text((model.filePath(for: id) as NSString).lastPathComponent)
+                            .lineLimit(1)
+                    }
+                    .font(.caption)
+                }
+                if group.fileIDs.count > 6 {
+                    Text("+ \(group.fileIDs.count - 6) more")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 10) {
+                    Button {
+                        model.prepareApply(group: group)
+                    } label: {
+                        Label("Apply to Finder…", systemImage: "folder.badge.gearshape")
+                    }
+                    .disabled(!model.catalogReady)
+                    .help("Create a folder named after this group and move the member files into it. Nothing moves until you confirm.")
+                    Text("You confirm every move; originals are moved, never copied or deleted, and it is undoable.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -444,6 +491,60 @@ private struct SmartGroupsView: View {
         case .nearDuplicate: return "square.on.square"
         case .semantic: return "point.3.connected.trianglepath.dotted"
         }
+    }
+}
+
+private struct ApplyPlanConfirmationSheet: View {
+    @EnvironmentObject private var model: LibrarianModel
+    let plan: OrganizationApplier.Plan
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Apply “\(plan.groupTitle)” to Finder", systemImage: "folder.badge.gearshape")
+                .font(.title3.bold())
+
+            VStack(alignment: .leading, spacing: 6) {
+                LabeledContent("A new folder") {
+                    Text(plan.destinationFolderPath)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+                LabeledContent("Files to move") {
+                    Text("\(plan.items.count)")
+                }
+                if plan.skippedOtherRoots > 0 {
+                    LabeledContent("Left in other folders") {
+                        Text("\(plan.skippedOtherRoots) (different root)")
+                    }
+                }
+                if !plan.missingPaths.isEmpty {
+                    LabeledContent("Skipped (missing)") {
+                        Text("\(plan.missingPaths.count)")
+                    }
+                }
+            }
+            .font(.subheadline)
+
+            Text("Files are moved (never copied or deleted) into the new folder. Every move is journaled in the encrypted catalog, and Undo Last Apply restores them.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { model.cancelApply() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Move \(plan.items.count) Files") {
+                    model.confirmApply()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(plan.items.isEmpty)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
     }
 }
 
@@ -818,7 +919,7 @@ private struct MagicPrivacyBar: View {
                     .font(.caption)
             }
             Spacer()
-            Text("READ ONLY · OFFLINE · ENCRYPTED").font(.caption2).foregroundStyle(.secondary)
+            Text("OFFLINE · ENCRYPTED · MOVES ONLY WHEN YOU APPLY").font(.caption2).foregroundStyle(.secondary)
         }
     }
 }

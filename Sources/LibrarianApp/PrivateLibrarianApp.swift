@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import LibrarianCore
+import LibrarianAppSupport
 
 /// Native SwiftUI shell (plan §1, §45, §46). No web server, no WebView,
 /// no listening socket. Sources are added via the system folder picker with
@@ -28,7 +29,10 @@ struct PrivateLibrarianApp: App {
                     .keyboardShortcut("o")
             }
         }
-        WindowGroup("Advanced Library", id: "advanced-library") {
+        // A `Window` (not WindowGroup) presents exactly one instance: repeated
+        // openWindow(id:) calls focus the existing library instead of stacking
+        // duplicate windows every time the user taps Library/Review/Duplicates.
+        Window("Advanced Library", id: "advanced-library") {
             MagicContentView()
                 .environmentObject(model)
                 .frame(minWidth: 900, minHeight: 560)
@@ -82,6 +86,27 @@ final class LibrarianModel: ObservableObject {
         let specialistRuntimeIDs: Set<String>
     }
 
+    /// What the last "Clean Up" actually did, per folder, so the home screen
+    /// can answer "what just got sorted?" instead of only "cleanup complete".
+    struct CleanupFolderReport: Identifiable, Sendable, Equatable {
+        let rootPath: String
+        let scanned: Int
+        let processed: Int
+        let missingMarked: Int
+        let unreadableDirectories: Int
+        let completion: String
+
+        var id: String { rootPath }
+        var displayName: String {
+            (rootPath as NSString).lastPathComponent.isEmpty ? rootPath : (rootPath as NSString).lastPathComponent
+        }
+    }
+
+    struct CleanupReport: Sendable, Equatable {
+        let finishedAt: Date
+        let folders: [CleanupFolderReport]
+    }
+
     @Published var sources: [SourceFolder] = []
     @Published var statusLines: [String] = []
     @Published var searchResults: [String] = []
@@ -97,6 +122,12 @@ final class LibrarianModel: ObservableObject {
     @Published var smartGroups: [SmartOrganizationGroup] = []
     @Published var coverage: OnboardingCoverage = .empty
     @Published var projectSummaries: [ProjectSemanticSummary] = []
+    @Published private(set) var sectionFiles: [Catalog.FileSummary] = []
+    @Published private(set) var lastCleanupReport: CleanupReport?
+    @Published private(set) var changedGroupIDs: Set<String> = []
+    @Published var pendingApplyPlan: OrganizationApplier.Plan?
+    @Published private(set) var lastApplyMessage: String?
+    @Published private(set) var canUndoApply = false
     @Published private(set) var pausedPaths: Set<String> = []
     @Published private(set) var liveIndexRunning = false
     @Published private(set) var livePendingEvents = 0
@@ -106,6 +137,7 @@ final class LibrarianModel: ObservableObject {
     @Published private(set) var catalogReady = false
     @Published private(set) var catalogError: String?
     @Published private(set) var isTier2Provisioned = false
+    @Published private(set) var specialistProvisionedIDs: Set<String> = []
     @Published private(set) var tier2Status = "Checking local model readiness…"
     @Published private(set) var isSearching = false
     @Published var localTranscriptionEnabled: Bool {
@@ -225,6 +257,7 @@ final class LibrarianModel: ObservableObject {
         modelStatusTask = Task { @MainActor [weak self] in
             let readiness = await work.value
             guard let self, self.modelStatusGeneration == generation else { return }
+            self.specialistProvisionedIDs = readiness.specialistIDs
             self.isTier2Provisioned = readiness.coreML
                 || readiness.legacyRuntime
                 || !readiness.specialistRuntimeIDs.isEmpty
@@ -588,6 +621,107 @@ final class LibrarianModel: ObservableObject {
         log("stopping cleanup after the current file…")
     }
 
+    // MARK: - Apply to Finder (explicit, journaled, undoable)
+
+    /// Build the preview plan for turning one virtual group into a real
+    /// folder. Nothing moves until `confirmApply()` runs.
+    func prepareApply(group: SmartOrganizationGroup) {
+        guard catalogReady, let catalog else { return }
+        let roots = sources.map(\.path)
+        Task.detached(priority: .userInitiated) { [weak self, catalog, group, roots] in
+            do {
+                let plan = try OrganizationApplier.plan(
+                    group: group,
+                    pathFor: { fileID in (try? catalog.fileRow(id: fileID))?.path ?? "" },
+                    sourceRoots: roots)
+                await MainActor.run { [weak self] in
+                    self?.pendingApplyPlan = plan
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.log("could not prepare apply: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func cancelApply() {
+        pendingApplyPlan = nil
+    }
+
+    /// Execute the confirmed plan with fresh security-scoped leases, then
+    /// refresh the dashboard so the group reflects the new locations.
+    func confirmApply() {
+        guard let plan = pendingApplyPlan else { return }
+        pendingApplyPlan = nil
+        guard catalogReady, let catalog else { return }
+        let bookmarkData = bookmarkDataByPath
+        let roots = sources.map(\.path)
+        log("applying \"\(plan.groupTitle)\" · moving \(plan.items.count) files…")
+        Task.detached(priority: .userInitiated) { [weak self, catalog, plan, bookmarkData, roots] in
+            do {
+                let outcome = try OrganizationApplier.apply(
+                    plan: plan,
+                    leaseForRoot: { rootPath in
+                        try SecurityScopedBookmarkLease(bookmarkData: bookmarkData[rootPath])
+                    },
+                    catalog: catalog)
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.lastApplyMessage = outcome.succeeded
+                        ? "Moved \(outcome.moved) files to \(outcome.destinationFolderPath)"
+                        : "Moved \(outcome.moved) of \(outcome.moved + outcome.failures.count) files · \(outcome.failures.count) failed"
+                    if !outcome.failures.isEmpty {
+                        self.log("apply failures: \(outcome.failures.prefix(5).map { "\($0.path): \($0.reason)" }.joined(separator: " · "))")
+                    }
+                    self.log("applied \"\(plan.groupTitle)\" · \(outcome.destinationFolderPath)")
+                    self.refreshDashboard()
+                    self.updateUndoAvailability()
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.log("apply failed: \(error.localizedDescription)")
+                    self?.lastApplyMessage = "Apply failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func undoLastApply() {
+        guard catalogReady, let catalog else { return }
+        let bookmarkData = bookmarkDataByPath
+        let roots = sources.map(\.path)
+        Task.detached(priority: .userInitiated) { [weak self, catalog, bookmarkData, roots] in
+            let outcome = OrganizationApplier.undoLatest(
+                catalog: catalog,
+                sourceRoots: roots,
+                leaseForRoot: { rootPath in
+                    try SecurityScopedBookmarkLease(bookmarkData: bookmarkData[rootPath])
+                })
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if let outcome {
+                    self.lastApplyMessage = outcome.succeeded
+                        ? "Undo complete · \(outcome.restored) files restored"
+                        : "Undo restored \(outcome.restored) files · \(outcome.failures.count) failed"
+                    self.log(self.lastApplyMessage ?? "")
+                } else {
+                    self.lastApplyMessage = "Nothing left to undo"
+                }
+                self.refreshDashboard()
+                self.updateUndoAvailability()
+            }
+        }
+    }
+
+    private func updateUndoAvailability() {
+        guard let catalog else {
+            canUndoApply = false
+            return
+        }
+        canUndoApply = ((try? catalog.latestApplyBatchID()) ?? nil) != nil
+    }
+
     func shutdown() {
         activeIndexCancellation?.cancel(reason: .shutdown)
         modelStatusTask?.cancel()
@@ -648,11 +782,15 @@ final class LibrarianModel: ObservableObject {
         let token = IndexCancellationToken()
         activeIndexCancellation = token
         isIndexing = true
+        // Snapshot group sizes so completion can show exactly which groups the
+        // cleanup created or grew ("what did it just organize?").
+        let groupSizesBefore = Dictionary(uniqueKeysWithValues: smartGroups.map { ($0.id, $0.fileIDs.count) })
         log("cleanup started · \(scopeLabel)")
 
-        Task.detached(priority: .userInitiated) { [weak self, jobs, session, token, scopeLabel] in
+        Task.detached(priority: .userInitiated) { [weak self, jobs, session, token, scopeLabel, groupSizesBefore] in
             var unavailableSources: [String] = []
             var completionReasons: [String] = []
+            var folderReports: [CleanupFolderReport] = []
             for (source, lease) in jobs {
                 if token.isCancelled { break }
                 do {
@@ -662,6 +800,13 @@ final class LibrarianModel: ObservableObject {
                         }
                     }
                     completionReasons.append("\(source.path)=\(result.completion.rawValue)")
+                    folderReports.append(CleanupFolderReport(
+                        rootPath: source.path,
+                        scanned: result.scanned,
+                        processed: result.processed,
+                        missingMarked: result.missingMarked,
+                        unreadableDirectories: result.unreadableDirectories,
+                        completion: result.completion.rawValue))
                     if result.completion == .rootUnavailable {
                         unavailableSources.append(source.path)
                     }
@@ -673,6 +818,7 @@ final class LibrarianModel: ObservableObject {
             }
             let unavailableSnapshot = unavailableSources
             let completionSnapshot = completionReasons
+            let reportSnapshot = folderReports
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 for path in unavailableSnapshot {
@@ -680,6 +826,14 @@ final class LibrarianModel: ObservableObject {
                 }
                 self.activeIndexCancellation = nil
                 self.isIndexing = false
+                self.refreshDashboard()
+                if !reportSnapshot.isEmpty {
+                    self.lastCleanupReport = CleanupReport(finishedAt: Date(), folders: reportSnapshot)
+                    let sizesAfter = Dictionary(uniqueKeysWithValues: self.smartGroups.map { ($0.id, $0.fileIDs.count) })
+                    self.changedGroupIDs = Set(sizesAfter.filter { id, count in
+                        (groupSizesBefore[id] ?? 0) < count
+                    }.keys)
+                }
                 if token.isCancelled {
                     self.log("cleanup stopped · \(token.reason?.rawValue ?? "cancelled")")
                 } else if completionSnapshot.contains(where: { $0.hasSuffix("=rootUnavailable") }) {
@@ -687,7 +841,6 @@ final class LibrarianModel: ObservableObject {
                 } else {
                     self.log("cleanup complete · \(scopeLabel)")
                 }
-                self.refreshDashboard()
                 self.restartLiveCoordinator()
             }
         }
@@ -712,10 +865,30 @@ final class LibrarianModel: ObservableObject {
         } catch {
             log("dashboard refresh error: \(error)")
         }
+        reloadSectionFiles()
+        updateUndoAvailability()
     }
 
-    func files(for section: LibrarySection) -> [Catalog.FileSummary] {
-        guard let catalog else { return [] }
+    /// Section listings run bounded catalog queries; keep them off the main
+    /// actor and only publish results for the still-selected section.
+    func reloadSectionFiles() {
+        let section = selectedSection
+        guard let catalog else {
+            sectionFiles = []
+            return
+        }
+        Task.detached(priority: .userInitiated) { [weak self, catalog, section] in
+            let files = Self.sectionFileSummaries(catalog: catalog, section: section)
+            await MainActor.run { [weak self] in
+                guard let self, self.selectedSection == section else { return }
+                self.sectionFiles = files
+            }
+        }
+    }
+
+    private nonisolated static func sectionFileSummaries(
+        catalog: Catalog, section: LibrarySection
+    ) -> [Catalog.FileSummary] {
         switch section {
         case .screenshots:
             let plural = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshots", limit: 200)) ?? []
@@ -883,7 +1056,7 @@ final class LibrarianModel: ObservableObject {
         let sandboxed = amISandboxed()
         return [
             ("App Sandbox enabled", sandboxed),
-            ("Sources read-only", true),   // enforced by SourceBroker O_RDONLY|O_NOFOLLOW + entitlements
+            ("Read-only unless you apply a plan", true), // SourceBroker O_RDONLY|O_NOFOLLOW; moves only via journaled apply
             ("Internet disabled", !hasNetworkEntitlement()),
             ("Telemetry disabled", true),
             ("Catalog encrypted", catalogOnDiskEncrypted()),

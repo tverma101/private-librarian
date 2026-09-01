@@ -3,7 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>com.apple.security.app-sandbox</key><true/>
-    <key>com.apple.security.files.user-selected.read-only</key><true/>
+    <!-- Read-write so an explicitly approved "Apply to Finder" plan can move
+         files inside a folder the user selected. Access is still granted only
+         through user-selected security-scoped bookmarks; indexing itself stays
+         read-only (SourceBroker opens O_RDONLY|O_NOFOLLOW). -->
+    <key>com.apple.security.files.user-selected.read-write</key><true/>
     <key>com.apple.security.files.bookmarks.app-scope</key><true/>
 </dict>
 </plist>

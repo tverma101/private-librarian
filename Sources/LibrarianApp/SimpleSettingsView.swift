@@ -38,6 +38,13 @@ struct SimpleSettingsView: View {
 
                 Toggle("Use downloaded local models", isOn: $model.localEmbeddingsEnabled)
 
+                if model.isTier2Provisioned, !model.localEmbeddingsEnabled {
+                    Label("Models are installed — turn this on to use them.",
+                          systemImage: "lightbulb")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+
                 Toggle("Transcribe audio locally", isOn: $model.localTranscriptionEnabled)
                     .disabled(!model.isLocalTranscriptionAvailable)
 
@@ -202,7 +209,9 @@ struct SimpleSettingsView: View {
 
     @ViewBuilder
     private func modelRow(_ descriptor: LocalModelDescriptor) -> some View {
-        let provisioned = SpecialistModelBridge.isProvisioned(descriptor)
+        // Uses the cached provisioned set from refreshModelStatus instead of
+        // walking model directories on every settings render.
+        let provisioned = model.specialistProvisionedIDs.contains(descriptor.id)
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: provisioned ? "checkmark.circle.fill" : "arrow.down.circle")
                 .foregroundStyle(provisioned ? .green : .secondary)
@@ -238,10 +247,30 @@ struct SimpleSettingsView: View {
 
     private var setupCommand: String {
         let scriptPath: String = {
+            if let override = ProcessInfo.processInfo.environment["LIBRARIAN_SCRIPTS_DIR"] {
+                let candidate = URL(fileURLWithPath: override).appendingPathComponent("setup_models.sh")
+                if FileManager.default.isExecutableFile(atPath: candidate.path) { return candidate.path }
+            }
             if let resourceURL = Bundle.main.resourceURL {
                 let bundled = resourceURL.appendingPathComponent("scripts/setup_models.sh")
                 if FileManager.default.isExecutableFile(atPath: bundled.path) {
-                    return shellQuote(bundled.path)
+                    return bundled.path
+                }
+            }
+            // Dev builds (SPM) do not bundle the script: walk up from the
+            // executable to the repo root so the copied command is absolute
+            // and works even though Terminal opens in the home directory.
+            var url = URL(fileURLWithPath: CommandLine.arguments.first ?? "")
+            for _ in 0..<8 {
+                let parent = url.deletingLastPathComponent()
+                if url.path == parent.path { break }
+                url = parent
+                if FileManager.default.fileExists(atPath: url.appendingPathComponent("Package.swift").path) {
+                    let script = url.appendingPathComponent("scripts/setup_models.sh")
+                    if FileManager.default.isExecutableFile(atPath: script.path) {
+                        return script.path
+                    }
+                    break
                 }
             }
             return "./scripts/setup_models.sh"
@@ -253,7 +282,7 @@ struct SimpleSettingsView: View {
         case .balanced: profile = "balanced"
         case .quality: profile = "quality"
         }
-        return "\(scriptPath) --specialist-profile \(profile)"
+        return "\(shellQuote(scriptPath)) --specialist-profile \(profile)"
     }
 
     private func copySetupCommand(openTerminal: Bool) {
@@ -271,7 +300,21 @@ struct SimpleSettingsView: View {
     }
 
     private func openModelsFolder() {
-        let folder = LibrarianModel.appSupportDir.appendingPathComponent("Models", isDirectory: true)
+        // Open the exact directory scripts/setup_models.sh populates by
+        // default (its APP_SUPPORT_DIR default is the app container path).
+        // Opening a different Models folder made installed models look lost.
+        let env = ProcessInfo.processInfo.environment
+        let folder: URL
+        if let override = env["LIBRARIAN_MODELS_DIR"], !override.isEmpty {
+            folder = URL(fileURLWithPath: override)
+        } else if let appSupport = env["LIBRARIAN_APP_SUPPORT_DIR"], !appSupport.isEmpty {
+            folder = URL(fileURLWithPath: appSupport, isDirectory: true).appendingPathComponent("Models", isDirectory: true)
+        } else {
+            let home = env["HOME"] ?? NSHomeDirectory()
+            folder = URL(fileURLWithPath: home, isDirectory: true)
+                .appendingPathComponent("Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian", isDirectory: true)
+                .appendingPathComponent("Models", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         NSWorkspace.shared.open(folder)
     }

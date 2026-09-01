@@ -343,6 +343,17 @@ public final class Catalog: @unchecked Sendable {
             enqueued REAL NOT NULL
         );
 
+        -- Journal of user-approved materializations (virtual group -> real
+        -- folder moves). Catalog-only; rows exist so an apply can be undone.
+        CREATE TABLE IF NOT EXISTS apply_journal (
+            batch_id TEXT NOT NULL,
+            applied_at REAL NOT NULL,
+            file_id TEXT NOT NULL,
+            from_path TEXT NOT NULL,
+            to_path TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_apply_journal_batch ON apply_journal(batch_id, applied_at);
+
         INSERT OR IGNORE INTO virtual_categories(name) VALUES ('Review');
         INSERT OR IGNORE INTO meta(k,v) VALUES ('schema_version','1');
         """)
@@ -1040,19 +1051,56 @@ public final class Catalog: @unchecked Sendable {
         }
     }
 
+    /// Build an injection-safe FTS5 MATCH query. Every token becomes a quoted
+    /// term joined by implicit AND, so multi-word queries match documents that
+    /// contain the words anywhere instead of requiring the exact phrase.
+    /// Double quotes inside the input delimit phrases and are otherwise
+    /// stripped from terms so a crafted string can never escape the quoting.
+    public static func ftsMatchQuery(_ input: String) -> String {
+        var tokens: [String] = []
+        var current = ""
+        var inQuotes = false
+        func flush() {
+            if !current.isEmpty {
+                tokens.append(current)
+                current = ""
+            }
+        }
+        for character in input {
+            if character == "\"" {
+                if inQuotes {
+                    flush()
+                    inQuotes = false
+                } else {
+                    flush()
+                    inQuotes = true
+                }
+            } else if character.isWhitespace, !inQuotes {
+                flush()
+            } else {
+                current.append(character)
+            }
+        }
+        flush()
+        return tokens
+            .map { "\"" + $0.trimmingCharacters(in: .whitespaces)
+                .replacingOccurrences(of: "\"", with: "") + "\"" }
+            .joined(separator: " ")
+    }
+
     /// FTS5 full-text search over extracted content (inside the encrypted db).
     public func searchExact(_ q: String, limit: Int = 50) throws -> [SearchHit] {
         guard limit > 0,
               !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
-        // Escape double quotes so user input cannot break out of the FTS query syntax.
-        let safe = q.replacingOccurrences(of: "\"", with: "\"\"")
+        let match = Self.ftsMatchQuery(q)
+        guard !match.isEmpty else { return [] }
         let textHits = try query("""
             SELECT f.id, f.path, snippet(text_fts, 1, '[', ']', '…', 12), bm25(text_fts)
             FROM text_fts JOIN files f ON f.id = text_fts.file_id
             WHERE f.status = 'indexed' AND text_fts MATCH ?
             ORDER BY bm25(text_fts)
             LIMIT ?
-            """, binds: [.text("\"" + safe + "\""), .int(Int64(limit))]) { r in
+            """, binds: [.text(match), .int(Int64(limit))]) { r in
             SearchHit(fileID: r.text(0) ?? "", path: r.text(1) ?? "",
                       snippet: r.text(2), rank: r.real(3))
         }
@@ -1062,7 +1110,7 @@ public final class Catalog: @unchecked Sendable {
             WHERE f.status = 'indexed' AND transcripts_fts MATCH ?
             ORDER BY bm25(transcripts_fts)
             LIMIT ?
-            """, binds: [.text("\"" + safe + "\""), .int(Int64(limit))]) { r in
+            """, binds: [.text(match), .int(Int64(limit))]) { r in
             SearchHit(fileID: r.text(0) ?? "", path: r.text(1) ?? "",
                       snippet: r.text(2), rank: r.real(3))
         }
@@ -1124,6 +1172,68 @@ public final class Catalog: @unchecked Sendable {
         return Set(memberships.compactMap { row in
             row.categoryPath == prefix || row.categoryPath.hasPrefix(prefix + "/") ? row.fileID : nil
         })
+    }
+
+    // MARK: - Apply journal (user-approved materialization of virtual groups)
+
+    public struct ApplyJournalEntry: Sendable, Equatable {
+        public let fileID: String
+        public let fromPath: String
+        public let toPath: String
+
+        public init(fileID: String, fromPath: String, toPath: String) {
+            self.fileID = fileID
+            self.fromPath = fromPath
+            self.toPath = toPath
+        }
+    }
+
+    /// Record every successful move of a user-approved apply batch. Callers
+    /// must only journal moves that actually happened so undo stays truthful.
+    public func recordApplyBatch(batchID: String, appliedAt: TimeInterval, entries: [ApplyJournalEntry]) throws {
+        guard !batchID.isEmpty, !entries.isEmpty else { return }
+        try transaction {
+            for entry in entries {
+                try run("""
+                    INSERT INTO apply_journal(batch_id, applied_at, file_id, from_path, to_path)
+                    VALUES (?, ?, ?, ?, ?)
+                    """, binds: [.text(batchID), .real(appliedAt), .text(entry.fileID),
+                                 .text(entry.fromPath), .text(entry.toPath)])
+            }
+        }
+    }
+
+    public func latestApplyBatchID() throws -> String? {
+        try query("""
+            SELECT batch_id FROM apply_journal
+            ORDER BY applied_at DESC, rowid DESC LIMIT 1
+            """) { $0.text(0) ?? "" }.first
+    }
+
+    public func applyBatchEntries(batchID: String) throws -> [ApplyJournalEntry] {
+        try query("""
+            SELECT file_id, from_path, to_path FROM apply_journal
+            WHERE batch_id = ? ORDER BY rowid
+            """, binds: [.text(batchID)]) { row in
+            ApplyJournalEntry(fileID: row.text(0) ?? "",
+                              fromPath: row.text(1) ?? "",
+                              toPath: row.text(2) ?? "")
+        }
+    }
+
+    /// Remove one batch's journal rows after a complete, verified undo.
+    public func deleteApplyBatch(batchID: String) throws {
+        try run("DELETE FROM apply_journal WHERE batch_id = ?", binds: [.text(batchID)])
+    }
+
+    /// Keep the catalog coherent after a real move: the file keeps its row and
+    /// memberships; only its recorded source path changes. The update is
+    /// guarded by the original path so a stale plan can never rewrite a row
+    /// that no longer matches what was moved.
+    public func updateAppliedPath(fileID: String, fromPath: String, toPath: String) throws {
+        try run("""
+            UPDATE files SET path = ? WHERE id = ? AND path = ?
+            """, binds: [.text(toPath), .text(fileID), .text(fromPath)])
     }
 
     /// Exact duplicate candidates only. Near-duplicate and semantic families

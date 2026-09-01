@@ -4,7 +4,7 @@
 
 Private Librarian is a native macOS app that indexes folders you choose, understands their contents locally, and gives you a much smaller set of useful virtual groups instead of reorganizing your real filesystem.
 
-**Your original files stay where they are.** Private Librarian does not move, rename, delete, Finder-tag, chmod, or rewrite source files. Search data, categories, similarity families, transcripts, corrections, and learned rules live in an encrypted catalog.
+**Your original files stay where they are by default.** Private Librarian does not rename, delete, Finder-tag, chmod, or rewrite source files. Search data, categories, similarity families, transcripts, corrections, and learned rules live in an encrypted catalog. The one exception is explicit and opt-in: **Apply to Finder** lets you materialize a virtual group — the files are moved (never copied or deleted) into a named folder, every move is journaled in the encrypted catalog, and the batch can be undone in one click.
 
 > **Project status:** alpha / integration testing. The main organizer is implemented and exercised in CI. One real packaged-app relaunch smoke test remains for macOS security-scoped bookmark persistence before this should be called a finished daily-use release.
 
@@ -45,12 +45,12 @@ A file may appear in several virtual groups at the same time. For example, one i
 
 The main rule is simple:
 
-**Private Librarian may read selected source files, but it must never modify them.**
+**Private Librarian may read selected source files freely, but it only ever modifies them through an explicit, journaled, undoable apply action.**
 
 1. `SourceBroker` owns source access and opens files read-only with no-follow checks.
 2. Models and parsers receive broker-owned bytes, derived text, feature data, or decoded PCM rather than write-capable source handles.
 3. Writable state belongs in the encrypted catalog.
-4. Organization is virtual; source filesystem layout is not the organizer's output format.
+4. Organization is virtual; the source filesystem layout changes only when you confirm an **Apply to Finder** plan. Applied moves are journaled in the encrypted catalog and restorable with Undo Last Apply.
 5. The packaged app has no runtime network client/server entitlement, telemetry, or cloud inference dependency.
 6. Optional model provisioning is explicit; the app does not silently download model weights.
 7. Saved folder access fails closed when its security-scoped bookmark cannot be restored and the UI asks for reauthorization instead of trying a raw path.
