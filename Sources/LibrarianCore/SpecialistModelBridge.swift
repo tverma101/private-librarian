@@ -244,7 +244,7 @@ public final class SpecialistModelBridge: @unchecked Sendable {
         return Self.parseClassification(worker.call(request, timeout: timeout), modelID: model.id)
     }
 
-    public func classifyText(model: LocalModelDescriptor = LocalModelStack.ling,
+    public func classifyText(model: LocalModelDescriptor,
                              evidence: SpecialistEvidence,
                              timeout: TimeInterval = 120) -> SpecialistClassification? {
         guard model.capability == .textReasoning, Self.isProvisioned(model), let worker else { return nil }

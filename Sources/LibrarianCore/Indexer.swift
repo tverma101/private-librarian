@@ -93,6 +93,16 @@ public final class Indexer: @unchecked Sendable {
     private let similarityClustering = SimilarityClustering()
     private let options: Options
     private let processingVersion: String
+
+    /// Image-junk heuristics are image-only derived state. Keep their generation
+    /// separate so an upgrade rechecks images without forcing a giant code tree
+    /// through extraction/model work again.
+    private func requiredProcessingVersion(for kind: FileKind) -> String {
+        kind == .image
+            ? processingVersion + "|image-junk:\(ImageJunkScorer.revision)"
+            : processingVersion
+    }
+
     /// Swappable ASR provider — defaults to Disabled (no transcription until benchmarked).
     private let transcriptionProvider: any SpeechTranscriptionProvider
     /// Swappable decoder — defaults to the broker-owned PCM decoder.
@@ -413,7 +423,7 @@ public final class Indexer: @unchecked Sendable {
                 binds: [.text(fileID)])
             try catalog.txRun(
                 "UPDATE files SET last_extractor=? WHERE id=?",
-                binds: [.text(processingVersion), .text(fileID)])
+                binds: [.text(requiredProcessingVersion(for: current.kind)), .text(fileID)])
             committed = true
         }
         return committed
@@ -427,6 +437,7 @@ public final class Indexer: @unchecked Sendable {
                          updateSimilarity: Bool = true) throws -> Bool {
         // 1. Identity BEFORE processing.
         guard let ident = try? broker.identity(at: path) else { return false }
+        let generationVersion = requiredProcessingVersion(for: ident.kind)
 
         // Critical efficiency gate: this must happen before upsert, extraction,
         // Vision, hashing, or Tier-2 subprocesses. The old implementation had
@@ -434,7 +445,7 @@ public final class Indexer: @unchecked Sendable {
         if let stored = try catalog.storedState(forPath: path),
            !ChangeDetection.needsProcessing(stored: stored,
                                             current: ident,
-                                            requiredExtractorVersion: processingVersion) {
+                                            requiredExtractorVersion: generationVersion) {
             // Cloud hydration can change allocated storage without changing
             // the logical size or timestamps. Recheck this non-hydrating
             // resource state so a placeholder is revisited when its bytes
@@ -459,7 +470,7 @@ public final class Indexer: @unchecked Sendable {
             // Plan §22: index the link itself as metadata. Never open it.
             try catalog.upsertFile(identity: ident, id: id)
             try catalog.setStatus(fileID: id, status: "pending")
-            try catalog.setExtractorVersion(fileID: id, version: processingVersion)
+            try catalog.setExtractorVersion(fileID: id, version: generationVersion)
             try catalog.setStatus(fileID: id, status: "indexed")
             // A path that is no longer a decodable regular file cannot stand
             // behind its old generation's transcript.
@@ -471,7 +482,7 @@ public final class Indexer: @unchecked Sendable {
         if EvidenceExtractor.isCloudPlaceholder(at: path) {
             try catalog.upsertFile(identity: ident, id: id)
             try catalog.setStatus(fileID: id, status: "pending")
-            try catalog.setExtractorVersion(fileID: id, version: processingVersion)
+            try catalog.setExtractorVersion(fileID: id, version: generationVersion)
             try catalog.setStatus(fileID: id, status: "cloud-placeholder")
             // Placeholder bytes are not present; any earlier transcript does
             // not describe this generation.
@@ -542,6 +553,7 @@ public final class Indexer: @unchecked Sendable {
         // Runs under MEDIUM slot; failures are non-fatal.
         var visionLabels: [(String, Float)] = []
         var screenshotAssessment: ScreenshotAssessment?
+        var imageJunkAssessment: ImageJunkAssessment?
         var stagedFeaturePrint: (Data, String)? = nil
         if ident.kind == .image, let bytes = imageBytes, !bytes.isEmpty {
             recordWork { $0.visionCalls += 1 }
@@ -565,6 +577,11 @@ public final class Indexer: @unchecked Sendable {
                 metadata: metadata,
                 ocrText: textContent,
                 visionLabels: visionLabels.map { $0.0 })
+            imageJunkAssessment = ImageJunkScorer.assess(
+                data: bytes,
+                ocrText: textContent,
+                visionLabels: visionLabels,
+                isScreenshot: screenshotAssessment?.isScreenshot == true)
         }
 
         // Optional specialist OCR is an escalation only. Native text/Vision OCR wins when
@@ -764,6 +781,26 @@ public final class Indexer: @unchecked Sendable {
             guard let data = try? classification.jsonData() else { return nil }
             return ClassifierContract.validate(data)
         }()
+        if let junk = imageJunkAssessment, junk.isLikelyJunk,
+           let base = validatedClass,
+           !base.categories.contains("Image/Junk") {
+            var categories = base.categories
+            if categories.count < ClassifierContract.maxCategories {
+                categories.append("Image/Junk")
+            }
+            let junkReasons = junk.reasons.map { "junk:\($0)" }
+            let trial = Classification(
+                fileID: base.fileID,
+                categories: categories,
+                description: base.description,
+                confidence: max(base.confidence, junk.score),
+                reasonCodes: Array((base.reasonCodes + junkReasons)
+                    .prefix(ClassifierContract.maxReasonCodes)))
+            if let data = try? trial.jsonData(),
+               let validated = ClassifierContract.validate(data) {
+                validatedClass = validated
+            }
+        }
         let baseCategories = validatedClass?.categories
         // Apply only enabled, evidence-bound rules after the base classifier.
         // Re-validate the merged result so learned data cannot bypass the
@@ -998,7 +1035,7 @@ public final class Indexer: @unchecked Sendable {
                         ON CONFLICT(file_id) DO UPDATE SET sha256=excluded.sha256, computed=excluded.computed
                         """, binds: [.text(id), .int(ident.size), .blob(digest), .real(Date().timeIntervalSince1970)])
                 }
-                try catalog.txRun("UPDATE files SET last_extractor=? WHERE id=?", binds: [.text(processingVersion), .text(id)])
+                try catalog.txRun("UPDATE files SET last_extractor=? WHERE id=?", binds: [.text(generationVersion), .text(id)])
                 try catalog.txRun("DELETE FROM learned_reindex_queue WHERE file_id=?", binds: [.text(id)])
                 try catalog.txRun("UPDATE files SET status='indexed' WHERE id=?", binds: [.text(id)])
             }

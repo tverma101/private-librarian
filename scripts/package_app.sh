@@ -409,10 +409,7 @@ if [ "$INCLUDE_MODELS" -eq 1 ] || [ "$INCLUDE_SPECIALISTS" -eq 1 ]; then
             dinov3-vitb16-lvd1689m \
             paddleocr-vl-1.6 \
             minicpm-v-4.6 \
-            ling-3.0-tiny \
-            lfm2.5-vl-3b \
-            internvl3.5-4b \
-            mimo-vl-7b-rl-2508; do
+            lfm2.5-vl-3b; do
             model_path="$SPECIALIST_MODEL_SOURCE/$model"
             if [ ! -e "$model_path" ] && [ ! -L "$model_path" ]; then
                 continue
@@ -452,6 +449,14 @@ install -m 0444 "$ROOT_DIR/scripts/embed.py" "$RESOURCES/scripts/embed.py"
 if [ -f "$ROOT_DIR/scripts/specialist.py" ]; then
     install -m 0444 "$ROOT_DIR/scripts/specialist.py" "$RESOURCES/scripts/specialist.py"
 fi
+# Model provisioning is intentionally an explicit Terminal action. The app's
+# runtime network entitlement stays disabled; these helpers are packaged so a
+# clean install can bootstrap pinned local models without a source checkout.
+install -m 0555 "$ROOT_DIR/scripts/setup_models.sh" "$RESOURCES/scripts/setup_models.sh"
+install -m 0444 "$ROOT_DIR/scripts/provision_image_models.py" "$RESOURCES/scripts/provision_image_models.py"
+install -m 0444 "$ROOT_DIR/scripts/provision_specialist_models.py" "$RESOURCES/scripts/provision_specialist_models.py"
+install -m 0444 "$ROOT_DIR/scripts/model-requirements.txt" "$RESOURCES/scripts/model-requirements.txt"
+install -m 0444 "$ROOT_DIR/scripts/specialist-requirements.txt" "$RESOURCES/scripts/specialist-requirements.txt"
 
 # The release bundle is assembled from the archived executable, so compile
 # the asset catalog explicitly instead of relying on SwiftPM's resource bundle

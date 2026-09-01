@@ -60,33 +60,12 @@ MODELS = {
         "profile": "balanced",
         "note": "first VLM fallback for ambiguous images",
     },
-    "ling-3.0-tiny": {
-        "hf_id": "inclusionAI/Ling-3.0-tiny",
-        "revision_prefix": "b61f433",
-        "license": "MIT",
-        "profile": "quality",
-        "note": "text/routing ambiguity fallback",
-    },
     "lfm2.5-vl-3b": {
         "hf_id": "LiquidAI/LFM2.5-VL-3B",
         "revision_prefix": "5a414ea",
         "license": "LFM1.0",
         "profile": "quality",
         "note": "optional heavy VLM; non-Apache license, never bundled by default",
-    },
-    "internvl3.5-4b": {
-        "hf_id": "OpenGVLab/InternVL3_5-4B",
-        "revision_prefix": "481f6e3",
-        "license": "Apache-2.0",
-        "profile": "quality",
-        "note": "optional heavy VLM",
-    },
-    "mimo-vl-7b-rl-2508": {
-        "hf_id": "XiaomiMiMo/MiMo-VL-7B-RL-2508",
-        "revision_prefix": "4bfb270",
-        "license": "MIT",
-        "profile": "quality",
-        "note": "optional heaviest VLM; never resident by default",
     },
 }
 
@@ -323,7 +302,7 @@ def main() -> int:
             continue
         names.append(name)
     if args.profile == "quality" and not args.verify_only:
-        print("WARNING: quality profile includes multiple multi-GB models; this is an explicit large download.", file=sys.stderr)
+        print("Quality adds LFM2.5-VL-3B; models above the 11.50 GB Mac ceiling are not offered.", file=sys.stderr)
     MODELS_ROOT.mkdir(parents=True, exist_ok=True)
     ok = True
     for name in names:

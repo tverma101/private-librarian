@@ -197,6 +197,7 @@ public struct SmartOrganizationPlanner: Sendable {
         case .category:
             if group.id == "composite:installers-archives" { return "downloads" }
             if group.id == "composite:media" { return "media" }
+            if group.id == "category:Image/Junk" { return "junk" }
             if group.id.hasPrefix("category:Screenshots/") { return "screenshots" }
             if group.id.hasPrefix("category:School/") { return "school" }
             if group.id.hasPrefix("category:Projects/") { return "projects" }
@@ -212,7 +213,7 @@ public struct SmartOrganizationPlanner: Sendable {
         case "school": preferred = 4
         case "projects": preferred = 2
         case "semantic": preferred = 5
-        case "downloads", "media": preferred = 1
+        case "downloads", "media", "junk": preferred = 1
         default: preferred = 4
         }
         return min(maxGroups, preferred)
@@ -270,6 +271,7 @@ public struct SmartOrganizationPlanner: Sendable {
         if path == "Assignment" {
             return ("Assignments", "School & work", 100)
         }
+        if path == "Image/Junk" { return ("Likely image junk", "Review before deleting", 108) }
         if path == "Documents/PDF" { return ("PDFs", "Documents", 90) }
         if path == "Documents/Office" { return ("Office documents", "Documents", 90) }
         if path == "Image/Animals" { return ("Animals", "Images", 82) }

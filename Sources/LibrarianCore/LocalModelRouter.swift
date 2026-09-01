@@ -80,15 +80,6 @@ public enum LocalModelStack: Sendable {
         cost: .medium,
         runtime: "paddleocr")
 
-    public static let ling = LocalModelDescriptor(
-        id: "ling-3.0-tiny",
-        capability: .textReasoning,
-        hfID: "inclusionAI/Ling-3.0-tiny",
-        revisionPrefix: "b61f433",
-        license: "MIT",
-        cost: .heavy,
-        runtime: "local-generation")
-
     /// First generative vision fallback. Small enough to be the only VLM in the balanced profile.
     public static let miniCPM = LocalModelDescriptor(
         id: "minicpm-v-4.6",
@@ -100,24 +91,6 @@ public enum LocalModelStack: Sendable {
         runtime: "transformers")
 
     /// Heavy fallbacks are installable but never default-resident or called for routine files.
-    public static let mimo = LocalModelDescriptor(
-        id: "mimo-vl-7b-rl-2508",
-        capability: .visionHeavyFallback,
-        hfID: "XiaomiMiMo/MiMo-VL-7B-RL-2508",
-        revisionPrefix: "4bfb270",
-        license: "MIT",
-        cost: .heavy,
-        runtime: "transformers")
-
-    public static let internVL = LocalModelDescriptor(
-        id: "internvl3.5-4b",
-        capability: .visionHeavyFallback,
-        hfID: "OpenGVLab/InternVL3_5-4B",
-        revisionPrefix: "481f6e3",
-        license: "Apache-2.0",
-        cost: .heavy,
-        runtime: "transformers-remote-code")
-
     public static let lfm = LocalModelDescriptor(
         id: "lfm2.5-vl-3b",
         capability: .visionHeavyFallback,
@@ -127,8 +100,10 @@ public enum LocalModelStack: Sendable {
         cost: .heavy,
         runtime: "transformers-remote-code")
 
+    /// Product-supported stack for the target Mac. Models whose own execution
+    /// footprint cannot reliably remain below 11.50 GB are intentionally absent.
     public static let all: [LocalModelDescriptor] = [
-        siglip2, dinov3, paddleOCR, ling, miniCPM, mimo, internVL, lfm
+        siglip2, dinov3, paddleOCR, miniCPM, lfm
     ]
 
     public static func descriptor(id: String) -> LocalModelDescriptor? {
@@ -141,7 +116,7 @@ public enum LocalModelProfile: String, Codable, Sendable, CaseIterable {
     case fast
     /// Embeddings first, MiniCPM only for unresolved images, specialist OCR when native OCR is weak.
     case balanced
-    /// Same cheap-first path, with Ling/heavy VLM escalation available for a small hard queue.
+    /// Same cheap-first path, with one bounded LFM2.5-VL 3B fallback for the hard queue.
     case quality
 }
 
@@ -195,13 +170,10 @@ public struct LocalModelRouter: Sendable {
         if profile != .fast, context.kind == .image, ambiguous {
             append(LocalModelStack.miniCPM)
         }
-        if profile == .quality, ambiguous {
-            if context.hasUsefulText { append(LocalModelStack.ling) }
-            if context.kind == .image {
-                append(LocalModelStack.lfm)
-                append(LocalModelStack.internVL)
-                append(LocalModelStack.mimo)
-            }
+        if profile == .quality, ambiguous, context.kind == .image {
+            // LFM2.5-VL-3B is the largest supported fallback. Larger candidates
+            // were removed rather than relying on swap/offload to hide a RAM violation.
+            append(LocalModelStack.lfm)
         }
         return route
     }

@@ -71,10 +71,7 @@ MODEL_SPECS = {
     "dinov3-vitb16-lvd1689m": ("facebook/dinov3-vitb16-pretrain-lvd1689m", "5931719"),
     "paddleocr-vl-1.6": ("PaddlePaddle/PaddleOCR-VL-1.6", "cdc88f5"),
     "minicpm-v-4.6": ("openbmb/MiniCPM-V-4.6", "8169864"),
-    "ling-3.0-tiny": ("inclusionAI/Ling-3.0-tiny", "b61f433"),
     "lfm2.5-vl-3b": ("LiquidAI/LFM2.5-VL-3B", "5a414ea"),
-    "internvl3.5-4b": ("OpenGVLab/InternVL3_5-4B", "481f6e3"),
-    "mimo-vl-7b-rl-2508": ("XiaomiMiMo/MiMo-VL-7B-RL-2508", "4bfb270"),
 }
 
 RUNTIME_MODULES = {
@@ -82,10 +79,7 @@ RUNTIME_MODULES = {
     "dinov3-vitb16-lvd1689m": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
     "paddleocr-vl-1.6": ("PIL", "paddle", "paddleocr"),
     "minicpm-v-4.6": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
-    "ling-3.0-tiny": ("torch", "transformers", "accelerate", "safetensors"),
     "lfm2.5-vl-3b": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
-    "internvl3.5-4b": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
-    "mimo-vl-7b-rl-2508": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
 }
 
 ALLOWED_CATEGORIES = {
@@ -109,17 +103,11 @@ WARM_MODELS = {
 TRANSIENT_MODELS = {
     "paddleocr-vl-1.6",
     "minicpm-v-4.6",
-    "ling-3.0-tiny",
     "lfm2.5-vl-3b",
-    "internvl3.5-4b",
-    "mimo-vl-7b-rl-2508",
 }
 OFFLOADABLE_MODELS = {
     "minicpm-v-4.6",
-    "ling-3.0-tiny",
     "lfm2.5-vl-3b",
-    "internvl3.5-4b",
-    "mimo-vl-7b-rl-2508",
 }
 OFFLOAD_ROOT = Path(os.environ.get(
     "LIBRARIAN_SPECIALIST_OFFLOAD_DIR",
@@ -195,7 +183,13 @@ def _prepare_for_model(model_id: str) -> None:
 
 
 def _large_model_load_kwargs(model_id: str) -> dict:
+    # Hard target-Mac rule: no supported transient model may silently load FP32.
+    # Apple Silicon CPU/GPU share unified memory, so swapping layers to CPU is not
+    # a substitute for fitting the model. Keep the supported 3B fallback in FP16.
+    import torch
     kwargs = {"low_cpu_mem_usage": True}
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        kwargs["torch_dtype"] = torch.float16
     if model_id not in OFFLOADABLE_MODELS:
         return kwargs
     offload = OFFLOAD_ROOT / model_id
@@ -546,43 +540,13 @@ def _extract_json(text: str) -> dict:
     return {"categories": categories, "description": description, "confidence": confidence, "reasons": reasons}
 
 
-def _load_text_generator(model_id: str):
-    if model_id in _CACHE:
-        return _CACHE[model_id]
-    if not _verify_snapshot(model_id):
-        raise RuntimeError(f"untrusted/unprovisioned model: {model_id}")
-    _prepare_for_model(model_id)
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    path = str(_model_dir(model_id))
-    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        path, local_files_only=True, trust_remote_code=False, **_large_model_load_kwargs(model_id))
-    model.eval()
-    _CACHE[model_id] = (model, tokenizer)
-    return model, tokenizer
-
-
-def _ling_classify(existing: dict) -> dict:
-    import torch
-    model, tokenizer = _load_text_generator("ling-3.0-tiny")
-    prompt = _classification_prompt(existing)
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
-    device = getattr(model, "device", None)
-    if device is not None:
-        encoded = {k: v.to(device) for k, v in encoded.items()}
-    with torch.inference_mode():
-        output = model.generate(**encoded, do_sample=False, max_new_tokens=320)
-    generated = output[0][encoded["input_ids"].shape[-1]:]
-    return _extract_json(tokenizer.decode(generated, skip_special_tokens=True))
-
-
 def _vlm_classify(model_id: str, image, existing: dict) -> dict:
     if not _verify_snapshot(model_id):
         raise RuntimeError(f"untrusted/unprovisioned model: {model_id}")
     _prepare_for_model(model_id)
     prompt = _classification_prompt(existing)
     path = str(_model_dir(model_id))
-    if model_id in {"minicpm-v-4.6", "internvl3.5-4b"}:
+    if model_id == "minicpm-v-4.6":
         from transformers import AutoModel, AutoTokenizer
         cached = _CACHE.get(model_id)
         if cached is None:
@@ -594,11 +558,8 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
             cached = (model, tokenizer)
             _CACHE[model_id] = cached
         model, tokenizer = cached
-        if model_id == "minicpm-v-4.6":
-            response = model.chat(image=image, msgs=[{"role": "user", "content": prompt}], tokenizer=tokenizer,
-                                  sampling=False, temperature=0)
-        else:
-            response = model.chat(tokenizer, image, prompt, generation_config={"do_sample": False, "max_new_tokens": 320})
+        response = model.chat(image=image, msgs=[{"role": "user", "content": prompt}], tokenizer=tokenizer,
+                              sampling=False, temperature=0)
         return _extract_json(response[0] if isinstance(response, tuple) else str(response))
     from transformers import AutoModelForImageTextToText, AutoProcessor
     cached = _CACHE.get(model_id)
@@ -644,7 +605,7 @@ def _handle(request: dict) -> dict:
             "offline": True,
             "available": {mid: _verify_snapshot(mid, verify_hashes=False) for mid in ids if mid in MODEL_SPECS},
             "resident": sorted(_CACHE),
-            "memory_policy": "warm-encoders-only; transient-exclusive; disk-offload-available",
+            "memory_policy": "11.50-GB-ceiling; warm-encoders-only; transient-exclusive; MPS-fp16",
         }
     if op == "release":
         model_id = request.get("model")
@@ -660,11 +621,9 @@ def _handle(request: dict) -> dict:
     if op == "ocr":
         raw, _ = _decode_image(str(request.get("data_b64", "")))
         return _paddle_ocr(raw, str(request.get("suffix", ".png")))
-    if op == "classify_text":
-        return _ling_classify(request.get("evidence") if isinstance(request.get("evidence"), dict) else {})
     if op == "classify_image":
         model_id = str(request.get("model", "minicpm-v-4.6"))
-        if model_id not in {"minicpm-v-4.6", "lfm2.5-vl-3b", "internvl3.5-4b", "mimo-vl-7b-rl-2508"}:
+        if model_id not in {"minicpm-v-4.6", "lfm2.5-vl-3b"}:
             raise ValueError("model is not a configured VLM fallback")
         _, image = _decode_image(str(request.get("data_b64", "")))
         evidence = request.get("evidence") if isinstance(request.get("evidence"), dict) else {}
@@ -685,7 +644,7 @@ def main() -> int:
             "status": "ok",
             "offline": True,
             "models": sorted(MODEL_SPECS),
-            "memory_policy": "warm-encoders-only; transient-exclusive; disk-offload-available",
+            "memory_policy": "11.50-GB-ceiling; warm-encoders-only; transient-exclusive; MPS-fp16",
         }))
         return 0
     if args.runtime_check:
