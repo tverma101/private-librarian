@@ -150,11 +150,16 @@ public final class Catalog: @unchecked Sendable {
             created REAL NOT NULL
         );
 
+        -- NOTE: no UNIQUE(name) here. Same-named categories under different
+        -- parents ("Archive" and "Tax/Archive") are valid taxonomy shapes;
+        -- uniqueness is per-parent via the expression index created below.
         CREATE TABLE IF NOT EXISTS virtual_categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
             parent_id INTEGER REFERENCES virtual_categories(id) ON DELETE CASCADE
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_virtual_categories_parent_name
+            ON virtual_categories(COALESCE(parent_id, -1), name);
 
         CREATE TABLE IF NOT EXISTS category_membership (
             category_id INTEGER NOT NULL REFERENCES virtual_categories(id) ON DELETE CASCADE,
@@ -413,6 +418,60 @@ public final class Catalog: @unchecked Sendable {
         if (summaryVersion.first ?? "1") == "4" {
             try run("UPDATE meta SET v='5' WHERE k='schema_version'")
         }
+        // v5→v6: rebuild virtual_categories without its historical table-level
+        // UNIQUE(name). That constraint made a same-named child under two
+        // different parents (e.g. "Archive" and "Tax/Archive") impossible:
+        // txEnsureCategory's INSERT hit the constraint, the whole index commit
+        // rolled back, and the file re-failed on every retry. Uniqueness is
+        // now per-parent (COALESCE(parent_id,-1), name). Detection is the old
+        // table SQL so the rebuild is idempotent and never touches catalogs
+        // already created with the new schema.
+        let categoryTableSQL = try query(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='virtual_categories'") {
+            $0.text(0) ?? ""
+        }.first ?? ""
+        if categoryTableSQL.contains("NOT NULL UNIQUE") {
+            let rebuilt = try transactionBodyWithoutForeignKeys {
+                try rawExec("""
+                    CREATE TABLE virtual_categories_rebuild (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        parent_id INTEGER REFERENCES virtual_categories_rebuild(id) ON DELETE CASCADE
+                    )
+                    """)
+                try rawExec("""
+                    INSERT INTO virtual_categories_rebuild(id, name, parent_id)
+                    SELECT id, name, parent_id FROM virtual_categories
+                    """)
+                try rawExec("DROP TABLE virtual_categories")
+                try rawExec("ALTER TABLE virtual_categories_rebuild RENAME TO virtual_categories")
+            }
+            _ = rebuilt
+            // The id is preserved by the copy, so memberships keep resolving.
+            try run("CREATE UNIQUE INDEX IF NOT EXISTS idx_virtual_categories_parent_name ON virtual_categories(COALESCE(parent_id, -1), name)")
+        }
+        let taxonomyVersion = try query("SELECT v FROM meta WHERE k='schema_version'") { $0.text(0) ?? "1" }
+        if (taxonomyVersion.first ?? "1") == "5" {
+            try run("UPDATE meta SET v='6' WHERE k='schema_version'")
+        }
+    }
+
+    /// Run a write sequence with foreign keys disabled for its duration.
+    /// Needed by table rebuilds: dropping a table that others reference is
+    /// only legal with FK enforcement off, and the pragma is a no-op inside
+    /// a transaction, so it is toggled around the caller's transaction.
+    private func transactionBodyWithoutForeignKeys(_ body: () throws -> Void) throws -> Bool {
+        try rawExec("PRAGMA foreign_keys=OFF")
+        do {
+            try transaction {
+                try body()
+            }
+            try rawExec("PRAGMA foreign_keys=ON")
+            return true
+        } catch {
+            try? rawExec("PRAGMA foreign_keys=ON")
+            throw error
+        }
     }
 
     // MARK: - Low-level helpers
@@ -630,7 +689,12 @@ public final class Catalog: @unchecked Sendable {
             WHERE path=? OR path LIKE ?
             ESCAPE '~'
             """, binds: [.text(normalized), .text(childPattern)])
-        try run("DELETE FROM project_summaries WHERE root=?", binds: [.text(normalized)])
+        // Nested roots inside the unscoped root lose their scope too, so
+        // their persisted summaries must not outlive the data they describe.
+        try run("""
+            DELETE FROM project_summaries WHERE root=? OR root LIKE ?
+            ESCAPE '~'
+            """, binds: [.text(normalized), .text(childPattern)])
         try? clearAccessBackoff(atOrUnder: normalized)
     }
 
@@ -659,13 +723,27 @@ public final class Catalog: @unchecked Sendable {
             .replacingOccurrences(of: "_", with: "~_")
     }
 
+    /// Run a multi-statement write sequence atomically when called from
+    /// outside the catalog queue. When already inside a transaction on the
+    /// queue (the indexer's commit path), statements join that transaction
+    /// instead of attempting a nested BEGIN.
+    private func atomically(_ body: () throws -> Void) throws {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            try body()
+        } else {
+            try transaction { try body() }
+        }
+    }
+
     public func saveText(fileID: String, body: String, extractor: String) throws {
-        try run("DELETE FROM text_fts WHERE file_id=?", binds: [.text(fileID)])
-        try run("""
-        INSERT INTO text_content(file_id, body, extractor, created) VALUES(?,?,?,?)
-        ON CONFLICT(file_id) DO UPDATE SET body=excluded.body, extractor=excluded.extractor, created=excluded.created
-        """, binds: [.text(fileID), .text(body), .text(extractor), .real(Date().timeIntervalSince1970)])
-        try run("INSERT INTO text_fts(file_id, body) VALUES(?,?)", binds: [.text(fileID), .text(body)])
+        try atomically {
+            try run("DELETE FROM text_fts WHERE file_id=?", binds: [.text(fileID)])
+            try run("""
+            INSERT INTO text_content(file_id, body, extractor, created) VALUES(?,?,?,?)
+            ON CONFLICT(file_id) DO UPDATE SET body=excluded.body, extractor=excluded.extractor, created=excluded.created
+            """, binds: [.text(fileID), .text(body), .text(extractor), .real(Date().timeIntervalSince1970)])
+            try run("INSERT INTO text_fts(file_id, body) VALUES(?,?)", binds: [.text(fileID), .text(body)])
+        }
     }
 
     public func saveClassification(_ c: Classification, classifier: String) throws {
@@ -706,6 +784,7 @@ public final class Catalog: @unchecked Sendable {
                 INSERT INTO review_inbox(file_id, state, reason, created, updated)
                 VALUES(?, 'open', ?, ?, ?)
                 ON CONFLICT(file_id) DO UPDATE SET state='open', reason=excluded.reason, updated=excluded.updated
+                WHERE state != 'resolved'
                 """, binds: [.text(effective.fileID), .text(reason), .real(now), .real(now)])
         }
     }
@@ -836,7 +915,7 @@ public final class Catalog: @unchecked Sendable {
     public func recordHash(fileID: String, size: Int64, sha256: Data) throws {
         try run("""
         INSERT INTO exact_hashes(file_id, size, sha256, computed) VALUES(?,?,?,?)
-        ON CONFLICT(file_id) DO UPDATE SET sha256=excluded.sha256, computed=excluded.computed
+        ON CONFLICT(file_id) DO UPDATE SET size=excluded.size, sha256=excluded.sha256, computed=excluded.computed
         """, binds: [.text(fileID), .int(size), .blob(sha256), .real(Date().timeIntervalSince1970)])
     }
 
@@ -863,10 +942,12 @@ public final class Catalog: @unchecked Sendable {
     }
 
     public func replaceEmbeddingChunks(fileID: String, model: String, chunks: [(dim: Int, vector: Data)]) throws {
-        try run("DELETE FROM embedding_chunks WHERE file_id=? AND model=?", binds: [.text(fileID), .text(model)])
-        for (idx, c) in chunks.enumerated() {
-            try run("INSERT INTO embedding_chunks(file_id, model, chunk_index, dim, vector) VALUES(?,?,?,?,?)",
-                    binds: [.text(fileID), .text(model), .int(Int64(idx)), .int(Int64(c.dim)), .blob(c.vector)])
+        try atomically {
+            try run("DELETE FROM embedding_chunks WHERE file_id=? AND model=?", binds: [.text(fileID), .text(model)])
+            for (idx, c) in chunks.enumerated() {
+                try run("INSERT INTO embedding_chunks(file_id, model, chunk_index, dim, vector) VALUES(?,?,?,?,?)",
+                        binds: [.text(fileID), .text(model), .int(Int64(idx)), .int(Int64(c.dim)), .blob(c.vector)])
+            }
         }
     }
 
@@ -1244,10 +1325,15 @@ public final class Catalog: @unchecked Sendable {
             FROM exact_hashes h
             JOIN files f ON f.id=h.file_id
             JOIN (
-                SELECT size, sha256 FROM exact_hashes
-                GROUP BY size, sha256 HAVING count(*) > 1
+                -- Groups form over indexed files only, matching the
+                -- dashboard: a deleted/unscoped twin must not make its
+                -- surviving copy look like a duplicate.
+                SELECT dhe.size, dhe.sha256 FROM exact_hashes dhe
+                JOIN files ef ON ef.id=dhe.file_id
+                WHERE ef.status='indexed'
+                GROUP BY dhe.size, dhe.sha256 HAVING count(*) > 1
             ) d ON d.size=h.size AND d.sha256=h.sha256
-            WHERE f.status NOT IN ('missing', 'unscoped')
+            WHERE f.status='indexed'
             """) { $0.text(0) ?? "" }
         return Set(rows)
     }
@@ -1330,6 +1416,22 @@ public final class Catalog: @unchecked Sendable {
                     "DELETE FROM category_overrides WHERE file_id=? AND category=? AND action=?",
                     binds: [.text(fileID), .text("Review/Unknown"),
                             .text(ReviewCorrectionAction.addCategory.rawValue)])
+                // An explicit correction also supersedes the 'Review/Unknown'
+                // membership row markUnknown inserted (source='review' rows
+                // survive classifier rebuilds, so it must be removed here).
+                // The category is hierarchical (Review → Unknown), so match
+                // by full path, not by component name.
+                try txRun("""
+                    DELETE FROM category_membership WHERE file_id=? AND category_id IN (
+                        WITH RECURSIVE category_paths(id, path) AS (
+                            SELECT id, name FROM virtual_categories WHERE parent_id IS NULL
+                            UNION ALL
+                            SELECT c.id, category_paths.path || '/' || c.name
+                            FROM virtual_categories c JOIN category_paths ON c.parent_id = category_paths.id
+                        )
+                        SELECT id FROM category_paths WHERE path='Review/Unknown'
+                    )
+                    """, binds: [.text(fileID)])
                 try txRun("""
                     INSERT INTO category_overrides(file_id, category, action, updated)
                     VALUES(?,?,?,?)
@@ -1562,14 +1664,16 @@ public final class Catalog: @unchecked Sendable {
     // MARK: - Transcripts (encrypted at rest — same SQLCipher DB)
 
     public func saveTranscript(fileID: String, provider: String, segments: [TranscriptSegment]) throws {
-        try run("DELETE FROM transcripts WHERE file_id=?", binds: [.text(fileID)])
-        try run("DELETE FROM transcripts_fts WHERE file_id=?", binds: [.text(fileID)])
-        let now = Date().timeIntervalSince1970
-        for seg in segments {
-            try run("INSERT INTO transcripts(file_id, start, end, text, provider, created) VALUES(?,?,?,?,?,?)",
-                    binds: [.text(fileID), .real(seg.start), .real(seg.end), .text(seg.text), .text(provider), .real(now)])
-            if !seg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                try run("INSERT INTO transcripts_fts(file_id, text) VALUES(?,?)", binds: [.text(fileID), .text(seg.text)])
+        try atomically {
+            try run("DELETE FROM transcripts WHERE file_id=?", binds: [.text(fileID)])
+            try run("DELETE FROM transcripts_fts WHERE file_id=?", binds: [.text(fileID)])
+            let now = Date().timeIntervalSince1970
+            for seg in segments {
+                try run("INSERT INTO transcripts(file_id, start, end, text, provider, created) VALUES(?,?,?,?,?,?)",
+                        binds: [.text(fileID), .real(seg.start), .real(seg.end), .text(seg.text), .text(provider), .real(now)])
+                if !seg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    try run("INSERT INTO transcripts_fts(file_id, text) VALUES(?,?)", binds: [.text(fileID), .text(seg.text)])
+                }
             }
         }
     }

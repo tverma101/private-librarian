@@ -33,6 +33,9 @@ public struct ScreenshotIntelligence: Sendable {
     public init() {}
 
     /// Reads only image bytes supplied by the broker; never opens a source path.
+    /// Only EXPLICIT screenshot markers count as metadata evidence. Device
+    /// model names ("iPhone") and color profiles ("Display P3") appear on
+    /// every camera photo from those devices and must never be signals.
     public static func metadata(from data: Data) -> ScreenshotImageMetadata? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -42,7 +45,7 @@ public struct ScreenshotIntelligence: Sendable {
         let names = props.keys.compactMap { key -> String? in
             let value = props[key]
             let text = String("\(key) \(String(describing: value))".prefix(512)).lowercased()
-            return ["screen", "display", "screenshot", "iphone", "ipad", "simulator"].contains(where: text.contains) ? text : nil
+            return ["screenshot", "simulator"].contains(where: text.contains) ? text : nil
         }
         return ScreenshotImageMetadata(pixelWidth: width, pixelHeight: height,
                                        properties: Array(names.prefix(32)))
@@ -64,8 +67,8 @@ public struct ScreenshotIntelligence: Sendable {
             if Self.screenRatio(ratio) && min(metadata.pixelWidth, metadata.pixelHeight) >= 500 {
                 score += 0.35; reasons.append("dimensions:screen-ratio")
             }
-            if metadata.properties.contains(where: { $0.contains("screen") || $0.contains("display") || $0.contains("iphone") || $0.contains("ipad") }) {
-                score += 0.25; reasons.append("metadata:display")
+            if metadata.properties.contains(where: { $0.contains("screenshot") || $0.contains("simulator") }) {
+                score += 0.25; reasons.append("metadata:screenshot-marker")
             }
         }
         let uiTokens = ["settings", "search", "share", "menu", "home", "back", "notifications", "browser", "tab", "http", "www"]
@@ -75,7 +78,10 @@ public struct ScreenshotIntelligence: Sendable {
         if labels.contains(where: { $0.contains("screen") || $0.contains("computer") || $0.contains("monitor") }) {
             score += 0.20; reasons.append("vision:screen-like")
         }
-        guard score >= 0.40 else {
+        // 0.50 keeps common camera shapes (4:3, 3:2, 16:9 grabs) with generic
+        // OCR noise below the gate, while filename+dimensions (0.55) and any
+        // explicit marker combination still detect reliably.
+        guard score >= 0.50 else {
             return ScreenshotAssessment(isScreenshot: false, subtype: .unknown, confidence: score,
                                          reasonCodes: reasons.isEmpty ? ["insufficient-screenshot-evidence"] : reasons)
         }
@@ -91,8 +97,11 @@ public struct ScreenshotIntelligence: Sendable {
         assess(filename: filename, metadata: nil, ocrText: ocrText, visionLabels: visionLabels)
     }
 
+    /// Modern screen shapes only. 4:3 (1.333) and 3:2 (1.5) are deliberately
+    /// excluded: they are the dominant still-camera aspect ratios, and
+    /// including them classified whole camera libraries as screenshots.
     private static func screenRatio(_ ratio: Float) -> Bool {
-        [1.333, 1.5, 1.6, 1.667, 1.778, 1.8, 2.0, 2.167].contains { abs(ratio - $0) < 0.035 }
+        [1.6, 1.667, 1.778, 1.8, 2.0, 2.167].contains { abs(ratio - $0) < 0.035 }
     }
 
     private static func subtype(text: String, labels: [String]) -> ScreenshotSubtype {

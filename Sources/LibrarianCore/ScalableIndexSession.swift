@@ -162,6 +162,11 @@ public final class ScalableIndexSession: @unchecked Sendable {
         }()
         defer { worker?.close() }
         let sessionCatalog = catalog
+        // Similarity invalidation is batched across the whole scan: the
+        // rebuild loads the entire node+edge graph, so running it once per
+        // 512-file batch multiplied that full-graph cost by N/batchSize.
+        var pendingSimilarityChanges = Set<String>()
+        var pendingSimilarityRemovals = Set<String>()
 
         let discovered = try SourceBroker.enumerateBatches(
             root: root,
@@ -222,10 +227,7 @@ public final class ScalableIndexSession: @unchecked Sendable {
                     generation: scanGeneration,
                 paths: seenPaths)
 
-            if options.updateSimilarity, !changedIDs.isEmpty,
-               cancellation?.isCancelled != true {
-                try? indexer.rebuildSimilarityGraph(changedFileIDs: changedIDs)
-            }
+            pendingSimilarityChanges.formUnion(changedIDs)
             return cancellation?.isCancelled != true
         }
 
@@ -277,11 +279,16 @@ public final class ScalableIndexSession: @unchecked Sendable {
                         continue
                     }
                 }
-                if options.updateSimilarity, !removedIDs.isEmpty,
-                   cancellation?.isCancelled != true {
-                    try? indexer.rebuildSimilarityGraph(removedFileIDs: removedIDs)
-                }
+                pendingSimilarityRemovals.formUnion(removedIDs)
             }
+        }
+
+        // One graph rebuild per scan, after all changes are known.
+        if options.updateSimilarity, cancellation?.isCancelled != true,
+           !pendingSimilarityChanges.isEmpty || !pendingSimilarityRemovals.isEmpty {
+            try? indexer.rebuildSimilarityGraph(
+                changedFileIDs: pendingSimilarityChanges,
+                removedFileIDs: pendingSimilarityRemovals)
         }
 
         if cancellation?.isCancelled != true {

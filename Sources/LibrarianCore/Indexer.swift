@@ -421,9 +421,11 @@ public final class Indexer: @unchecked Sendable {
             try catalog.txRun(
                 "DELETE FROM learned_reindex_queue WHERE file_id=?",
                 binds: [.text(fileID)])
-            try catalog.txRun(
-                "UPDATE files SET last_extractor=? WHERE id=?",
-                binds: [.text(requiredProcessingVersion(for: current.kind)), .text(fileID)])
+            // Deliberately do NOT touch last_extractor here: this fast path
+            // re-applied classification rules only (no extraction, Vision,
+            // OCR, or embeddings). Stamping the current pipeline version
+            // would permanently suppress a future version-bump invalidation
+            // for files whose derived data predates it.
             committed = true
         }
         return committed
@@ -654,25 +656,38 @@ public final class Indexer: @unchecked Sendable {
                 return true
             }
             let decision = AudioProbe.probe(bytes: mBytes, fileExtension: ext.isEmpty ? nil : ext, tagHint: nil)
-            if decision.shouldTranscribe, options.enableLocalASR {
-                // Only run when not Disabled — cheap check before any PCM work.
-                if !(transcriptionProvider is DisabledSpeechTranscriptionProvider) {
-                    var pcmChunks: [PCMChunk] = []
-                    do {
-                        recordWork { $0.decodeCalls += 1 }
-                        try scheduler.perform(as: .medium) {
-                            try pcmDecoder.decode(snapshot: mBytes) { chunk in
-                                pcmChunks.append(chunk)
+                if decision.shouldTranscribe, options.enableLocalASR {
+                    // Only run when not Disabled — cheap check before any PCM work.
+                    if !(transcriptionProvider is DisabledSpeechTranscriptionProvider) {
+                        var pcmChunks: [PCMChunk] = []
+                        var pcmSampleCount = 0
+                        // Bounds retained decoded audio (~2h at 16 kHz mono
+                        // float32 ≈ 460 MB). Without this cap a long audiobook
+                        // passes the compressed-snapshot cap but decodes to
+                        // gigabytes, jetsam-killing the process mid-index —
+                        // and the next scan re-decodes the same file forever.
+                        let maxDecodedSamples = 16_000 * 7_200
+                        do {
+                            recordWork { $0.decodeCalls += 1 }
+                            try scheduler.perform(as: .medium) {
+                                try pcmDecoder.decode(snapshot: mBytes) { chunk in
+                                    pcmSampleCount += chunk.samples.count
+                                    guard pcmSampleCount <= maxDecodedSamples else {
+                                        throw MediaDecoderError.decoderFailed(
+                                            status: -2,
+                                            detail: "decoded audio exceeds the transcription policy cap")
+                                    }
+                                    pcmChunks.append(chunk)
+                                }
                             }
+                        } catch {
+                            // A definitive decode failure means this readable
+                            // generation produced no transcript; commit-time
+                            // generation cleanup below will remove stale speech.
+                            pcmChunks = []
+                            try? catalog.recordError(opaqueRef: id, stage: "media-decode",
+                                                     message: String(describing: error).prefix(200).description)
                         }
-                    } catch {
-                        // A definitive decode failure means this readable
-                        // generation produced no transcript; commit-time
-                        // generation cleanup below will remove stale speech.
-                        pcmChunks = []
-                        try? catalog.recordError(opaqueRef: id, stage: "media-decode",
-                                                 message: String(describing: error).prefix(200).description)
-                    }
                     if !pcmChunks.isEmpty {
                         switch scheduler.perform(as: .heavy, {
                             TranscriptionProviderState.transcribe(transcriptionProvider, chunks: pcmChunks)
@@ -963,10 +978,14 @@ public final class Indexer: @unchecked Sendable {
                         try catalog.txRun("DELETE FROM review_inbox WHERE file_id=? AND state='open'",
                                           binds: [.text(validated.fileID)])
                     } else {
+                        // A user-resolved review item must not silently flip
+                        // back to open just because the file was reprocessed
+                        // at the same low confidence.
                         try catalog.txRun("""
                             INSERT INTO review_inbox(file_id, state, reason, created, updated)
                             VALUES(?, 'open', ?, ?, ?)
                             ON CONFLICT(file_id) DO UPDATE SET state='open', reason=excluded.reason, updated=excluded.updated
+                            WHERE state != 'resolved'
                             """, binds: [.text(validated.fileID), .text(validated.reasonCodes.joined(separator: ",")),
                                            .real(now), .real(now)])
                     }
@@ -1032,7 +1051,7 @@ public final class Indexer: @unchecked Sendable {
                 if let digest = hashToRecord {
                     try catalog.txRun("""
                         INSERT INTO exact_hashes(file_id, size, sha256, computed) VALUES(?,?,?,?)
-                        ON CONFLICT(file_id) DO UPDATE SET sha256=excluded.sha256, computed=excluded.computed
+                        ON CONFLICT(file_id) DO UPDATE SET size=excluded.size, sha256=excluded.sha256, computed=excluded.computed
                         """, binds: [.text(id), .int(ident.size), .blob(digest), .real(Date().timeIntervalSince1970)])
                 }
                 try catalog.txRun("UPDATE files SET last_extractor=? WHERE id=?", binds: [.text(generationVersion), .text(id)])

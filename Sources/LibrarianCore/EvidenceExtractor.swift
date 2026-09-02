@@ -61,7 +61,7 @@ public struct EvidenceExtractor: Sendable {
         switch identity.kind {
         case .text:
             if let data = try? broker.boundedRead(identity.path, limit: 64 * 1024),
-               let str = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) {
+               let str = Self.decodeText(data) {
                 ev.textSample = String(str.prefix(8_000))
             }
         case .office, .archive:
@@ -94,5 +94,23 @@ public struct EvidenceExtractor: Sendable {
             .map { $0.lowercased() }
             .filter { !$0.isEmpty && $0.count > 1 && !($0.allSatisfy { !$0.isLetter }) }
         return Array(Set(parts)).sorted()
+    }
+
+    /// Decode extracted text without mojibake. UTF-8 is tried first; BOM-marked
+    /// UTF-16 files (common on Windows) decode as UTF-16 rather than falling
+    /// through to Latin-1, which silently turns every other byte into NUL
+    /// noise and makes the real words unsearchable. Only genuine single-byte
+    /// legacy content falls back to ISO Latin-1.
+    static func decodeText(_ data: Data) -> String? {
+        if let utf8 = String(data: data, encoding: .utf8) { return utf8 }
+        if data.count >= 2 {
+            let first = data[data.startIndex]
+            let second = data[data.index(after: data.startIndex)]
+            let hasUTF16BOM = (first == 0xFF && second == 0xFE) || (first == 0xFE && second == 0xFF)
+            if hasUTF16BOM {
+                return String(data: data, encoding: .utf16)
+            }
+        }
+        return String(data: data, encoding: .isoLatin1)
     }
 }

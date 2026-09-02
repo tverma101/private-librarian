@@ -548,6 +548,27 @@ codesign --force --sign "$IDENTITY" --timestamp=none --options runtime \
     --entitlements "$SIGNED_ENTITLEMENTS" "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
 
+# Keychain stability report. The catalog key item's access control is tied to
+# the signing identity: an ad-hoc signature is bound to this exact binary's
+# hash, so EVERY rebuild becomes a new untrusted keychain client and macOS
+# prompts on every launch ("keychain hell"). A stable Apple Development or
+# Developer ID signature designates the team instead and stays trusted across
+# rebuilds signed with the same certificate.
+if [ "$IDENTITY" = "-" ]; then
+    cat >&2 <<'WARNING'
+
+*************************************************************************
+WARNING: this app was signed AD-HOC (no codesigning identity found).
+Every rebuild will be treated as a new Keychain client and the app will
+prompt for its catalog key on every launch. Install an Apple Development
+certificate, or override with CODESIGN_IDENTITY, and repackage.
+*************************************************************************
+WARNING
+else
+    echo "codesign identity: $IDENTITY"
+    codesign -dv "$APP_BUNDLE" 2>&1 | grep -E "^(Authority|TeamIdentifier)=" | sed 's/^/  /'
+fi
+
 if [ "$MAKE_DMG" -eq 1 ]; then
     DMG_SOURCE_DIR="$(mktemp -d "$ROOT_DIR/.build/private-librarian-dmg.XXXXXX")"
     # Keep the app and the Applications alias at the volume root so Finder

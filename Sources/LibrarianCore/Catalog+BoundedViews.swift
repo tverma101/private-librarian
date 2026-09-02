@@ -38,11 +38,15 @@ extension Catalog {
             joins += """
              JOIN exact_hashes eh ON eh.file_id=f.id
              JOIN (
-                SELECT size, sha256 FROM exact_hashes
-                GROUP BY size, sha256 HAVING count(*) > 1
+                -- Indexed-only grouping, matching duplicateFileIDs() and the
+                -- dashboard so all duplicate views agree.
+                SELECT dhe.size, dhe.sha256 FROM exact_hashes dhe
+                JOIN files df ON df.id=dhe.file_id
+                WHERE df.status='indexed'
+                GROUP BY dhe.size, dhe.sha256 HAVING count(*) > 1
              ) dup ON dup.size=eh.size AND dup.sha256=eh.sha256
             """
-            clauses.append("f.status NOT IN ('missing','unscoped')")
+            clauses.append("f.status='indexed'")
         }
 
         if let status {

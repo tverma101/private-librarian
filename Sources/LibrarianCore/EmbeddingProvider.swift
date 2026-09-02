@@ -175,7 +175,32 @@ public struct CoreMLMobileCLIPProvider: EmbeddingProvider {
         self.providerID = "coreml-mobileclip-s0:\(Self.checkpointID):prep-\(h)"
     }
 
+    private final class PreflightBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cached: EmbeddingProviderPreflight?
+        func get() -> EmbeddingProviderPreflight? {
+            lock.lock(); defer { lock.unlock() }
+            return cached
+        }
+        func set(_ value: EmbeddingProviderPreflight) {
+            lock.lock(); defer { lock.unlock() }
+            cached = value
+        }
+    }
+
+    private static let preflightBox = PreflightBox()
+
+    /// Cached per process: the provenance branch re-hashes every compiled
+    /// artifact with SHA-256, and this is consulted on EVERY embed call and
+    /// UI readiness refresh. Provisioning changes apply on relaunch.
     public static var preflight: EmbeddingProviderPreflight {
+        if let cached = preflightBox.get() { return cached }
+        let computed = Self.computePreflight()
+        preflightBox.set(computed)
+        return computed
+    }
+
+    private static func computePreflight() -> EmbeddingProviderPreflight {
         let id = CoreMLMobileCLIPProvider().providerID
         let image = coremlModelURL(kind: "image")
         let text = coremlModelURL(kind: "text")
@@ -435,7 +460,11 @@ public enum EmbeddingProviderFactory: Sendable {
         case "disabled", "off", "none":
             return DisabledEmbeddingProvider()
         default:
-            return LocalModelEmbeddingProvider(providerID: "local-model-bridge-v1:\(kind)")
+            // Unknown kind spellings must resolve to the SAME canonical
+            // provider identity as the default, or vectors land under two
+            // disjoint model namespaces and semantic search silently returns
+            // nothing between an index run and a search run.
+            return LocalModelEmbeddingProvider()
         }
     }
     public static func availableProviders() -> [String] {

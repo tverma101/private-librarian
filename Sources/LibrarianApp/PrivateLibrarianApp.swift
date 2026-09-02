@@ -374,6 +374,48 @@ final class LibrarianModel: ObservableObject {
         refreshDashboard()
     }
 
+    /// Explicit recovery from "keychain hell": when the stored catalog key's
+    /// Keychain ACL no longer trusts this app's code signature (usually the
+    /// result of ad-hoc-signed rebuilds), every launch prompts and fails.
+    /// This action locks the old encrypted catalog files aside (never deletes
+    /// them), removes the unreadable app-owned key item, and opens a new
+    /// encrypted catalog created by THIS signed binary — whose ACL is then
+    /// stable across rebuilds signed with the same identity.
+    func resetCatalogKeyAndStartFresh() {
+        guard catalog == nil, !catalogMigrationRequired else { return }
+        let fm = FileManager.default
+        let stamp = Int(Date().timeIntervalSince1970)
+        do {
+            let active = catalogURL
+            if fm.fileExists(atPath: active.path) {
+                let locked = active.deletingLastPathComponent()
+                    .appendingPathComponent("catalog.locked-\(stamp).db")
+                try fm.moveItem(at: active, to: locked)
+                for sidecar in ["-shm", "-wal"] {
+                    let source = URL(fileURLWithPath: active.path + sidecar)
+                    if fm.fileExists(atPath: source.path) {
+                        try? fm.moveItem(at: source, to: URL(fileURLWithPath: locked.path + sidecar))
+                    }
+                }
+                log("previous catalog locked aside as \(locked.lastPathComponent); it was never deleted")
+            }
+            try CatalogKeychain.destroyAppOwned()
+            UserDefaults.standard.removeObject(forKey: Self.activeCatalogFilenameKey)
+            catalogError = nil
+            catalogMigrationAttempted = false
+            // Authorized folders are kept: their bookmarks still resolve, so
+            // the fresh catalog can be repopulated without re-picking folders.
+            openCatalogIfNeeded()
+            refreshDashboard()
+            if catalogReady {
+                log("fresh encrypted catalog ready; run Clean Up to index your folders again")
+            }
+        } catch {
+            catalogError = error.localizedDescription
+            log("catalog key reset failed: \(error); nothing was deleted")
+        }
+    }
+
     // MARK: - Read-only source access via security-scoped bookmarks
 
     func addSourceFolder() {
@@ -656,9 +698,8 @@ final class LibrarianModel: ObservableObject {
         pendingApplyPlan = nil
         guard catalogReady, let catalog else { return }
         let bookmarkData = bookmarkDataByPath
-        let roots = sources.map(\.path)
         log("applying \"\(plan.groupTitle)\" · moving \(plan.items.count) files…")
-        Task.detached(priority: .userInitiated) { [weak self, catalog, plan, bookmarkData, roots] in
+        Task.detached(priority: .userInitiated) { [weak self, catalog, plan, bookmarkData] in
             do {
                 let outcome = try OrganizationApplier.apply(
                     plan: plan,

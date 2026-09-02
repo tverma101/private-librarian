@@ -29,8 +29,18 @@ public enum OfficeContainer {
             var i = tail.count - 22
             while i >= 0 {
                 if tail[i] == sig[0], tail[i+1] == sig[1], tail[i+2] == sig[2], tail[i+3] == sig[3] {
-                    eocdOffsetInTail = i
-                    break
+                    // Validate the EOCD's own comment-length field: a valid
+                    // EOCD's comment must exactly fill the bytes after it.
+                    // Without this check a trailing archive comment that
+                    // merely contains the signature bytes is misread as the
+                    // real EOCD and valid archives silently fail to parse.
+                    if i + 22 <= tail.count {
+                        let commentLen = Int(tail[i+20]) | (Int(tail[i+21]) << 8)
+                        if commentLen == tail.count - i - 22 {
+                            eocdOffsetInTail = i
+                            break
+                        }
+                    }
                 }
                 i -= 1
             }

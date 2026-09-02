@@ -225,6 +225,11 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
 
 #if canImport(CoreServices)
     private var streams: [FSEventStreamRef] = []
+    /// One retained handle per live stream. The FSEventStreamContext's raw
+    /// pointer does not participate in ARC, so without this retain the
+    /// coordinator can deallocate while eventQueue is still dispatching a
+    /// callback batch that dereferences it.
+    private var streamSelfHandles: [Unmanaged<LiveIndexCoordinator>] = []
 #endif
     private var wakeObserver: NSObjectProtocol?
 
@@ -290,12 +295,7 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         lock.unlock()
 
 #if canImport(CoreServices)
-        for stream in streams {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-        }
-        streams.removeAll()
+        teardownStreams()
 #endif
         if let observer = wakeObserver {
 #if canImport(AppKit)
@@ -326,17 +326,31 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         lock.unlock()
 #if canImport(CoreServices)
         if running {
-            for stream in streams {
-                FSEventStreamStop(stream)
-                FSEventStreamInvalidate(stream)
-                FSEventStreamRelease(stream)
-            }
-            streams.removeAll()
+            teardownStreams()
             lock.lock()
             let snapshot = roots
             lock.unlock()
             if !snapshot.isEmpty { startStreams(for: snapshot) }
         }
+#endif
+    }
+
+    /// Stop, invalidate, and release every live stream, serialized on the
+    /// stream dispatch queue so a callback batch mid-flight can never touch
+    /// a dead stream, then drop the per-stream coordinator retains.
+    private func teardownStreams() {
+#if canImport(CoreServices)
+        guard !streams.isEmpty else { return }
+        eventQueue.sync {
+            for stream in self.streams {
+                FSEventStreamStop(stream)
+                FSEventStreamInvalidate(stream)
+                FSEventStreamRelease(stream)
+            }
+            self.streams.removeAll()
+        }
+        for handle in streamSelfHandles { handle.release() }
+        streamSelfHandles.removeAll()
 #endif
     }
 
@@ -667,9 +681,11 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
     private func startStreams(for urls: [URL]) {
         for url in urls {
             let path = url.path as NSString
+            let retained = Unmanaged.passRetained(self)
+            streamSelfHandles.append(retained)
             var context = FSEventStreamContext(
                 version: 0,
-                info: Unmanaged.passUnretained(self).toOpaque(),
+                info: retained.toOpaque(),
                 retain: nil, release: nil, copyDescription: nil)
             let flags: FSEventStreamCreateFlags = UInt32(
                 kFSEventStreamCreateFlagFileEvents
@@ -700,7 +716,10 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
             guard let stream = FSEventStreamCreate(
                 kCFAllocatorDefault, callback, &context, watched,
                 FSEventStreamEventId(kFSEventStreamEventIdSinceNow), latency, flags)
-            else { continue }
+            else {
+                if let orphaned = streamSelfHandles.popLast() { orphaned.release() }
+                continue
+            }
             FSEventStreamSetDispatchQueue(stream, eventQueue)
             FSEventStreamStart(stream)
             streams.append(stream)

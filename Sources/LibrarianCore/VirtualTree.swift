@@ -32,19 +32,30 @@ public struct VirtualTree: Sendable {
             nodes[p]?.fileIDs.append(m.fileID)
         }
 
-        // Assemble hierarchy.
+        // Assemble hierarchy. Recursive assembly guarantees each child
+        // subtree is complete before it is attached to its parent. The
+        // previous iterative loop appended struct copies whose `children`
+        // arrays were still empty (value semantics), so every nested
+        // category was silently dropped from the result.
         var result = root
-        for path in nodes.keys.sorted() {
+        var childrenByParent: [String: [String]] = [:]
+        for path in nodes.keys {
             let comps = path.split(separator: "/").map(String.init)
-            guard var node = nodes[path] else { continue }
-            node.children.sort { $0.name < $1.name }
-            if comps.count == 1 {
-                result.children.append(node)
-            } else {
-                let parentPath = comps.dropLast().joined(separator: "/")
-                nodes[parentPath]?.children.append(node)
-            }
+            guard comps.count > 1 else { continue }
+            childrenByParent[comps.dropLast().joined(separator: "/"), default: []].append(path)
         }
+        func assemble(_ path: String) -> Node {
+            guard var node = nodes[path] else {
+                let comps = path.split(separator: "/").map(String.init)
+                return Node(name: comps.last ?? path, children: [], fileIDs: [])
+            }
+            node.children = (childrenByParent[path] ?? []).sorted().map(assemble)
+            return node
+        }
+        result.children = nodes.keys
+            .filter { !$0.isEmpty && !$0.contains("/") }
+            .sorted()
+            .map(assemble)
         result.children.sort { $0.name < $1.name }
         return result
     }

@@ -74,3 +74,37 @@ would defeat macOS Keychain protection. Choose **Always Allow** once, quit, and
 relaunch. Future rebuilds retain the stable signing identity and use the
 app-owned item. A Developer ID identity, notarization, and stapling are still
 required for public distribution.
+
+## When every launch prompts and then fails (wedged ACL)
+
+If an existing app-owned item was created by an ad-hoc-signed build, the item's
+ACL designates that dead binary hash. Repackaging with the stable Apple
+Development identity fixes all FUTURE builds, but the first launch of the
+newly signed app is still a new client for the EXISTING item and prompts once.
+Choosing **Always Allow** adds the stable team identity to the item's trust and
+ends the prompting permanently.
+
+If the prompt instead fails repeatedly (denied, canceled, or errored), the app
+now offers an explicit recovery action in both the home catalog card and the
+advanced library: **Key Still Blocked? Reset Catalog Key…** (two-step
+confirmation). It:
+
+1. moves `catalog.db`, `catalog.db-wal`, and `catalog.db-shm` aside as
+   `catalog.locked-<timestamp>.db*` — never deletes them;
+2. deletes only the app-owned catalog key item (`destroyAppOwned()`); the
+   legacy login-keychain item is untouched;
+3. creates a new app-owned key and encrypted catalog created by the currently
+   signed binary, whose ACL is then stable across rebuilds signed with the same
+   identity; authorized source folders are kept so re-indexing needs no
+   re-picking.
+
+The locked-aside catalog stays decryptable forever with its old key, so this is
+recoverable, not data loss.
+
+## Dev builds
+
+`script/build_and_run.sh --debug` re-signs the freshly linked SwiftPM binary
+with the stable Apple Development identity. Plain `swift build` output stays
+ad-hoc signed; launching `LibrarianApp` from `.build/debug/` directly will
+therefore prompt for the dev-namespace keychain item on each rebuild — use the
+script, or re-sign manually, if you run dev builds against a real catalog.

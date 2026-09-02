@@ -62,8 +62,14 @@ public struct SourceBroker: Sendable {
             volumeUUID: Self.volumeUUID(forPath: path),
             fileID: UInt64(st.st_ino),
             size: Int64(st.st_size),
-            mtime: Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec)),
-            ctime: Date(timeIntervalSince1970: TimeInterval(st.st_ctimespec.tv_sec)),
+            // Nanosecond precision is load-bearing: second-truncated mtimes
+            // cannot distinguish two writes in the same wall-clock second,
+            // which defeats both the incremental skip decision and the
+            // commit-time generation recheck.
+            mtime: Date(timeIntervalSince1970:
+                TimeInterval(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1_000_000_000),
+            ctime: Date(timeIntervalSince1970:
+                TimeInterval(st.st_ctimespec.tv_sec) + Double(st.st_ctimespec.tv_nsec) / 1_000_000_000),
             kind: kind,
             isSymlink: isLink
         )

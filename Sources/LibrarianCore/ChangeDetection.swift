@@ -5,10 +5,12 @@ import Foundation
 public enum ChangeDetection {
 
     public static let extractorVersion = "extractors-1.0.0"
-    /// v3 replaces raw model-label category creation with a bounded human
-    /// taxonomy and adds the broad Projects/Code bucket. Existing catalogs
-    /// must reclassify once so old one-off memberships disappear.
-    public static let classifierVersion = "rule-based-v3-bounded-taxonomy"
+    /// v4 fixes the screenshot detector (camera aspect ratios and device-model
+    /// metadata no longer classify camera photos as screenshots), unifies the
+    /// singular/plural screenshot category, and repairs hierarchical category
+    /// creation. Existing catalogs must reclassify once so stale screenshot
+    /// memberships disappear.
+    public static let classifierVersion = "rule-based-v4-screenshot-recalibration"
 
     /// Decide whether a file needs (re)indexing given its stored record.
     /// `requiredExtractorVersion` is the complete processing-pipeline identity

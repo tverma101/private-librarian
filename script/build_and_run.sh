@@ -20,6 +20,16 @@ case "$MODE" in
         swift build
         BUILD_DIR="$(swift build --show-bin-path)"
         BUILD_BINARY="$BUILD_DIR/$APP_NAME"
+        # SwiftPM links ad-hoc (hash-signed) binaries: every rebuild becomes a
+        # new untrusted Keychain client and prompts for the catalog key. Re-sign
+        # with the stable Apple Development identity when one exists so the
+        # keychain ACL keeps trusting dev builds across rebuilds.
+        DEV_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+            | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' | head -1)"
+        if [ -n "$DEV_IDENTITY" ]; then
+            codesign --force --sign "$DEV_IDENTITY" --timestamp=none "$BUILD_BINARY" 2>/dev/null \
+                || echo "warning: could not re-sign dev binary; keychain may prompt" >&2
+        fi
         exec lldb -- "$BUILD_BINARY"
         ;;
 esac

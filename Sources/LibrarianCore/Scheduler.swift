@@ -37,7 +37,12 @@ public final class Scheduler: @unchecked Sendable {
     }
 
     static func installMemoryPressureHandler(_ onChange: @escaping (Int) -> Void) {
-        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global(qos: .utility))
+        // .normal MUST be subscribed: it is the only event that reports the
+        // all-clear. Without it pressureLevel ratchets up once and never
+        // resets, and a critical event permanently wedges every HEAVY job
+        // (allowedConcurrent -> 0 while acquire busy-waits forever).
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.normal, .warning, .critical], queue: .global(qos: .utility))
         source.setEventHandler {
             let level: Int = source.data.contains(.critical) ? 2 : (source.data.contains(.warning) ? 1 : 0)
             onChange(level)

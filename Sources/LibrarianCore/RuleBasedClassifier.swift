@@ -122,9 +122,11 @@ public struct RuleBasedClassifier: Sendable {
 
         // A screenshot-looking filename is only a weak image hint. Text files
         // named things like screenshot-notes.md must not enter screenshot views.
+        // Uses the plural form so filename hints and the screenshot assessment
+        // land in ONE category instead of splitting counts across two spellings.
         let tokens = Set(evidence.filenameTokens)
         if identity.kind == .image, tokens.contains("screenshot") {
-            cats.append("Screenshot")
+            cats.append("Screenshots")
             reasons.append("filename:screenshot")
             confidence += 0.1
         }

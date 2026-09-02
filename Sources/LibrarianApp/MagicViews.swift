@@ -840,13 +840,14 @@ struct LibrarianSettingsView: View {
 
 private struct CatalogBlockedView: View {
     @EnvironmentObject private var model: LibrarianModel
+    @State private var confirmReset = false
 
     var body: some View {
         ContentUnavailableView {
             Label("Catalog is not open", systemImage: "lock.doc")
         } description: {
             if model.catalogMigrationRequired {
-                Text("The existing encrypted catalog is waiting for the one-time migration action above. No library results are being shown until it opens.")
+                Text("The existing encrypted catalog is waiting for the one-time migration action above. No library results are shown until it opens.")
             } else if let error = model.catalogError, !error.isEmpty {
                 Text("The catalog could not be opened: \(error)")
             } else {
@@ -855,6 +856,18 @@ private struct CatalogBlockedView: View {
         } actions: {
             if !model.catalogMigrationRequired {
                 Button("Retry Catalog") { model.retryCatalogOpen() }
+                if model.catalogError != nil {
+                    Button(confirmReset ? "Confirm: Lock Old Catalog Aside and Start Fresh" : "Key Still Blocked? Reset Catalog Key…") {
+                        if confirmReset {
+                            model.resetCatalogKeyAndStartFresh()
+                            confirmReset = false
+                        } else {
+                            confirmReset = true
+                        }
+                    }
+                    .foregroundStyle(.red)
+                    .help("Moves the old encrypted catalog files aside (they are never deleted), removes the unreadable key, and creates a new encrypted catalog. Use this when every launch asks for keychain access and then fails.")
+                }
             } else if !model.catalogMigrationAttempted {
                 Button("Start New Catalog") { model.startFreshCatalog() }
             }

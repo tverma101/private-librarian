@@ -210,4 +210,26 @@ public enum CatalogKeychain {
             lookupCache.lock.unlock()
         }
     }
+
+    /// Delete ONLY the app-owned catalog key item and clear the process
+    /// cache. This is the explicit recovery path for an item whose Keychain
+    /// ACL no longer trusts this app's code signature (ad-hoc rebuild churn):
+    /// the encrypted catalog data on disk stays in place, so the caller must
+    /// move it aside before this unless the library is intentionally abandoned.
+    /// The legacy login-keychain item is never touched here.
+    public static func destroyAppOwned() throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeyError.osStatus(status)
+        }
+        lookupCache.lock.lock()
+        lookupCache.key = nil
+        lookupCache.failure = nil
+        lookupCache.lock.unlock()
+    }
 }

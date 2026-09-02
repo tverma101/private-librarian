@@ -9,6 +9,7 @@ struct CleanerHomeView: View {
     @EnvironmentObject private var model: LibrarianModel
     @Environment(\.openWindow) private var openWindow
     @State private var selectedSourceID: UUID?
+    @State private var confirmCatalogReset = false
     @FocusState private var searchFocused: Bool
 
     private var eligibleSources: [LibrarianModel.SourceFolder] {
@@ -450,7 +451,23 @@ struct CleanerHomeView: View {
                 Text(model.catalogError ?? "Private Librarian could not open its encrypted catalog.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                Button("Try Again") { model.retryCatalogOpen() }
+                HStack {
+                    Button("Try Again") { model.retryCatalogOpen() }
+                    if model.catalogError != nil {
+                        Button(confirmCatalogReset
+                               ? "Confirm: Lock Old Catalog Aside and Start Fresh"
+                               : "Key Still Blocked? Reset Catalog Key…") {
+                            if confirmCatalogReset {
+                                model.resetCatalogKeyAndStartFresh()
+                                confirmCatalogReset = false
+                            } else {
+                                confirmCatalogReset = true
+                            }
+                        }
+                        .foregroundStyle(.red)
+                        .help("Moves the old encrypted catalog aside (never deleted), removes the unreadable key, and creates a new encrypted catalog. Use this when every launch asks for keychain access and then fails.")
+                    }
+                }
             }
             .padding(16)
             .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))

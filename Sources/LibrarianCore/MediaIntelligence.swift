@@ -293,14 +293,26 @@ public struct AudioProbe: Sendable {
     private static func looksLikeAudioMagic(_ bytes: Data) -> Bool {
         guard bytes.count >= 4 else { return false }
         let b = [UInt8](bytes.prefix(12))
-        // MP3 sync, FLAC, Ogg, RIFF/WAVE, M4A/ftyp
+        // MP3 sync, FLAC, Ogg, RIFF/WAVE, audio-typed ftyp, ID3
         if b[0] == 0xFF && (b[1] & 0xE0) == 0xE0 { return true } // MP3 sync
         if b[0]==0x66 && b[1]==0x4C && b[2]==0x61 && b[3]==0x43 { return true } // FLAC
         if b[0]==0x4F && b[1]==0x67 && b[2]==0x67 && b[3]==0x53 { return true } // OggS
-        if b[0]==0x52 && b[1]==0x49 && b[2]==0x46 && b[3]==0x46 { return true } // RIFF
+        // RIFF alone is a generic container (WebP, ANI, ...); only WAVE is audio.
+        if b[0]==0x52 && b[1]==0x49 && b[2]==0x46 && b[3]==0x46 {
+            guard bytes.count >= 12,
+                  let wave = String(bytes: bytes[8..<12], encoding: .ascii) else { return false }
+            return wave == "WAVE"
+        }
         if bytes.count >= 8 {
             let ftyp = String(bytes: bytes[4..<min(8, bytes.count)], encoding: .ascii) ?? ""
-            if ftyp == "ftyp" { return true }
+            if ftyp == "ftyp" {
+                // HEIC/HEIF/AVIF are ISO-BMFF image containers, not audio.
+                guard bytes.count >= 12,
+                      let brand = String(bytes: bytes[8..<12], encoding: .ascii) else { return true }
+                let imageBrands: Set<String> = ["heic", "heix", "heim", "hevc", "hevx",
+                                                "mif1", "msf1", "avif", "avic", "jpeg"]
+                return !imageBrands.contains(brand)
+            }
         }
         if b[0]==0x49 && b[1]==0x44 && b[2]==0x33 { return true } // ID3
         return false

@@ -70,6 +70,12 @@ public struct BrokerPCMDecoder: Sendable {
     /// the indexer so no source path crosses the decoder boundary.
     public func decode(snapshot: Data,
                        onChunk: (PCMChunk) throws -> Void) throws {
+        // Bound the target rate to the range transcription decoding uses;
+        // an unbounded rate makes the resampler allocate petabyte-scale
+        // buffers for absurd configurations instead of failing cleanly.
+        guard (8_000.0...384_000.0).contains(sampleRate) else {
+            throw MediaDecoderError.invalidConfiguration
+        }
         guard sampleRate.isFinite, sampleRate > 0,
               chunkDuration.isFinite, chunkDuration > 0,
               sampleRate <= Double(Int.max) / chunkDuration,
