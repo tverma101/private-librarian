@@ -407,11 +407,8 @@ struct CleanerHomeView: View {
 
             if !model.searchResults.isEmpty {
                 VStack(alignment: .leading, spacing: 7) {
-                    ForEach(Array(model.searchResults.prefix(6).enumerated()), id: \.offset) { _, result in
-                        Text(result)
-                            .font(.caption)
-                            .lineLimit(2)
-                            .textSelection(.enabled)
+                    ForEach(model.searchResults.prefix(6)) { result in
+                        SearchResultRow(result: result)
                     }
                     if model.searchResults.count > 6 {
                         Button("Open all results") {
@@ -421,6 +418,10 @@ struct CleanerHomeView: View {
                         .buttonStyle(.link)
                     }
                 }
+            } else if model.searchFoundNothing, !model.isSearching {
+                Text("No results for “\(model.query)”.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(18)

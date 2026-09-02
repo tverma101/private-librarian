@@ -3,8 +3,71 @@ import SwiftUI
 import LibrarianCore
 import LibrarianAppSupport
 
-enum LibrarySection: String, CaseIterable, Identifiable {
-    case overview
+/// One search hit. Shows where the file actually lives and offers to reveal
+/// it in Finder. Note rows (path empty) render as explanatory text only.
+struct SearchResultRow: View {
+    @EnvironmentObject private var model: LibrarianModel
+    let result: LibrarianModel.SearchResult
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: iconName)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                if result.path.isEmpty {
+                    Text(result.modeLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text((result.path as NSString).lastPathComponent)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Text(result.path)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .textSelection(.enabled)
+                    if !result.snippet.isEmpty {
+                        Text(result.snippet)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    Text(result.modeLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Spacer()
+            if !result.path.isEmpty {
+                Button {
+                    model.revealInFinder(result.path)
+                } label: {
+                    Image(systemName: "arrow.up.forward.app")
+                }
+                .buttonStyle(.borderless)
+                .help("Reveal in Finder")
+                .accessibilityLabel("Reveal in Finder")
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var iconName: String {
+        if result.path.isEmpty { return "info.circle" }
+        let ext = (result.path as NSString).pathExtension.lowercased()
+        switch ext {
+        case "pdf": return "doc.richtext"
+        case "png", "jpg", "jpeg", "heic", "webp", "gif", "tiff": return "photo"
+        case "mp3", "wav", "m4a", "aac", "flac": return "waveform"
+        case "mp4", "mov", "mkv", "avi": return "film"
+        default: return "doc"
+        }
+    }
+}
+
+enum LibrarySection: String, CaseIterable, Identifiable {    case overview
     case smart
     case screenshots
     case school
@@ -184,8 +247,8 @@ struct MagicContentView: View {
                 } else {
                     if !model.searchResults.isEmpty {
                         GroupBox("Search results") {
-                            ForEach(Array(model.searchResults.enumerated()), id: \.offset) { _, result in
-                                Text(result).textSelection(.enabled)
+                            ForEach(model.searchResults) { result in
+                                SearchResultRow(result: result)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -348,6 +411,7 @@ private struct MetricCard: View {
 }
 
 private struct FileExplorerView: View {
+    @EnvironmentObject private var model: LibrarianModel
     let title: String
     let subtitle: String
     let files: [Catalog.FileSummary]
@@ -372,6 +436,15 @@ private struct FileExplorerView: View {
                             if let confidence = file.confidence {
                                 Text(String(format: "%.0f%%", confidence * 100)).font(.caption).foregroundStyle(.secondary)
                             }
+                            Button {
+                                model.revealInFinder(file.path)
+                            } label: {
+                                Image(systemName: "arrow.up.forward.app")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(file.status == "missing")
+                            .help("Reveal in Finder")
+                            .accessibilityLabel("Reveal in Finder")
                         }
                         Divider()
                     }
@@ -756,85 +829,6 @@ private struct ReviewInboxView: View {
     private func apply(item: ReviewItem, category: String, action: ReviewCorrectionAction) {
         model.applyReviewCorrection(item: item, category: category, action: action)
         categoryDrafts.removeValue(forKey: item.fileID)
-    }
-}
-
-struct LibrarianSettingsView: View {
-    @EnvironmentObject private var model: LibrarianModel
-
-    var body: some View {
-        Form {
-            Section("Catalog") {
-                if model.catalogReady {
-                    Label(model.isUsingFreshCatalog ? "Fresh encrypted catalog open" : "Encrypted catalog open",
-                          systemImage: "checkmark.seal.fill")
-                        .foregroundStyle(.green)
-                    if model.isUsingFreshCatalog {
-                        Text("The previous catalog.db remains untouched. This fresh catalog was created without requesting its legacy Keychain item.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                } else if model.catalogMigrationRequired {
-                    CatalogMigrationBanner()
-                } else if let error = model.catalogError, !error.isEmpty {
-                    Label("Catalog unavailable", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                    Button("Retry Catalog") { model.retryCatalogOpen() }
-                } else {
-                    Label("Opening encrypted catalog…", systemImage: "hourglass")
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section("Local intelligence") {
-                Toggle("Local embeddings", isOn: $model.localEmbeddingsEnabled)
-                    .disabled(!model.isTier2Provisioned)
-                    .help("Enabled only after the offline runtime and a verified checkpoint pass preflight")
-                Picker("Model profile", selection: $model.localModelProfile) {
-                    Text("Fast · embeddings only").tag(LocalModelProfile.fast)
-                    Text("Balanced · specialist fallback").tag(LocalModelProfile.balanced)
-                    Text("Quality · heavy fallback allowed").tag(LocalModelProfile.quality)
-                }
-                Text(model.tier2Status)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                Toggle("Local transcription", isOn: $model.localTranscriptionEnabled)
-                    .disabled(!model.isLocalTranscriptionAvailable)
-                    .help("Opt-in whisper.cpp transcription; nothing is downloaded automatically")
-                Text(model.localTranscriptionStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-
-            Section("Search") {
-                Picker("Mode", selection: $model.searchMode) {
-                    Text("Auto").tag("auto")
-                    Text("Exact").tag("exact")
-                    Text("Semantic").tag("semantic")
-                    Text("CLIP text → image").tag("clipText")
-                }
-                .onChange(of: model.searchMode) { _, value in
-                    UserDefaults.standard.set(value, forKey: "tier2-search-mode-v1")
-                }
-            }
-
-            Section("Privacy") {
-                Text("Models run offline only after explicit provisioning. Source folders are read-only and the encrypted catalog is kept in the app container.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .formStyle(.grouped)
-        .frame(minWidth: 560, idealWidth: 620, minHeight: 460)
-        .padding()
     }
 }
 

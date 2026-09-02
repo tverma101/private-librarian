@@ -71,6 +71,16 @@ final class LibrarianModel: ObservableObject {
         let path: String
     }
 
+    /// One search hit rendered by both surfaces. Carries the real path (the
+    /// old string rows led with an opaque catalog file ID, which told the
+    /// user nothing about where the file lives) plus the match context.
+    struct SearchResult: Identifiable, Sendable, Equatable {
+        let id: String
+        let path: String
+        let snippet: String
+        let modeLabel: String
+    }
+
     struct PreviewRequest: Sendable, Equatable {
         let path: String
         let sourceRoot: String
@@ -109,7 +119,7 @@ final class LibrarianModel: ObservableObject {
 
     @Published var sources: [SourceFolder] = []
     @Published var statusLines: [String] = []
-    @Published var searchResults: [String] = []
+    @Published var searchResults: [SearchResult] = []
     @Published var query: String = ""
     @Published var isIndexing = false
     @Published var selectedSection: LibrarySection = .overview
@@ -140,6 +150,7 @@ final class LibrarianModel: ObservableObject {
     @Published private(set) var specialistProvisionedIDs: Set<String> = []
     @Published private(set) var tier2Status = "Checking local model readiness…"
     @Published private(set) var isSearching = false
+    @Published private(set) var searchFoundNothing = false
     @Published var localTranscriptionEnabled: Bool {
         didSet {
             UserDefaults.standard.set(localTranscriptionEnabled, forKey: AppLocalTranscription.enabledDefaultsKey)
@@ -1027,68 +1038,90 @@ final class LibrarianModel: ObservableObject {
         guard let catalog, !normalizedQuery.isEmpty else {
             searchResults = []
             isSearching = false
+            searchFoundNothing = false
             return
         }
         isSearching = true
+        searchFoundNothing = false
         searchResults = []
         let enabled = localEmbeddingsEnabled
         let profile = localModelProfile
         let mode = searchMode
         let providerKind = CoreMLMobileCLIPProvider.isAvailable ? "coreml-mobileclip" : nil
         let work = Task.detached(priority: .userInitiated) {
-            Self.searchLines(catalog: catalog, query: normalizedQuery, mode: mode,
-                             enableLocalEmbeddings: enabled, localModelProfile: profile,
-                             embeddingProviderKind: providerKind)
+            Self.searchResults(catalog: catalog, query: normalizedQuery, mode: mode,
+                               enableLocalEmbeddings: enabled, localModelProfile: profile,
+                               embeddingProviderKind: providerKind)
         }
         searchTask = Task { @MainActor [weak self] in
-            let lines = await work.value
+            let results = await work.value
             guard let self, self.searchGeneration == generation else { return }
             self.isSearching = false
-            self.searchResults = lines.isEmpty ? ["No results"] : lines
+            self.searchFoundNothing = results.isEmpty
+            self.searchResults = results
         }
     }
 
-    private nonisolated static func searchLines(
+    /// Reveal a cataloged file in Finder with it selected. Read-only — Finder
+    /// shows the live file wherever it actually is.
+    func revealInFinder(_ path: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    private nonisolated static func searchResults(
         catalog: Catalog,
         query: String,
         mode: String,
         enableLocalEmbeddings: Bool,
         localModelProfile: LocalModelProfile,
         embeddingProviderKind: String?
-    ) -> [String] {
+    ) -> [SearchResult] {
         let service = SearchService(
             catalog: catalog,
             enableLocalEmbeddings: enableLocalEmbeddings,
             localModelProfile: localModelProfile,
             embeddingProviderKind: embeddingProviderKind)
-        func exactLines() -> [String] {
+        func exactResults() -> [SearchResult] {
             ((try? service.search(query)) ?? []).map { hit in
-                let evidence = hit.snippet.map {
-                    "\n  evidence: \($0.replacingOccurrences(of: "\n", with: " "))"
-                } ?? ""
-                return "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\(evidence)"
+                SearchResult(id: hit.fileID, path: hit.path,
+                             snippet: (hit.snippet ?? "").replacingOccurrences(of: "\n", with: " "),
+                             modeLabel: "match")
             }
         }
-        func semanticLines() -> [String] {
+        func semanticResults() -> [SearchResult] {
             ((try? service.semanticSearch(query: query)) ?? []).map { hit in
-                "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\n  evidence: semantic similarity \(String(format: "%.2f", hit.score))"
+                SearchResult(id: hit.fileID, path: hit.path, snippet: "",
+                             modeLabel: String(format: "semantic %.0f%%", hit.score * 100))
             }
         }
-        func clipLines() -> [String] {
+        func clipResults() -> [SearchResult] {
             ((try? service.clipTextToImageSearch(query: query)) ?? []).map { hit in
-                "\(hit.fileID) — \((hit.path as NSString).lastPathComponent)\n  evidence: CLIP text→image similarity \(String(format: "%.2f", hit.score))"
+                SearchResult(id: hit.fileID, path: hit.path, snippet: "",
+                             modeLabel: String(format: "visual %.0f%%", hit.score * 100))
             }
         }
 
         switch mode {
-        case "exact": return exactLines()
-        case "semantic": return semanticLines()
-        case "clipText": return clipLines()
+        case "exact": return exactResults()
+        case "semantic":
+            let rows = semanticResults()
+            if !rows.isEmpty { return rows }
+            // An explicit mode must never look like "search is broken": when
+            // its models are not enabled/available, say so and fall back.
+            return [SearchResult(id: "note", path: "", snippet: "",
+                                 modeLabel: "semantic search needs downloaded local models — showing exact matches for “\(query)”")] + exactResults()
+        case "clipText":
+            let rows = clipResults()
+            if !rows.isEmpty { return rows }
+            return [SearchResult(id: "note", path: "", snippet: "",
+                                 modeLabel: "visual search needs downloaded local models — showing exact matches for “\(query)”")] + exactResults()
         default:
-            let semantic = semanticLines()
+            // Auto prefers the richest available signal, then falls back.
+            let semantic = semanticResults()
             if !semantic.isEmpty { return semantic }
-            let clip = clipLines()
-            return clip.isEmpty ? exactLines() : clip
+            let clip = clipResults()
+            if !clip.isEmpty { return clip }
+            return exactResults()
         }
     }
 
