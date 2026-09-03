@@ -486,6 +486,7 @@ private struct SmartGroupsView: View {
                 HStack(spacing: 10) {
                     if model.canUndoApply {
                         Button("Undo Last Apply") { model.undoLastApply() }
+                        .disabled(model.isApplyOperationInProgress)
                     }
                     if let message = model.lastApplyMessage {
                         Text(message)
@@ -570,54 +571,121 @@ private struct SmartGroupCard: View {
 private struct ApplyPlanConfirmationSheet: View {
     @EnvironmentObject private var model: LibrarianModel
     let plan: OrganizationApplier.Plan
-    @Environment(\.dismiss) private var dismiss
+    @State private var selectedRootPath = ""
+    @State private var excludedFileIDs: Set<String> = []
+
+    private var rootSelection: Binding<String> {
+        Binding(
+            get: { selectedRootPath.isEmpty ? plan.destinationRootPath : selectedRootPath },
+            set: { newRoot in
+                selectedRootPath = newRoot
+                // Replans swap the presented plan in place; exclusions carry
+                // over because they are keyed by stable catalog file IDs.
+                model.replanApply(to: newRoot)
+            })
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Apply “\(plan.groupTitle)” to Finder", systemImage: "folder.badge.gearshape")
+            Label("Review “\(plan.groupTitle)”", systemImage: "folder.badge.gearshape")
                 .font(.title3.bold())
 
+            Text("This is a preview only. Nothing has moved. Check the destination and every proposed file move before applying.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            if plan.candidateRootPaths.count > 1 {
+                Picker("Move files into", selection: rootSelection) {
+                    ForEach(plan.candidateRootPaths, id: \.self) { root in
+                        Text(root).tag(root)
+                    }
+                }
+            }
+
             VStack(alignment: .leading, spacing: 6) {
-                LabeledContent("A new folder") {
+                LabeledContent("Destination folder") {
                     Text(plan.destinationFolderPath)
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
                 }
-                LabeledContent("Files to move") {
-                    Text("\(plan.items.count)")
+                LabeledContent("Files selected") {
+                    Text("\(plan.items.count - excludedFileIDs.count)")
                 }
                 if plan.skippedOtherRoots > 0 {
                     LabeledContent("Left in other folders") {
-                        Text("\(plan.skippedOtherRoots) (different root)")
+                        Text("\(plan.skippedOtherRoots) (different authorized root)")
                     }
                 }
                 if !plan.missingPaths.isEmpty {
-                    LabeledContent("Skipped (missing)") {
-                        Text("\(plan.missingPaths.count)")
+                    LabeledContent("Unavailable now") {
+                        Text("\(plan.missingPaths.count) — these will stay where they are")
                     }
                 }
             }
             .font(.subheadline)
 
-            Text("Files are moved (never copied or deleted) into the new folder. Every move is journaled in the encrypted catalog, and Undo Last Apply restores them.")
+            if !plan.items.isEmpty {
+                GroupBox("Exact moves") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 7) {
+                            ForEach(Array(plan.items.prefix(40)), id: \.fileID) { item in
+                                Toggle(isOn: Binding(
+                                    get: { !excludedFileIDs.contains(item.fileID) },
+                                    set: { included in
+                                        if included {
+                                            excludedFileIDs.remove(item.fileID)
+                                        } else {
+                                            excludedFileIDs.insert(item.fileID)
+                                        }
+                                    })) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text((item.fromPath as NSString).lastPathComponent)
+                                            .font(.caption.weight(.medium))
+                                        Text("\(item.fromPath)  →  \(item.toPath)")
+                                            .font(.caption2.monospaced())
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                    }
+                                }
+                                .toggleStyle(.checkbox)
+                                if item.fileID != plan.items.prefix(40).last?.fileID {
+                                    Divider()
+                                }
+                            }
+                            if plan.items.count > 40 {
+                                Text("+ \(plan.items.count - 40) more moves")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 230)
+                }
+            }
+
+            Text("Files are moved, never copied or deleted. The planned names above are reserved to avoid overwriting existing files. The operation is journaled so Undo can restore successful moves.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack {
+                Text("\(excludedFileIDs.count) excluded")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { model.cancelApply() }
                     .keyboardShortcut(.cancelAction)
-                Button("Move \(plan.items.count) Files") {
-                    model.confirmApply()
+                Button("Move \(plan.items.count - excludedFileIDs.count) Files") {
+                    model.confirmApply(excluding: excludedFileIDs)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(plan.items.isEmpty)
+                .disabled(plan.items.isEmpty || excludedFileIDs.count >= plan.items.count)
                 .keyboardShortcut(.defaultAction)
             }
         }
         .padding(24)
-        .frame(width: 520)
+        .frame(width: 620)
+        .onAppear { selectedRootPath = plan.destinationRootPath }
     }
 }
 

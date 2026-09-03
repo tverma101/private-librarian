@@ -88,6 +88,14 @@ public struct SourceBroker: Sendable {
         return lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR
     }
 
+    /// Check that the path names a regular file without following its final
+    /// component. Mutation callers use this instead of `fileExists`, which
+    /// also accepts directories and can follow symlinks.
+    public func isRegularFile(at path: String) -> Bool {
+        var st = stat()
+        return lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG
+    }
+
     // MARK: - Kind classification
 
     public static func classify(path: String) -> FileKind {
@@ -499,9 +507,13 @@ public struct SourceBroker: Sendable {
     }
 
     public static func isPath(_ path: String, under prefix: String) -> Bool {
-        let p = prefix.count > 1 && prefix.hasSuffix("/") ? String(prefix.dropLast()) : prefix
-        if p == "/" { return path.hasPrefix("/") }
-        return path == p || path.hasPrefix(p + "/")
+        // Standardize lexically, but do not resolve symlinks. This removes
+        // traversal components while preserving the no-follow responsibility
+        // of the caller that opens or mutates the path.
+        let normalizedPath = lexicallyStandardizedPath(path)
+        let normalizedPrefix = lexicallyStandardizedPath(prefix)
+        if normalizedPrefix == "/" { return normalizedPath.hasPrefix("/") }
+        return normalizedPath == normalizedPrefix || normalizedPath.hasPrefix(normalizedPrefix + "/")
     }
 }
 

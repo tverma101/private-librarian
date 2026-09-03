@@ -31,6 +31,21 @@ struct CleanerHomeView: View {
         model.smartGroups.first(where: { $0.id == "category:Image/Junk" })?.fileIDs.count ?? 0
     }
 
+    private var selectedProfileReady: Bool {
+        model.localModelProfile == .fast || model.isTier2Provisioned
+    }
+
+    private var profileDescription: String {
+        switch model.localModelProfile {
+        case .fast:
+            return "Fast analysis uses deterministic rules and Apple Vision. No model download is required."
+        case .balanced:
+            return "Balanced uses downloaded local models when available and keeps uncertain files for review."
+        case .quality:
+            return "Quality uses the full downloaded local stack for harder images and documents."
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -43,6 +58,7 @@ struct CleanerHomeView: View {
                     }
 
                     cleanupCard
+                    analysisResultCard
                     foldersCard
                     resultCard
                     searchCard
@@ -117,12 +133,43 @@ struct CleanerHomeView: View {
     private var cleanupCard: some View {
         VStack(spacing: 18) {
             VStack(spacing: 6) {
-                Text(model.isIndexing ? "Cleaning up \(scopeLabel)…" : "Ready to clean up the mess?")
+                Text(model.isIndexing ? "Analyzing \(scopeLabel)…" : model.isReconciling ? "Checking \(scopeLabel)…" : "Analyze your files safely")
                     .font(.title2.bold())
-                Text("Private Librarian scans locally, groups broadly, and keeps the source folders read-only.")
+                Text("Private Librarian scans locally and suggests organization. Nothing moves until you review and confirm it.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+            }
+
+            if !model.sources.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("Quality", selection: $model.localModelProfile) {
+                        Text("Fast").tag(LocalModelProfile.fast)
+                        Text("Balanced").tag(LocalModelProfile.balanced)
+                        Text("Quality").tag(LocalModelProfile.quality)
+                    }
+                    .pickerStyle(.segmented)
+                    Text(profileDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if model.localModelProfile != .fast, !model.isTier2Provisioned {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "arrow.down.circle")
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Download the selected local models first")
+                                    .font(.caption.weight(.medium))
+                                Text("Analysis is disabled for this quality mode until its local models are ready.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            SettingsLink { Text("Set Up") }
+                                .font(.caption)
+                        }
+                        .foregroundStyle(.orange)
+                    }
+                }
+                .frame(maxWidth: 420)
             }
 
             if model.sources.isEmpty {
@@ -158,22 +205,27 @@ struct CleanerHomeView: View {
                         .controlSize(.small)
                         .frame(maxWidth: 360)
 
-                    Button("Stop Cleanup") {
+                    Button("Stop Analysis") {
                         model.cancelIndexing()
                     }
                     .keyboardShortcut(.cancelAction)
+                } else if model.isReconciling {
+                    ProgressView("Checking known files…")
+                        .controlSize(.small)
+                        .frame(maxWidth: 360)
                 } else {
                     Button {
                         startCleanup()
                     } label: {
-                        Label("Clean Up", systemImage: "sparkles")
+                        Label("Analyze Folder", systemImage: "sparkles")
                             .font(.headline)
                             .frame(minWidth: 180)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(!model.catalogReady || eligibleSources.isEmpty)
+                    .disabled(!model.catalogReady || eligibleSources.isEmpty || !selectedProfileReady)
+                    .help("Read and understand files without moving them")
                 }
             }
 
@@ -305,64 +357,94 @@ struct CleanerHomeView: View {
 
                 Spacer()
             }
-
-            if let report = model.lastCleanupReport {
-                cleanupSummary(report)
-            }
         }
         .padding(18)
         .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
-    /// Answers "what folder did it just sort, and what came out of it?" —
-    /// per-folder scan counts plus the groups this cleanup created or grew.
-    private func cleanupSummary(_ report: LibrarianModel.CleanupReport) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Divider()
-            HStack {
-                Label("Last cleanup · \(report.finishedAt.formatted(date: .abbreviated, time: .shortened))", systemImage: "checkmark.seal")
-                    .font(.subheadline.weight(.medium))
-                Spacer()
-            }
-
-            ForEach(report.folders) { folder in
-                HStack(spacing: 8) {
-                    Image(systemName: "folder.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 16)
-                    Text(folder.displayName)
-                        .font(.caption.weight(.medium))
-                        .lineLimit(1)
-                        .help(folder.rootPath)
-                    Text(folder.completion == "completed" ? "" : "· \(folder.completion)")
-                        .font(.caption)
-                        .foregroundStyle(folder.completion == "completed" ? .clear : .orange)
+    /// The single place that answers "what just happened to my folder?" —
+    /// per-folder evidence, the groups that are ready, and the next step.
+    @ViewBuilder
+    private var analysisResultCard: some View {
+        if let report = model.lastCleanupReport {
+            let anyProblem = !report.ranCleanly || report.folders.contains { $0.unreadableDirectories > 0 }
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline) {
+                    Label(report.headline,
+                          systemImage: anyProblem ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
+                        .font(.headline)
                     Spacer()
-                    Text("\(folder.scanned) scanned · \(folder.processed) updated · \(folder.missingMarked) missing")
+                    Text("\(report.finishedAt.formatted(date: .omitted, time: .shortened)) · \(String(format: "%.0f s", report.duration))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .monospacedDigit()
                 }
-            }
 
-            if !model.changedGroupIDs.isEmpty {
-                let changed = model.smartGroups.filter { model.changedGroupIDs.contains($0.id) }
-                if !changed.isEmpty {
+                ForEach(report.folders) { folder in
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "folder.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 16)
+                            Text(folder.displayName)
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
+                                .help(folder.rootPath)
+                            if folder.completion != "completed" {
+                                Text(folder.completion)
+                                    .font(.caption2.weight(.medium))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(.orange.opacity(0.15), in: Capsule())
+                            }
+                            Spacer()
+                        }
+                        Text(folder.detailLine)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .textSelection(.enabled)
+                    }
+                }
+
+                if model.smartGroups.isEmpty {
+                    Text("No groups yet — check the Review section for files that need a second look.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Organized now")
+                        Text("Groups ready · \(model.smartGroups.count)")
                             .font(.caption.weight(.medium))
-                        FlowChips(items: changed.prefix(8).map { group in
-                            "\(group.title) (\(group.fileIDs.count))"
+                        FlowChips(items: model.smartGroups.prefix(8).map { group in
+                            let growth = model.changedGroupIDs.contains(group.id) ? " · just updated" : ""
+                            return "\(group.title) (\(group.fileIDs.count))\(growth)"
                         })
-                        if changed.count > 8 {
-                            Text("+ \(changed.count - 8) more groups in the Library")
+                        if model.smartGroups.count > 8 {
+                            Text("+ \(model.smartGroups.count - 8) more groups in the Library")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
                     }
                 }
+
+                HStack {
+                    Button {
+                        model.selectedSection = .smart
+                        openWindow(id: "advanced-library")
+                    } label: {
+                        Label("Review organization", systemImage: "square.grid.2x2")
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Text("Nothing moved — applying a plan is always a separate, confirmed step.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
+            .padding(18)
+            .background(
+                (anyProblem ? Color.orange.opacity(0.08) : Color.accentColor.opacity(0.08)),
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
     }
 

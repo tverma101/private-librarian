@@ -112,15 +112,41 @@ final class ApplyAndSearchRegressionTests: XCTestCase {
         let file = try catalog.allFiles().first { $0.path.hasSuffix("csc151-ch4.txt") }!
 
         let moved = file.path + ".moved"
-        try catalog.updateAppliedPath(fileID: file.id, fromPath: file.path, toPath: moved)
+        XCTAssertTrue(try catalog.updateAppliedPath(fileID: file.id,
+                                                     fromPath: file.path,
+                                                     toPath: moved))
         XCTAssertEqual(try catalog.fileRow(id: file.id)?.path, moved)
 
         // A stale plan (old fromPath) must not rewrite the row again.
-        try catalog.updateAppliedPath(fileID: file.id, fromPath: file.path, toPath: "/somewhere/else")
+        XCTAssertFalse(try catalog.updateAppliedPath(fileID: file.id,
+                                                      fromPath: file.path,
+                                                      toPath: "/somewhere/else"))
         XCTAssertEqual(try catalog.fileRow(id: file.id)?.path, moved)
     }
 
     // MARK: - OrganizationApplier
+
+    func testSmartGroupsExcludeMissingAndUnscopedFiles() throws {
+        let catalog = try TestSupport.makeCatalog()
+        let paths = ["/tmp/active-a.txt", "/tmp/active-b.txt", "/tmp/missing-c.txt", "/tmp/unscoped-d.txt"]
+        for (index, path) in paths.enumerated() {
+            let id = "smart-\(index)"
+            try catalog.upsertFile(
+                identity: FileIdentity(path: path, volumeUUID: nil, fileID: UInt64(index + 1),
+                                       size: 12, mtime: Date(), ctime: Date(), kind: .text,
+                                       isSymlink: false), id: id)
+            try catalog.setStatus(fileID: id, status: "indexed")
+            try catalog.saveClassification(
+                Classification(fileID: id, categories: ["Documents/PDF"], description: "",
+                               confidence: 0.9, reasonCodes: ["test"]), classifier: "test")
+        }
+        try catalog.setStatus(fileID: "smart-2", status: "missing")
+        try catalog.setStatus(fileID: "smart-3", status: "unscoped")
+
+        let groups = try catalog.smartOrganizationGroups()
+        XCTAssertEqual(groups.first(where: { $0.id == "category:Documents/PDF" })?.fileIDs,
+                       ["smart-0", "smart-1"])
+    }
 
     private struct StaticLease: OrganizationLease {
         let url: URL
@@ -173,10 +199,28 @@ final class ApplyAndSearchRegressionTests: XCTestCase {
             sourceRoots: [rootA.path, rootB.path])
 
         XCTAssertEqual(plan.destinationRootPath, rootA.path)
+        XCTAssertEqual(plan.candidateRootPaths, [rootA.path, rootB.path].sorted())
         XCTAssertEqual(plan.items.count, 2)
+        XCTAssertEqual(plan.items.map(\.toPath), [
+            rootA.path + "/PDFs/report_a.pdf",
+            rootA.path + "/PDFs/report_b.pdf",
+        ])
         XCTAssertEqual(plan.missingPaths.count, 1)
         XCTAssertEqual(plan.skippedOtherRoots, 1)
         XCTAssertEqual(plan.destinationFolderPath, rootA.path + "/PDFs")
+
+        let selectedPlan = try OrganizationApplier.plan(
+            group: group("PDFs", paths: [
+                rootA.appendingPathComponent("report_a.pdf").path,
+                rootA.appendingPathComponent("report_b.pdf").path,
+                rootB.appendingPathComponent("report_a.pdf").path,
+            ]),
+            pathFor: { $0 },
+            sourceRoots: [rootA.path, rootB.path],
+            destinationRootPath: rootB.path)
+        XCTAssertEqual(selectedPlan.destinationRootPath, rootB.path)
+        XCTAssertEqual(selectedPlan.items.map(\.toPath), [rootB.path + "/PDFs/report_a.pdf"])
+        XCTAssertEqual(selectedPlan.skippedOtherRoots, 2)
     }
 
     func testPlanSanitizesFolderName() {
@@ -184,18 +228,48 @@ final class ApplyAndSearchRegressionTests: XCTestCase {
         XCTAssertFalse(OrganizationApplier.sanitizedFolderName(from: "a/b:c").contains("/"))
         XCTAssertFalse(OrganizationApplier.sanitizedFolderName(from: "a/b:c").contains(":"))
         XCTAssertEqual(OrganizationApplier.sanitizedFolderName(from: "   "), "Organized files")
+        XCTAssertEqual(OrganizationApplier.sanitizedFolderName(from: "."), "Organized files")
+        XCTAssertEqual(OrganizationApplier.sanitizedFolderName(from: ".."), "Organized files")
+    }
+
+    func testPathContainmentNormalizesTraversalWithoutResolvingSymlinks() {
+        XCTAssertTrue(SourceBroker.isPath("/tmp/root/sub/../file", under: "/tmp/root"))
+        XCTAssertFalse(SourceBroker.isPath("/tmp/root/../../outside", under: "/tmp/root"))
+        XCTAssertFalse(SourceBroker.isPath("/tmp/rooted/file", under: "/tmp/root"))
+    }
+
+    func testPlanRejectsDirectoriesAndSymlinksAsMovableFiles() throws {
+        let root = try makeTempTree()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let symlink = root.appendingPathComponent("linked.pdf")
+        try FileManager.default.createSymbolicLink(at: symlink,
+                                                   withDestinationURL: root.appendingPathComponent("report_a.pdf"))
+        let plan = try OrganizationApplier.plan(
+            group: group("PDFs", paths: [root.appendingPathComponent("sub").path, symlink.path]),
+            pathFor: { $0 }, sourceRoots: [root.path])
+        XCTAssertTrue(plan.items.isEmpty)
+        XCTAssertEqual(Set(plan.missingPaths), Set([root.appendingPathComponent("sub").path, symlink.path]))
     }
 
     func testApplyMovesFilesJournalsAndUpdatesCatalogThenUndoRestores() throws {
         let root = try makeTempTree()
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
         let catalog = try TestSupport.makeCatalog()
+        _ = try Indexer(broker: SourceBroker(), catalog: catalog, scheduler: Scheduler()).indexRoot(root)
 
         let originalA = root.appendingPathComponent("report_a.pdf")
         let originalC = root.appendingPathComponent("sub/report_c.pdf")
+        let indexedRows = try catalog.allFiles()
+        let selectedIDs = [originalA.path, originalC.path].compactMap { path in
+            indexedRows.first { $0.path == path }?.id
+        }
+        XCTAssertEqual(selectedIDs.count, 2)
+        let applyGroup = SmartOrganizationGroup(id: "category:PDFs", title: "PDFs",
+                                                subtitle: "", kind: .category,
+                                                fileIDs: selectedIDs)
         let plan = try OrganizationApplier.plan(
-            group: group("PDFs", paths: [originalA.path, originalC.path]),
-            pathFor: { $0 },
+            group: applyGroup,
+            pathFor: { id in (try? catalog.fileRow(id: id))?.path ?? "" },
             sourceRoots: [root.path])
 
         let outcome = try OrganizationApplier.apply(

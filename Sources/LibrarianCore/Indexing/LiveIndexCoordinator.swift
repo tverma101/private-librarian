@@ -474,6 +474,12 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
         lock.unlock()
+        // A debounce item may have crossed the cancellation boundary and
+        // already queued work. Drain that serialized worker first so tests and
+        // diagnostic callers never observe a half-processed batch.
+        if DispatchQueue.getSpecific(key: workQueueKey) == nil {
+            workQueue.sync {}
+        }
         return drainAndProcessSync()
     }
 
@@ -552,6 +558,15 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         do {
             _ = try broker.identity(at: path)
         } catch BrokerError.statFailed(let error) where error == ENOENT || error == ENOTDIR {
+            try markMissing(atOrUnder: path)
+            if isWatchedRoot(path) {
+                onRootAccessLost?(path, "root-unavailable")
+            }
+            return (nil, previousID ?? nil)
+        } catch BrokerError.openFailed(let error) where error == ENOENT || error == ENOTDIR {
+            // A path can disappear between event delivery and lstat. Treat
+            // both access seams as a deletion, rather than silently dropping
+            // the event as a transient read failure.
             try markMissing(atOrUnder: path)
             if isWatchedRoot(path) {
                 onRootAccessLost?(path, "root-unavailable")

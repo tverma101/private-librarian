@@ -215,16 +215,17 @@ That final OS-level check is tracked in issue #44.
 
 ## Repository map
 
-- `Sources/LibrarianCore/` — indexing, catalog, OCR, smart organization, similarity, media, learning, and provider logic.
-- `Sources/LibrarianApp/` — native SwiftUI app.
-- `Sources/librarian-cli/` — development/verification CLI.
-- `Tests/LibrarianTests/` — safety, behavior, resilience, media, search, organization, and quality tests.
-- `scripts/` — packaging, verification, provisioning, benchmarks, and helper processes.
-- `docs/ARCHITECTURE.md` — system architecture.
-- `docs/SECURITY.md` — threat model and security boundaries.
-- `docs/VERIFICATION.md` — verification commands and receipts.
-- `docs/UPSTREAM_REUSE.md` — upstream research and attribution notes.
-- `ThirdParty/` — vendored third-party code, provenance, and required notices.
+If you are new to the codebase, start with the [project map](docs/PROJECT_MAP.md).
+It explains the product flow, SwiftPM targets, feature ownership, and the best
+place to look for common changes.
+
+For deeper detail, use:
+
+- [Architecture](docs/ARCHITECTURE.md) for module boundaries and design contracts.
+- [Security](docs/SECURITY.md) for the read-only, offline, and encrypted-catalog rules.
+- [Verification](docs/VERIFICATION.md) for local checks and evidence limits.
+- [Upstream reuse notes](docs/UPSTREAM_REUSE.md) for research and attribution.
+- `ThirdParty/` for vendored code, provenance, and required notices.
 
 ## Contributing
 

@@ -8,6 +8,9 @@ searchable, virtually organized catalog of a user's local folders while being
 > filesystem-writing capabilities. Organization exists only inside an
 > encrypted catalog.
 
+If you are looking for a quick tour rather than a design reference, start with
+the [project map](PROJECT_MAP.md).
+
 ## Invariant stack (each layer independently enforces the last)
 
 ```

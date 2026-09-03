@@ -96,10 +96,12 @@ final class LibrarianModel: ObservableObject {
         let specialistRuntimeIDs: Set<String>
     }
 
-    /// What the last "Clean Up" actually did, per folder, so the home screen
-    /// can answer "what just got sorted?" instead of only "cleanup complete".
+    /// What the last analysis run actually did, per folder, so the home screen
+    /// can answer "what just happened to my folder?" instead of only
+    /// "analysis complete".
     struct CleanupFolderReport: Identifiable, Sendable, Equatable {
         let rootPath: String
+        let knownBefore: Int
         let scanned: Int
         let processed: Int
         let missingMarked: Int
@@ -110,11 +112,44 @@ final class LibrarianModel: ObservableObject {
         var displayName: String {
             (rootPath as NSString).lastPathComponent.isEmpty ? rootPath : (rootPath as NSString).lastPathComponent
         }
+
+        /// One honest line about this folder's run, including the explicit
+        /// "nothing changed" case instead of a row of zeros.
+        var detailLine: String {
+            var parts: [String] = ["\(scanned) files checked"]
+            if processed > 0 {
+                parts.append("\(processed) analyzed (new or changed)")
+            }
+            if missingMarked > 0 {
+                parts.append("\(missingMarked) no longer on disk")
+            }
+            if unreadableDirectories > 0 {
+                parts.append("\(unreadableDirectories) folders unreadable")
+            }
+            if processed == 0 && missingMarked == 0 {
+                parts.append(scanned == 0 ? "folder is empty" : "already analyzed, nothing changed")
+            }
+            return parts.joined(separator: " · ")
+        }
     }
 
     struct CleanupReport: Sendable, Equatable {
         let finishedAt: Date
+        let duration: TimeInterval
         let folders: [CleanupFolderReport]
+
+        var totalScanned: Int { folders.reduce(0) { $0 + $1.scanned } }
+        var totalProcessed: Int { folders.reduce(0) { $0 + $1.processed } }
+        var totalMissing: Int { folders.reduce(0) { $0 + $1.missingMarked } }
+        var ranCleanly: Bool { folders.allSatisfy { $0.completion == "completed" } }
+
+        var headline: String {
+            if !ranCleanly { return "Analysis finished with warnings" }
+            if totalProcessed > 0 {
+                return "Analysis complete · \(totalProcessed) new or changed"
+            }
+            return "Up to date · nothing new to analyze"
+        }
     }
 
     @Published var sources: [SourceFolder] = []
@@ -138,6 +173,11 @@ final class LibrarianModel: ObservableObject {
     @Published var pendingApplyPlan: OrganizationApplier.Plan?
     @Published private(set) var lastApplyMessage: String?
     @Published private(set) var canUndoApply = false
+    @Published private(set) var isApplyOperationInProgress = false
+    @Published private(set) var isReconciling = false
+    /// Bumped whenever a preview is superseded (applied, cancelled, or being
+    /// replanned) so an in-flight replan cannot re-present a stale sheet.
+    private var applyReplanGeneration = 0
     @Published private(set) var pausedPaths: Set<String> = []
     @Published private(set) var liveIndexRunning = false
     @Published private(set) var livePendingEvents = 0
@@ -239,6 +279,9 @@ final class LibrarianModel: ObservableObject {
         refreshModelStatus()
         openCatalogIfNeeded()
         refreshDashboard()
+        if catalogReady {
+            reconcileAuthorizedSources()
+        }
     }
 
     /// Readiness checks can enumerate large model snapshots and invoke a small
@@ -674,19 +717,75 @@ final class LibrarianModel: ObservableObject {
         log("stopping cleanup after the current file…")
     }
 
+    /// Verify known catalog rows against the live authorized folders without
+    /// re-running extraction or local models. Full analysis remains explicit.
+    func reconcileAuthorizedSources() {
+        guard catalogReady, let catalog, !isReconciling, !isIndexing else { return }
+        let authorized: [(sourcePath: String, lease: SecurityScopedBookmarkLease)] = sources
+            .filter { !pausedPaths.contains($0.path) && !sourcesNeedingReauthorization.contains($0.path) }
+            .compactMap { source in sourceLease(for: source).map { (source.path, $0) } }
+        guard !authorized.isEmpty else { return }
+
+        isReconciling = true
+        log("checking known files against authorized folders…")
+        Task.detached(priority: .utility) { [weak self, catalog, authorized] in
+            let broker = SourceBroker()
+            let rows = (try? catalog.allFiles(statuses: ["indexed"])) ?? []
+            var markedMissing = 0
+            var skippedInaccessible = 0
+            for row in rows {
+                // Rows outside every currently authorized root are left alone:
+                // a paused or de-authorized folder is not evidence that its
+                // files disappeared.
+                guard let scope = authorized.first(where: {
+                    SourceBroker.isPath(row.path, under: $0.sourcePath)
+                }) else { continue }
+                let outcome = SourceReconciler.classify(
+                    leaseTargetURL: scope.lease.targetURL(
+                        for: row.path, originalRootPath: scope.sourcePath),
+                    identity: { try broker.identity(at: $0) })
+                switch outcome {
+                case .current:
+                    break
+                case .movedOrDeleted:
+                    try? catalog.markMissing(path: row.path)
+                    markedMissing += 1
+                case .permissionDenied:
+                    try? catalog.recordAccessBackoff(prefix: row.path, reason: "permission-denied")
+                    skippedInaccessible += 1
+                case .unavailable:
+                    skippedInaccessible += 1
+                }
+            }
+            let missingSnapshot = markedMissing
+            let skippedSnapshot = skippedInaccessible
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isReconciling = false
+                self.log(missingSnapshot == 0 && skippedSnapshot == 0
+                         ? "folder check complete · known files are current"
+                         : "folder check complete · \(missingSnapshot) file(s) moved or deleted"
+                           + (skippedSnapshot == 0 ? "" : " · \(skippedSnapshot) unreadable, kept as-is"))
+                self.refreshDashboard()
+            }
+        }
+    }
+
     // MARK: - Apply to Finder (explicit, journaled, undoable)
 
     /// Build the preview plan for turning one virtual group into a real
     /// folder. Nothing moves until `confirmApply()` runs.
-    func prepareApply(group: SmartOrganizationGroup) {
-        guard catalogReady, let catalog else { return }
+    func prepareApply(group: SmartOrganizationGroup, destinationRootPath: String? = nil) {
+        guard catalogReady, let catalog, !isApplyOperationInProgress,
+              !isReconciling, pendingApplyPlan == nil else { return }
         let roots = sources.map(\.path)
-        Task.detached(priority: .userInitiated) { [weak self, catalog, group, roots] in
+        Task.detached(priority: .userInitiated) { [weak self, catalog, group, roots, destinationRootPath] in
             do {
                 let plan = try OrganizationApplier.plan(
                     group: group,
                     pathFor: { fileID in (try? catalog.fileRow(id: fileID))?.path ?? "" },
-                    sourceRoots: roots)
+                    sourceRoots: roots,
+                    destinationRootPath: destinationRootPath)
                 await MainActor.run { [weak self] in
                     self?.pendingApplyPlan = plan
                 }
@@ -698,16 +797,56 @@ final class LibrarianModel: ObservableObject {
         }
     }
 
+    /// Rebuild the preview when the user chooses a different authorized root.
+    /// The sheet stays presented and the plan swaps in place once replanning
+    /// finishes; nil-ing the plan first would dismiss and re-present the sheet.
+    /// Replanning is intentional: conflict-free destination names depend on the
+    /// live contents of the selected destination.
+    func replanApply(to rootPath: String) {
+        guard !isApplyOperationInProgress,
+              let currentPlan = pendingApplyPlan,
+              let group = smartGroups.first(where: { $0.id == currentPlan.groupID }),
+              currentPlan.candidateRootPaths.contains(rootPath),
+              rootPath != currentPlan.destinationRootPath else { return }
+        guard catalogReady, let catalog else { return }
+        applyReplanGeneration += 1
+        let generation = applyReplanGeneration
+        let roots = sources.map(\.path)
+        Task.detached(priority: .userInitiated) { [weak self, catalog, group, roots, rootPath, generation] in
+            do {
+                let plan = try OrganizationApplier.plan(
+                    group: group,
+                    pathFor: { fileID in (try? catalog.fileRow(id: fileID))?.path ?? "" },
+                    sourceRoots: roots,
+                    destinationRootPath: rootPath)
+                await MainActor.run { [weak self] in
+                    guard let self, self.applyReplanGeneration == generation else { return }
+                    self.pendingApplyPlan = plan
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    guard let self, self.applyReplanGeneration == generation else { return }
+                    self.log("apply preview failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
     func cancelApply() {
+        applyReplanGeneration += 1
         pendingApplyPlan = nil
     }
 
     /// Execute the confirmed plan with fresh security-scoped leases, then
     /// refresh the dashboard so the group reflects the new locations.
-    func confirmApply() {
-        guard let plan = pendingApplyPlan else { return }
+    func confirmApply(excluding fileIDs: Set<String> = []) {
+        guard let pendingPlan = pendingApplyPlan, catalogReady, let catalog,
+              !isApplyOperationInProgress, !isReconciling else { return }
+        let plan = pendingPlan.excluding(fileIDs: fileIDs)
+        guard !plan.items.isEmpty else { return }
+        applyReplanGeneration += 1
         pendingApplyPlan = nil
-        guard catalogReady, let catalog else { return }
+        isApplyOperationInProgress = true
         let bookmarkData = bookmarkDataByPath
         log("applying \"\(plan.groupTitle)\" · moving \(plan.items.count) files…")
         Task.detached(priority: .userInitiated) { [weak self, catalog, plan, bookmarkData] in
@@ -720,6 +859,7 @@ final class LibrarianModel: ObservableObject {
                     catalog: catalog)
                 await MainActor.run { [weak self] in
                     guard let self else { return }
+                    self.isApplyOperationInProgress = false
                     self.lastApplyMessage = outcome.succeeded
                         ? "Moved \(outcome.moved) files to \(outcome.destinationFolderPath)"
                         : "Moved \(outcome.moved) of \(outcome.moved + outcome.failures.count) files · \(outcome.failures.count) failed"
@@ -732,15 +872,18 @@ final class LibrarianModel: ObservableObject {
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    self?.log("apply failed: \(error.localizedDescription)")
-                    self?.lastApplyMessage = "Apply failed: \(error.localizedDescription)"
+                    guard let self else { return }
+                    self.isApplyOperationInProgress = false
+                    self.log("apply failed: \(error.localizedDescription)")
+                    self.lastApplyMessage = "Apply failed: \(error.localizedDescription)"
                 }
             }
         }
     }
 
     func undoLastApply() {
-        guard catalogReady, let catalog else { return }
+        guard catalogReady, let catalog, !isApplyOperationInProgress else { return }
+        isApplyOperationInProgress = true
         let bookmarkData = bookmarkDataByPath
         let roots = sources.map(\.path)
         Task.detached(priority: .userInitiated) { [weak self, catalog, bookmarkData, roots] in
@@ -752,6 +895,7 @@ final class LibrarianModel: ObservableObject {
                 })
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                self.isApplyOperationInProgress = false
                 if let outcome {
                     self.lastApplyMessage = outcome.succeeded
                         ? "Undo complete · \(outcome.restored) files restored"
@@ -837,15 +981,19 @@ final class LibrarianModel: ObservableObject {
         // Snapshot group sizes so completion can show exactly which groups the
         // cleanup created or grew ("what did it just organize?").
         let groupSizesBefore = Dictionary(uniqueKeysWithValues: smartGroups.map { ($0.id, $0.fileIDs.count) })
+        let runStartedAt = Date()
         log("cleanup started · \(scopeLabel)")
 
-        Task.detached(priority: .userInitiated) { [weak self, jobs, session, token, scopeLabel, groupSizesBefore] in
+        Task.detached(priority: .userInitiated) { [weak self, jobs, session, token, scopeLabel, groupSizesBefore, catalog, runStartedAt] in
             var unavailableSources: [String] = []
             var completionReasons: [String] = []
             var folderReports: [CleanupFolderReport] = []
             for (source, lease) in jobs {
                 if token.isCancelled { break }
                 do {
+                    // Baseline of rows the catalog already knew for this root,
+                    // so the report can say "nothing new" with evidence.
+                    let knownBefore = (try? catalog.indexedFileCount(under: source.path)) ?? 0
                     let result = try session.indexRoot(lease.url, cancellation: token) { progress in
                         Task { @MainActor [weak self] in
                             self?.log("cleanup \(scopeLabel) · \(progress.rootPath)… \(progress.scanned) files scanned")
@@ -854,6 +1002,7 @@ final class LibrarianModel: ObservableObject {
                     completionReasons.append("\(source.path)=\(result.completion.rawValue)")
                     folderReports.append(CleanupFolderReport(
                         rootPath: source.path,
+                        knownBefore: knownBefore,
                         scanned: result.scanned,
                         processed: result.processed,
                         missingMarked: result.missingMarked,
@@ -880,18 +1029,24 @@ final class LibrarianModel: ObservableObject {
                 self.isIndexing = false
                 self.refreshDashboard()
                 if !reportSnapshot.isEmpty {
-                    self.lastCleanupReport = CleanupReport(finishedAt: Date(), folders: reportSnapshot)
+                    self.lastCleanupReport = CleanupReport(
+                        finishedAt: Date(),
+                        duration: Date().timeIntervalSince(runStartedAt),
+                        folders: reportSnapshot)
                     let sizesAfter = Dictionary(uniqueKeysWithValues: self.smartGroups.map { ($0.id, $0.fileIDs.count) })
                     self.changedGroupIDs = Set(sizesAfter.filter { id, count in
                         (groupSizesBefore[id] ?? 0) < count
                     }.keys)
                 }
+                let processedTotal = reportSnapshot.reduce(0) { $0 + $1.processed }
+                let missingTotal = reportSnapshot.reduce(0) { $0 + $1.missingMarked }
                 if token.isCancelled {
-                    self.log("cleanup stopped · \(token.reason?.rawValue ?? "cancelled")")
+                    self.log("analysis stopped · \(scopeLabel) · \(processedTotal) new or changed before stop")
                 } else if completionSnapshot.contains(where: { $0.hasSuffix("=rootUnavailable") }) {
-                    self.log("cleanup complete with unavailable folder · \(scopeLabel)")
+                    self.log("analysis finished with an unavailable folder · \(scopeLabel) · \(processedTotal) new or changed")
                 } else {
-                    self.log("cleanup complete · \(scopeLabel)")
+                    self.log("analysis complete · \(scopeLabel) · \(processedTotal) new or changed"
+                             + (missingTotal == 0 ? "" : " · \(missingTotal) missing"))
                 }
                 self.restartLiveCoordinator()
             }

@@ -29,6 +29,9 @@ public enum OrganizationApplier {
         public struct Item: Sendable, Equatable {
             public let fileID: String
             public let fromPath: String
+            /// Catalog-space destination selected during preview. Apply must
+            /// use this exact path so conflict renames cannot surprise the user.
+            public let toPath: String
         }
 
         public let id: String
@@ -36,6 +39,9 @@ public enum OrganizationApplier {
         public let groupTitle: String
         public let folderName: String
         public let destinationRootPath: String
+        /// Authorized roots represented by this group, offered to the user as
+        /// destination choices. The selected root remains deterministic by default.
+        public let candidateRootPaths: [String]
         public let items: [Item]
         public let missingPaths: [String]
         public let skippedOtherRoots: Int
@@ -43,6 +49,20 @@ public enum OrganizationApplier {
         /// Catalog-space destination folder path (what the user will see).
         public var destinationFolderPath: String {
             destinationRootPath + "/" + folderName
+        }
+
+        /// Return the same preview after the user deselects individual files.
+        /// Keeping the plan ID preserves one journal batch for the confirmation.
+        public func excluding(fileIDs: Set<String>) -> Plan {
+            Plan(id: id,
+                 groupID: groupID,
+                 groupTitle: groupTitle,
+                 folderName: folderName,
+                 destinationRootPath: destinationRootPath,
+                 candidateRootPaths: candidateRootPaths,
+                 items: items.filter { !fileIDs.contains($0.fileID) },
+                 missingPaths: missingPaths,
+                 skippedOtherRoots: skippedOtherRoots)
         }
     }
 
@@ -71,11 +91,19 @@ public enum OrganizationApplier {
     public enum ApplyError: Error, LocalizedError, Equatable {
         case noMembers
         case noAuthorizedRoot
+        case journalPersistenceFailed(reason: String, rollbackFailures: [Outcome.Failure])
 
         public var errorDescription: String? {
             switch self {
-            case .noMembers: return "This group has no movable files."
-            case .noAuthorizedRoot: return "The folder holding these files is no longer authorized. Re-authorize it and try again."
+            case .noMembers:
+                return "This group has no movable files."
+            case .noAuthorizedRoot:
+                return "The folder holding these files is no longer authorized. Re-authorize it and try again."
+            case let .journalPersistenceFailed(reason, rollbackFailures):
+                if rollbackFailures.isEmpty {
+                    return "The move was rolled back because its recovery record could not be saved: \(reason)"
+                }
+                return "The recovery record could not be saved and \(rollbackFailures.count) moved file(s) could not be restored. Review recovery before trying again."
             }
         }
     }
@@ -87,7 +115,8 @@ public enum OrganizationApplier {
     public static func plan(
         group: SmartOrganizationGroup,
         pathFor: (String) -> String,
-        sourceRoots: [String]
+        sourceRoots: [String],
+        destinationRootPath requestedDestinationRoot: String? = nil
     ) throws -> Plan {
         let members = group.fileIDs.map { (fileID: $0, path: pathFor($0)) }
             .filter { !$0.path.isEmpty }
@@ -109,7 +138,16 @@ public enum OrganizationApplier {
             }
             byRoot[root, default: []].append(member)
         }
-        guard let destinationRoot = byRoot.max(by: { $0.value.count < $1.value.count })?.key else {
+        let destinationRoot: String
+        if let requestedDestinationRoot,
+           byRoot[requestedDestinationRoot] != nil {
+            destinationRoot = requestedDestinationRoot
+        } else if let inferredRoot = byRoot.max(by: {
+            if $0.value.count != $1.value.count { return $0.value.count < $1.value.count }
+            return $0.key > $1.key
+        })?.key {
+            destinationRoot = inferredRoot
+        } else {
             throw ApplyError.noAuthorizedRoot
         }
 
@@ -117,12 +155,27 @@ public enum OrganizationApplier {
         let destinationMembers = byRoot[destinationRoot] ?? []
         var missingPaths: [String] = []
         var items: [Plan.Item] = []
+        var reservedDestinationNames: Set<String> = []
+        let destinationPath = destinationRoot + "/" + folderName
+        let broker = SourceBroker()
         for member in destinationMembers {
-            if FileManager.default.fileExists(atPath: member.path) {
-                items.append(Plan.Item(fileID: member.fileID, fromPath: member.path))
-            } else {
-                missingPaths.append(member.path)
+            // Applying the same group again must be a no-op for files already
+            // inside its destination, not a path-nesting operation.
+            guard !SourceBroker.isPath(member.path, under: destinationPath) else {
+                continue
             }
+            guard broker.isRegularFile(at: member.path) else {
+                missingPaths.append(member.path)
+                continue
+            }
+            let fileName = URL(fileURLWithPath: member.path).lastPathComponent
+            let targetURL = conflictFreeDestination(
+                for: fileName,
+                in: URL(fileURLWithPath: destinationPath, isDirectory: true),
+                reservedNames: &reservedDestinationNames)
+            items.append(Plan.Item(fileID: member.fileID,
+                                   fromPath: member.path,
+                                   toPath: destinationPath + "/" + targetURL.lastPathComponent))
         }
         let skippedOtherRoots = members.count - destinationMembers.count
         return Plan(
@@ -131,6 +184,7 @@ public enum OrganizationApplier {
             groupTitle: group.title,
             folderName: folderName,
             destinationRootPath: destinationRoot,
+            candidateRootPaths: byRoot.keys.sorted(),
             items: items,
             missingPaths: missingPaths.sorted(),
             skippedOtherRoots: skippedOtherRoots)
@@ -143,7 +197,7 @@ public enum OrganizationApplier {
             name = name.replacingOccurrences(of: separator, with: " ")
         }
         name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if name.isEmpty { name = "Organized files" }
+        if name.isEmpty || name == "." || name == ".." { name = "Organized files" }
         return String(name.prefix(80))
     }
 
@@ -180,33 +234,88 @@ public enum OrganizationApplier {
                 failures.append(.init(path: item.fromPath, reason: "outside the authorized folder"))
                 continue
             }
-            guard FileManager.default.fileExists(atPath: sourceURL.path) else {
-                failures.append(.init(path: item.fromPath, reason: "file is gone"))
+            guard broker.isRegularFile(at: sourceURL.path) else {
+                failures.append(.init(path: item.fromPath,
+                                      reason: "source is missing, a directory, or a symlink"))
                 continue
             }
-            let fileName = sourceURL.lastPathComponent
-            let targetURL = conflictFreeDestination(for: fileName, in: destinationURL)
+            guard let targetURL = lease.targetURL(
+                for: item.toPath,
+                originalRootPath: plan.destinationRootPath),
+                  SourceBroker.isPath(item.toPath, under: plan.destinationFolderPath),
+                  !FileManager.default.fileExists(atPath: targetURL.path) else {
+                failures.append(.init(path: item.fromPath,
+                                      reason: "destination changed since preview"))
+                continue
+            }
+            guard targetURL.lastPathComponent == URL(fileURLWithPath: item.toPath).lastPathComponent else {
+                failures.append(.init(path: item.fromPath,
+                                      reason: "planned destination could not be resolved"))
+                continue
+            }
             do {
                 try FileManager.default.moveItem(at: sourceURL, to: targetURL)
             } catch {
                 failures.append(.init(path: item.fromPath, reason: error.localizedDescription))
                 continue
             }
-            let toPath = plan.destinationRootPath + "/" + plan.folderName + "/" + targetURL.lastPathComponent
-            journal.append(.init(fileID: item.fileID, fromPath: item.fromPath, toPath: toPath))
+            journal.append(.init(fileID: item.fileID, fromPath: item.fromPath, toPath: item.toPath))
             moved += 1
         }
 
-        // Journal first (so undo is always possible), then reconcile the
-        // catalog row paths. Path updates are guarded by the original path.
+        // The filesystem has already changed, so a journal-write failure must
+        // not leave an un-undoable batch behind. Roll successful moves back
+        // before returning the catalog error.
         if !journal.isEmpty {
-            try catalog.recordApplyBatch(batchID: batchID,
-                                         appliedAt: Date().timeIntervalSince1970,
-                                         entries: journal)
+            do {
+                try catalog.recordApplyBatch(batchID: batchID,
+                                             appliedAt: Date().timeIntervalSince1970,
+                                             entries: journal)
+            } catch {
+                var rollbackFailures: [Outcome.Failure] = []
+                for entry in journal.reversed() {
+                    guard let sourceURL = lease.targetURL(for: entry.toPath,
+                                                          originalRootPath: plan.destinationRootPath),
+                          let targetURL = lease.targetURL(for: entry.fromPath,
+                                                          originalRootPath: plan.destinationRootPath) else {
+                        rollbackFailures.append(.init(path: entry.toPath,
+                                                      reason: "rollback path is outside the authorized folder"))
+                        continue
+                    }
+                    guard broker.isRegularFile(at: sourceURL.path) else {
+                        rollbackFailures.append(.init(path: entry.toPath,
+                                                      reason: "moved file was not available during rollback"))
+                        continue
+                    }
+                    do {
+                        guard !FileManager.default.fileExists(atPath: targetURL.path) else {
+                            throw CocoaError(.fileWriteFileExists)
+                        }
+                        try FileManager.default.createDirectory(
+                            at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        try FileManager.default.moveItem(at: sourceURL, to: targetURL)
+                    } catch {
+                        rollbackFailures.append(.init(path: entry.toPath,
+                                                      reason: "rollback failed: \(error.localizedDescription)"))
+                    }
+                }
+                throw ApplyError.journalPersistenceFailed(
+                    reason: error.localizedDescription,
+                    rollbackFailures: rollbackFailures)
+            }
             for entry in journal {
-                try? catalog.updateAppliedPath(fileID: entry.fileID,
-                                               fromPath: entry.fromPath,
-                                               toPath: entry.toPath)
+                do {
+                    guard try catalog.updateAppliedPath(fileID: entry.fileID,
+                                                        fromPath: entry.fromPath,
+                                                        toPath: entry.toPath) else {
+                        failures.append(.init(path: entry.toPath,
+                                              reason: "catalog row changed before the move was recorded"))
+                        continue
+                    }
+                } catch {
+                    failures.append(.init(path: entry.toPath,
+                                          reason: "catalog update failed: \(error.localizedDescription)"))
+                }
             }
         }
 
@@ -237,7 +346,10 @@ public enum OrganizationApplier {
         func rootFor(_ path: String) -> String? {
             sourceRoots
                 .filter { SourceBroker.isPath(path, under: $0) }
-                .max(by: { $0.count < $1.count })
+                .max(by: {
+                    if $0.count != $1.count { return $0.count < $1.count }
+                    return $0 > $1
+                })
         }
 
         for entry in entries.reversed() {
@@ -267,14 +379,24 @@ public enum OrganizationApplier {
                 failures.append(.init(path: entry.toPath, reason: error.localizedDescription))
                 continue
             }
-            try? catalog.updateAppliedPath(fileID: entry.fileID,
-                                           fromPath: entry.toPath,
-                                           toPath: entry.fromPath)
+            do {
+                guard try catalog.updateAppliedPath(fileID: entry.fileID,
+                                                    fromPath: entry.toPath,
+                                                    toPath: entry.fromPath) else {
+                    failures.append(.init(path: entry.toPath,
+                                          reason: "catalog row changed before Undo could be recorded"))
+                    continue
+                }
+            } catch {
+                failures.append(.init(path: entry.toPath,
+                                      reason: "catalog update failed: \(error.localizedDescription)"))
+                continue
+            }
             undone.append(entry)
             restored += 1
         }
 
-        if !undone.isEmpty, restored == entries.count {
+        if !undone.isEmpty, restored == entries.count, failures.isEmpty {
             try? catalog.deleteApplyBatch(batchID: batchID)
         }
         return UndoOutcome(batchID: batchID, restored: restored, failures: failures)
@@ -284,16 +406,41 @@ public enum OrganizationApplier {
 
     /// "Report.pdf" existing -> "Report 2.pdf", "Report 3.pdf", …
     static func conflictFreeDestination(for fileName: String, in directory: URL) -> URL {
-        var candidate = directory.appendingPathComponent(fileName)
-        guard FileManager.default.fileExists(atPath: candidate.path) else { return candidate }
-        let base = (fileName as NSString).deletingPathExtension
-        let ext = (fileName as NSString).pathExtension
-        for counter in 2...10_000 {
-            let name = ext.isEmpty ? "\(base) \(counter)" : "\(base) \(counter).\(ext)"
-            candidate = directory.appendingPathComponent(name)
-            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        var reservedNames: Set<String> = []
+        return conflictFreeDestination(for: fileName,
+                                       in: directory,
+                                       reservedNames: &reservedNames)
+    }
+
+    private static func conflictFreeDestination(
+        for fileName: String,
+        in directory: URL,
+        reservedNames: inout Set<String>) -> URL {
+        func isAvailable(_ name: String) -> Bool {
+            !reservedNames.contains(name)
+                && !FileManager.default.fileExists(
+                    atPath: directory.appendingPathComponent(name).path)
         }
-        return directory.appendingPathComponent("\(base) \(UUID().uuidString).\(ext)")
+
+        var candidateName = fileName
+        if !isAvailable(candidateName) {
+            let base = (fileName as NSString).deletingPathExtension
+            let ext = (fileName as NSString).pathExtension
+            for counter in 2...10_000 {
+                let name = ext.isEmpty ? "\(base) \(counter)" : "\(base) \(counter).\(ext)"
+                if isAvailable(name) {
+                    candidateName = name
+                    break
+                }
+            }
+            if !isAvailable(candidateName) {
+                candidateName = ext.isEmpty
+                    ? "\(base) \(UUID().uuidString)"
+                    : "\(base) \(UUID().uuidString).\(ext)"
+            }
+        }
+        reservedNames.insert(candidateName)
+        return directory.appendingPathComponent(candidateName)
     }
 }
 

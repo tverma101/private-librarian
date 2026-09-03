@@ -1311,10 +1311,18 @@ public final class Catalog: @unchecked Sendable {
     /// memberships; only its recorded source path changes. The update is
     /// guarded by the original path so a stale plan can never rewrite a row
     /// that no longer matches what was moved.
-    public func updateAppliedPath(fileID: String, fromPath: String, toPath: String) throws {
-        try run("""
-            UPDATE files SET path = ? WHERE id = ? AND path = ?
-            """, binds: [.text(toPath), .text(fileID), .text(fromPath)])
+    @discardableResult
+    public func updateAppliedPath(fileID: String, fromPath: String, toPath: String) throws -> Bool {
+        let update = {
+            try self.rawRun("""
+                UPDATE files SET path = ? WHERE id = ? AND path = ?
+                """, binds: [.text(toPath), .text(fileID), .text(fromPath)])
+            return sqlite3_changes(self.db) == 1
+        }
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            return try update()
+        }
+        return try queue.sync { try update() }
     }
 
     /// Exact duplicate candidates only. Near-duplicate and semantic families

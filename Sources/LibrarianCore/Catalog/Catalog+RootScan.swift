@@ -58,6 +58,21 @@ extension Catalog {
         }
     }
 
+    /// Number of indexed rows currently known under one root, including the
+    /// root itself. The app uses this to explain what an analysis run changed
+    /// relative to what was already known before it started.
+    public func indexedFileCount(under rootPath: String) throws -> Int {
+        let normalizedRoot = rootPath.count > 1 && rootPath.hasSuffix("/")
+            ? String(rootPath.dropLast()) : rootPath
+        let descendantPrefix = normalizedRoot == "/" ? "/" : normalizedRoot + "/"
+        return try query("""
+            SELECT COUNT(*) FROM files
+            WHERE status='indexed' AND (path=? OR substr(path,1,length(?))=?)
+            """, binds: [.text(normalizedRoot), .text(descendantPrefix), .text(descendantPrefix)]) {
+            Int($0.int(0))
+        }.first ?? 0
+    }
+
     /// Page active catalog rows under one root that were not observed in the
     /// completed scan generation. Callers still prove ENOENT/ENOTDIR through
     /// SourceBroker before changing status; a skipped/unreadable subtree is
