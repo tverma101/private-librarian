@@ -2,8 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "fix/**"
+      - "feat/**"
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: private-librarian-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -51,6 +59,7 @@ jobs:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
       - name: Test (mandatory security suite)
+        shell: bash
         run: swift test 2>&1 | tee test.log; exit ${PIPESTATUS[0]}
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
@@ -68,26 +77,45 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
-      - name: Local specialist runtime and memory contract
+      - name: Local specialist runtime, auth, and memory contract
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile scripts/specialist.py scripts/provision_specialist_models.py
+          bash -n scripts/setup_models.sh
+          python3 -m py_compile scripts/specialist.py scripts/provision_specialist_models.py scripts/provision_image_models.py
           python3 scripts/test_specialist_contract.py
           python3 scripts/specialist.py --syntax-check | tee specialist-contract.json
           grep -q '11.50-GB-ceiling; warm-encoders-only; transient-exclusive; MPS-fp16' specialist-contract.json
           grep -F 'kwargs["torch_dtype"] = torch.float16' scripts/specialist.py
           python3 scripts/provision_specialist_models.py --list >/dev/null
 
+          # Gated-model auth must be possible without putting a token in argv,
+          # source, UserDefaults, or a generated manifest.
+          grep -F -- '--hf-token-stdin' scripts/setup_models.sh >/dev/null
+          grep -F 'HF_TOKEN="$HF_TOKEN_VALUE" "$PYTHON"' scripts/setup_models.sh >/dev/null
+          if git grep -nE 'hf_[A-Za-z0-9]{20,}' -- . ':(exclude)ThirdParty/**'; then
+            echo "A Hugging Face token-like secret is tracked in source" >&2
+            exit 1
+          fi
+
+          # Production inference stays offline even though the app now has a
+          # network-client entitlement for explicit model provisioning.
+          grep -F 'local_files_only=True' scripts/specialist.py >/dev/null
+          grep -F 'local_files_only=True' scripts/embed.py >/dev/null
+          grep -F 'HF_HUB_OFFLINE' Sources/LibrarianCore/LocalModels/SpecialistModelBridge.swift >/dev/null
+
+          # Keep the current fp16 specialist set inside the target-Mac ceiling.
+          # These candidates require a separate quantized runtime before they
+          # may be exposed by production routing.
           for model in ling-3.0-tiny internvl3.5-4b mimo-vl-7b-rl-2508; do
             if grep -R --line-number --fixed-strings "$model" \
-              Sources/LibrarianCore/LocalModelRouter.swift \
-              Sources/LibrarianCore/SpecialistModelBridge.swift \
-              Sources/LibrarianApp/SimpleSettingsView.swift \
+              Sources/LibrarianCore/LocalModels/LocalModelRouter.swift \
+              Sources/LibrarianCore/LocalModels/SpecialistModelBridge.swift \
+              Sources/LibrarianApp/App/SimpleSettingsView.swift \
               scripts/provision_specialist_models.py \
               scripts/specialist.py \
               scripts/package_app.sh; then
-              echo "Model above the target Mac ceiling is exposed by production code: $model" >&2
+              echo "Model above the current fp16 target-Mac ceiling is exposed by production code: $model" >&2
               exit 1
             fi
           done
@@ -138,7 +166,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Package sandboxed app and audit entitlements
+        shell: bash
         run: |
+          set -euo pipefail
           DEVELOPER_DIR=/Applications/Xcode_16.app/Contents/Developer swift build -c release
           scripts/e2e_local.sh .build/release/librarian-cli
           scripts/package_app.sh --xcode --no-dmg
@@ -146,5 +176,10 @@ jobs:
           test ! -e .build/package-stage/PrivateLibrarian.app/Contents/MacOS/librarian-cli
           test ! -e dist/PrivateLibrarian.app
           python3 scripts/audit_entitlements.py .build/package-stage/PrivateLibrarian.app --expect-hardened
-          sandbox-exec -f <(printf '(version 1)\n(allow default)\n(deny network*)\n') \
-            python3 scripts/network_negative_probe.py
+
+          # This app intentionally has outbound client networking for the
+          # explicit Settings > Install Models action. The entitlement audit
+          # proves server/listener capability remains absent; offline model
+          # worker behavior is asserted in the test job above.
+          ! codesign -d --entitlements :- .build/package-stage/PrivateLibrarian.app 2>&1 \
+            | grep -q '<key>com.apple.security.network.server</key>[[:space:]]*<true/>'

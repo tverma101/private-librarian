@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Entitlement auditor (plan §38). Inspects a signed .app (or any Mach-O binary)
-and FAILS if forbidden entitlements are present, or — for the app target —
-if required ones are missing.
+Entitlement auditor. Inspects a signed .app (or Mach-O binary) and fails when
+production permissions drift from Private Librarian's explicit security model.
+
+The app deliberately has outbound client networking so the user can provision
+models from Settings. It never has inbound/server networking. Source folders
+use user-selected read/write scope because Apply/Undo can move files only after
+confirmation; analysis itself remains read-only by implementation.
 
 Usage: audit_entitlements.py <path-to-app-or-binary> [--expect-hardened]
 Exit 0 = pass, 1 = fail.
@@ -12,8 +16,6 @@ import subprocess
 import sys
 
 FORBIDDEN = [
-    "com.apple.security.files.user-selected.read-write",
-    "com.apple.security.network.client",
     "com.apple.security.network.server",
     "com.apple.security.automation.apple-events",
     "com.apple.security.privileged-file-operations",
@@ -25,7 +27,9 @@ FORBIDDEN = [
 
 REQUIRED_APP = [
     "com.apple.security.app-sandbox",
-    "com.apple.security.files.user-selected.read-only",
+    "com.apple.security.files.user-selected.read-write",
+    "com.apple.security.files.bookmarks.app-scope",
+    "com.apple.security.network.client",
 ]
 
 
@@ -36,7 +40,14 @@ def entitlements(path):
     return out.stdout or ""
 
 
+def has_true(ents, key):
+    return re.search(rf"<key>{re.escape(key)}</key>\s*<true/>", ents) is not None
+
+
 def main():
+    if len(sys.argv) < 2:
+        print("usage: audit_entitlements.py <app-or-binary> [--expect-hardened]", file=sys.stderr)
+        return 2
     path = sys.argv[1]
     expect_hardened = "--expect-hardened" in sys.argv
     ents = entitlements(path)
@@ -46,33 +57,37 @@ def main():
         return 1
 
     failures = []
-    for f in FORBIDDEN:
-        # Match the key with a true value (not <false/>).
-        pat = re.compile(rf"<key>{re.escape(f)}</key>\s*<true/>")
-        if pat.search(ents):
-            failures.append(f"FORBIDDEN entitlement present: {f}")
+    for key in FORBIDDEN:
+        if has_true(ents, key):
+            failures.append(f"FORBIDDEN entitlement present: {key}")
 
     is_app = path.endswith(".app") or "/LibrarianApp" in path
     if is_app:
-        for r in REQUIRED_APP:
-            pat = re.compile(rf"<key>{re.escape(r)}</key>\s*<true/>")
-            if not pat.search(ents):
-                failures.append(f"REQUIRED entitlement missing: {r}")
+        for key in REQUIRED_APP:
+            if not has_true(ents, key):
+                failures.append(f"REQUIRED entitlement missing: {key}")
+
+        # Do not accidentally regress to the old read-only sandbox profile:
+        # the app advertises Apply/Undo and needs write authority inside only
+        # those roots the user explicitly selected.
+        if has_true(ents, "com.apple.security.files.user-selected.read-only"):
+            failures.append("legacy user-selected.read-only entitlement is still present")
 
     if expect_hardened and "com.apple.security.cs.disable-library-validation" in ents:
         failures.append("library validation disabled")
 
     if failures:
         print("ENTITLEMENT AUDIT FAIL")
-        for f in failures:
-            print("  -", f)
+        for failure in failures:
+            print("  -", failure)
         return 1
 
     print("ENTITLEMENT AUDIT PASS")
-    print("  sandbox:        ", "yes" if "app-sandbox</key>" in ents else "n/a (non-app binary)")
-    print("  read-write access:", "ABSENT (good)" if "user-selected.read-write" not in ents else "PRESENT (bad)")
-    print("  network client: ", "ABSENT (good)" if "network.client" not in ents else "PRESENT (bad)")
-    print("  network server: ", "ABSENT (good)" if "network.server" not in ents else "PRESENT (bad)")
+    print("  sandbox:           ", "yes" if has_true(ents, "com.apple.security.app-sandbox") else "n/a")
+    print("  selected read/write:", "yes" if has_true(ents, "com.apple.security.files.user-selected.read-write") else "n/a")
+    print("  app bookmarks:      ", "yes" if has_true(ents, "com.apple.security.files.bookmarks.app-scope") else "n/a")
+    print("  network client:     ", "yes (explicit model setup)" if has_true(ents, "com.apple.security.network.client") else "n/a")
+    print("  network server:     ", "absent")
     return 0
 
 

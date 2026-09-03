@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Install the optional local embedding runtime and its two wired checkpoints.
-# This script is the supported setup entrypoint; the app itself never performs
-# network access or package/model installation.
+# Install the optional local embedding/specialist runtime and pinned models.
+# This is the supported provisioning entrypoint. It may be launched explicitly
+# by the app or from Terminal; normal indexing/inference never calls it.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE_PYTHON="${LIBRARIAN_BOOTSTRAP_PYTHON:-}"
@@ -20,6 +20,8 @@ INSTALL_SPECIALIST_RUNTIME=0
 DOWNLOAD_SPECIALISTS=0
 LEGACY_SELECTION_EXPLICIT=0
 RUNTIME_ONLY=0
+HF_TOKEN_STDIN=0
+HF_TOKEN_VALUE=""
 
 usage() {
     cat <<EOF
@@ -46,6 +48,7 @@ Options:
                       install specialist dependencies without downloading checkpoints
   --specialist-models-only
                       provision specialists using an existing Python runtime
+  --hf-token-stdin   read one Hugging Face token line from stdin for this run only
   --force            redownload ready models and preserve their old directories
   -h, --help         show this help
 
@@ -55,6 +58,12 @@ Environment:
   LIBRARIAN_MODELS_DIR        default model root override
   LIBRARIAN_SPECIALIST_MODELS_DIR specialist model root override
   LIBRARIAN_MODEL_RUNTIME_DIR default runtime directory override
+  HF_TOKEN                    optional Hugging Face token for Terminal/CI usage
+
+Security:
+  --hf-token-stdin keeps the token out of argv and shell history. The value is
+  scoped to the actual Hugging Face provisioning subprocesses and is never
+  written to model provenance or setup logs.
 EOF
 }
 
@@ -131,6 +140,10 @@ while (($#)); do
             INSTALL_RUNTIME=0
             shift
             ;;
+        --hf-token-stdin)
+            HF_TOKEN_STDIN=1
+            shift
+            ;;
         --force)
             FORCE=1
             shift
@@ -146,6 +159,15 @@ while (($#)); do
             ;;
     esac
 done
+
+if [ "$HF_TOKEN_STDIN" -eq 1 ]; then
+    IFS= read -r HF_TOKEN_VALUE || true
+    HF_TOKEN_VALUE="${HF_TOKEN_VALUE//$'\r'/}"
+    if [ -z "$HF_TOKEN_VALUE" ]; then
+        echo "--hf-token-stdin was requested but stdin did not contain a token" >&2
+        exit 2
+    fi
+fi
 
 if [ "$RUNTIME_ONLY" -eq 1 ]; then
     DOWNLOAD_MODELS=0
@@ -207,13 +229,21 @@ else
     [ -x "$PYTHON" ] || { echo "Model Python is not executable: $PYTHON" >&2; exit 1; }
 fi
 
+run_provisioner() {
+    if [ -n "$HF_TOKEN_VALUE" ]; then
+        HF_TOKEN="$HF_TOKEN_VALUE" "$PYTHON" "$@"
+    else
+        "$PYTHON" "$@"
+    fi
+}
+
 if [ "$DOWNLOAD_MODELS" -eq 1 ]; then
     mkdir -p "$MODELS_DIR"
     args=("$ROOT_DIR/scripts/provision_image_models.py" "${MODEL_ARGS[@]}" --models-dir "$MODELS_DIR")
     if [ "$FORCE" -eq 1 ]; then
         args+=(--force)
     fi
-    LIBRARIAN_MODELS_DIR="$MODELS_DIR" "$PYTHON" "${args[@]}"
+    LIBRARIAN_MODELS_DIR="$MODELS_DIR" run_provisioner "${args[@]}"
 fi
 
 if [ "$DOWNLOAD_SPECIALISTS" -eq 1 ]; then
@@ -222,8 +252,12 @@ if [ "$DOWNLOAD_SPECIALISTS" -eq 1 ]; then
     if [ "$FORCE" -eq 1 ]; then
         specialist_args+=(--force)
     fi
-    LIBRARIAN_SPECIALIST_MODELS_DIR="$SPECIALIST_MODELS_DIR" "$PYTHON" "${specialist_args[@]}"
+    LIBRARIAN_SPECIALIST_MODELS_DIR="$SPECIALIST_MODELS_DIR" run_provisioner "${specialist_args[@]}"
 fi
+
+# Do not retain a stdin-supplied credential any longer than this process needs.
+HF_TOKEN_VALUE=""
+unset HF_TOKEN_VALUE
 
 echo "Model runtime: $PYTHON"
 echo "Model root: $MODELS_DIR"

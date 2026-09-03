@@ -1,15 +1,22 @@
 import SwiftUI
 import AppKit
 import LibrarianCore
+import LibrarianAppSupport
 
-/// Product settings intentionally expose outcomes instead of implementation
-/// plumbing. Model downloads remain an explicit Terminal setup step because
-/// the packaged app's runtime network entitlement is deliberately disabled.
+/// Product settings expose outcomes rather than model/runtime plumbing. Model
+/// downloads are explicit user actions; normal indexing and inference remain
+/// local-files-only after provisioning.
 struct SimpleSettingsView: View {
     @EnvironmentObject private var model: LibrarianModel
     @State private var showAllModels = false
     @State private var copiedCommand = false
-    @State private var terminalLaunchFailed = false
+    @State private var huggingFaceToken = ""
+    @State private var hasHuggingFaceToken = false
+    @State private var huggingFaceStatus = "Checking Keychain…"
+    @State private var isInstallingModels = false
+    @State private var setupStatus = ""
+    @State private var setupOutput = ""
+    @State private var showSetupOutput = false
 
     var body: some View {
         Form {
@@ -28,8 +35,7 @@ struct SimpleSettingsView: View {
                 Toggle("Use downloaded local models", isOn: $model.localEmbeddingsEnabled)
 
                 if model.isTier2Provisioned, !model.localEmbeddingsEnabled {
-                    Label("Models are installed — turn this on to use them.",
-                          systemImage: "lightbulb")
+                    Label("Models are installed — turn this on to use them.", systemImage: "lightbulb")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -44,6 +50,39 @@ struct SimpleSettingsView: View {
                 }
             }
 
+            Section("Hugging Face access") {
+                HStack(spacing: 8) {
+                    Image(systemName: hasHuggingFaceToken ? "key.fill" : "key")
+                        .foregroundStyle(hasHuggingFaceToken ? .green : .secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(hasHuggingFaceToken ? "Access token saved" : "Access token not saved")
+                            .font(.subheadline.weight(.medium))
+                        Text(huggingFaceStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Link("Create / manage token", destination: URL(string: "https://huggingface.co/settings/tokens")!)
+                        .font(.caption)
+                }
+
+                SecureField("Paste Hugging Face token", text: $huggingFaceToken)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack {
+                    Button("Save in Keychain") { saveHuggingFaceToken() }
+                        .disabled(huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Remove Token") { removeHuggingFaceToken() }
+                        .disabled(!hasHuggingFaceToken)
+                    Spacer()
+                    Link("Request DINOv3 access", destination: officialURL(LocalModelStack.dinov3))
+                }
+
+                Text("The token is stored in macOS Keychain and is supplied only to an explicit model-install process. It is never written to UserDefaults, model manifests, setup commands, or logs. Gated models still require accepting their license/access terms on Hugging Face.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Model setup") {
                 HStack(spacing: 8) {
                     Circle()
@@ -53,40 +92,78 @@ struct SimpleSettingsView: View {
                         .font(.subheadline)
                     Spacer()
                     Button("Refresh") { model.refreshModelStatus() }
+                        .disabled(isInstallingModels)
                 }
 
                 if model.localModelProfile == .fast {
-                    Text("Fast works without a download. Installing the two embedding models is optional and improves semantic image search while still avoiding generative models.")
+                    Text("Fast works without a download. Installing the embedding stack is optional and adds semantic image search and visual clustering without a generative model.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("The selected stack is downloaded only when you explicitly run the setup command. Inference remains offline afterward.")
+                    Text("Install downloads the selected pinned checkpoints into Private Librarian's app container. After setup, inference uses local files only.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 HStack {
                     Button {
-                        copySetupCommand(openTerminal: true)
+                        installSelectedModels()
                     } label: {
-                        Label(copiedCommand ? "Command Copied" : "Open Terminal + Copy", systemImage: "terminal")
+                        if isInstallingModels {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Installing…")
+                        } else {
+                            Label("Install Selected Models", systemImage: "arrow.down.circle")
+                        }
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(isInstallingModels || !hasHuggingFaceToken)
 
-                    Button("Copy Command") {
-                        copySetupCommand(openTerminal: false)
+                    Button {
+                        copySetupCommand(openTerminal: true)
+                    } label: {
+                        Label(copiedCommand ? "Command Copied" : "Terminal Fallback", systemImage: "terminal")
                     }
+                    .disabled(isInstallingModels)
 
-                    Button("Open Models Folder") {
-                        openModelsFolder()
+                    Button("Open Models Folder") { openModelsFolder() }
+                }
+
+                if !hasHuggingFaceToken {
+                    Label("Save a Hugging Face token above before installing this stack; DINOv3 is gated.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+
+                if !setupStatus.isEmpty {
+                    Text(setupStatus)
+                        .font(.caption)
+                        .foregroundStyle(setupStatusColor)
+                        .textSelection(.enabled)
+                }
+
+                if !setupOutput.isEmpty {
+                    DisclosureGroup("Setup log", isExpanded: $showSetupOutput) {
+                        ScrollView {
+                            Text(setupOutput)
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 180)
                     }
                 }
 
-                Text(setupCommand)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .lineLimit(3)
+                DisclosureGroup("Terminal command") {
+                    Text(setupCommand)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Text("The Terminal fallback can use an existing `hf auth login`. The in-app installer does not require CLI login because it uses the Keychain token above.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Selected models") {
@@ -107,14 +184,14 @@ struct SimpleSettingsView: View {
                 }
             }
 
-            Section("Folders") {
+            Section("Folders and Finder access") {
                 if model.sources.isEmpty {
                     Text("No source folders yet.")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(model.sources) { source in
                         HStack {
-                            Image(systemName: model.needsReauthorization(source) ? "exclamationmark.triangle" : "folder")
+                            Image(systemName: model.needsReauthorization(source) ? "exclamationmark.triangle" : "folder.badge.checkmark")
                                 .foregroundStyle(model.needsReauthorization(source) ? .orange : .secondary)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text((source.path as NSString).lastPathComponent)
@@ -122,6 +199,11 @@ struct SimpleSettingsView: View {
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
+                                Text(model.needsReauthorization(source)
+                                     ? "Permission needs refresh"
+                                     : "Read for analysis · write only after Apply confirmation")
+                                    .font(.caption2)
+                                    .foregroundStyle(model.needsReauthorization(source) ? .orange : .secondary)
                             }
                             Spacer()
                             if model.isPaused(source) {
@@ -129,6 +211,8 @@ struct SimpleSettingsView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
+                            Button("Re-authorize…") { model.reauthorizeSource(source) }
+                                .buttonStyle(.borderless)
                         }
                     }
                 }
@@ -137,6 +221,10 @@ struct SimpleSettingsView: View {
                     Button("Add Folder…") { model.addSourceFolder() }
                     Button("Add Exclusion…") { model.addExclusionFolder() }
                 }
+
+                Text("Private Librarian uses macOS security-scoped, user-selected read/write folder permission. Analysis itself still opens source files read-only. Re-authorize a folder once after upgrading from an older read-only build or whenever Apply reports that access was lost.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 if !model.excludedPaths.isEmpty {
                     DisclosureGroup("Excluded folders") {
@@ -155,18 +243,23 @@ struct SimpleSettingsView: View {
             }
 
             Section("Privacy") {
-                Label("Runtime networking is disabled", systemImage: "network.slash")
-                Label("Source folders are opened read-only", systemImage: "lock.open")
-                Label("Models receive broker-owned bytes/text, never source write access", systemImage: "checkmark.shield")
+                Label("Indexing and inference use local files only", systemImage: "lock.shield")
+                Label("Outbound network access is used only by explicit model setup", systemImage: "arrow.down.circle")
+                Label("Analysis opens source files read-only", systemImage: "doc.text.magnifyingglass")
+                Label("Finder writes happen only after an Apply confirmation", systemImage: "folder.badge.gearshape")
+                Label("Models receive broker-owned bytes/text, never source paths or write authority", systemImage: "checkmark.shield")
 
-                Text("Official model-page links below open in your browser. The app itself does not download models or send indexed content to those sites.")
+                Text("Official model-page links open in your browser. Downloaded checkpoints are verified and normal model workers force local-files-only/offline loading.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .frame(width: 650, height: 690)
+        .frame(width: 690, height: 760)
         .padding(4)
+        .onAppear {
+            refreshHuggingFaceTokenState()
+        }
     }
 
     private var profileDescription: String {
@@ -174,9 +267,9 @@ struct SimpleSettingsView: View {
         case .fast:
             return "Fastest. Deterministic rules + Apple Vision, with local encoders when installed. No generative model is used."
         case .balanced:
-            return "Recommended. SigLIP2 + DINOv3 for most images; PaddleOCR and MiniCPM wake only when needed, then unload."
+            return "Recommended. SigLIP2 + DINOv3 for most images; specialist OCR and MiniCPM wake only when needed, then unload."
         case .quality:
-            return "For hard libraries. Adds LFM2.5-VL 3B as the largest fallback. Every offered model is bounded for an 11.50 GB Mac ceiling and unloads between stages."
+            return "For hard libraries. Uses the same cheap-first path and adds the bounded LFM2.5-VL 3B fallback for unresolved images. Specialists unload between stages."
         }
     }
 
@@ -235,36 +328,7 @@ struct SimpleSettingsView: View {
     }
 
     private var setupCommand: String {
-        let scriptPath: String = {
-            if let override = ProcessInfo.processInfo.environment["LIBRARIAN_SCRIPTS_DIR"] {
-                let candidate = URL(fileURLWithPath: override).appendingPathComponent("setup_models.sh")
-                if FileManager.default.isExecutableFile(atPath: candidate.path) { return candidate.path }
-            }
-            if let resourceURL = Bundle.main.resourceURL {
-                let bundled = resourceURL.appendingPathComponent("scripts/setup_models.sh")
-                if FileManager.default.isExecutableFile(atPath: bundled.path) {
-                    return bundled.path
-                }
-            }
-            // Dev builds (SPM) do not bundle the script: walk up from the
-            // executable to the repo root so the copied command is absolute
-            // and works even though Terminal opens in the home directory.
-            var url = URL(fileURLWithPath: CommandLine.arguments.first ?? "")
-            for _ in 0..<8 {
-                let parent = url.deletingLastPathComponent()
-                if url.path == parent.path { break }
-                url = parent
-                if FileManager.default.fileExists(atPath: url.appendingPathComponent("Package.swift").path) {
-                    let script = url.appendingPathComponent("scripts/setup_models.sh")
-                    if FileManager.default.isExecutableFile(atPath: script.path) {
-                        return script.path
-                    }
-                    break
-                }
-            }
-            return "./scripts/setup_models.sh"
-        }()
-
+        let scriptPath = AppModelSetup.setupScriptURL()?.path ?? "./scripts/setup_models.sh"
         let profile: String
         switch model.localModelProfile {
         case .fast: profile = "embeddings"
@@ -288,16 +352,89 @@ struct SimpleSettingsView: View {
         }
     }
 
+    @MainActor
+    private func installSelectedModels() {
+        guard !isInstallingModels else { return }
+        let token: String
+        do {
+            guard let stored = try HuggingFaceTokenStore.load(), !stored.isEmpty else {
+                hasHuggingFaceToken = false
+                huggingFaceStatus = "Save a token before installing gated models."
+                return
+            }
+            token = stored
+        } catch {
+            huggingFaceStatus = error.localizedDescription
+            return
+        }
+
+        isInstallingModels = true
+        setupStatus = "Preparing the isolated local-model runtime and downloading the selected pinned checkpoints…"
+        setupOutput = ""
+        showSetupOutput = false
+        let profile = model.localModelProfile
+
+        Task {
+            let result = await AppModelSetup.run(profile: profile, token: token)
+            isInstallingModels = false
+            setupStatus = result.message
+            setupOutput = result.output
+            showSetupOutput = !result.succeeded
+            if result.succeeded {
+                model.refreshModelStatus()
+                model.localEmbeddingsEnabled = true
+            }
+        }
+    }
+
+    private var setupStatusColor: Color {
+        if isInstallingModels { return .secondary }
+        if setupStatus.localizedCaseInsensitiveContains("installed and verified") { return .green }
+        return .orange
+    }
+
+    private func refreshHuggingFaceTokenState() {
+        do {
+            hasHuggingFaceToken = try HuggingFaceTokenStore.load() != nil
+            huggingFaceStatus = hasHuggingFaceToken
+                ? "Stored securely in macOS Keychain."
+                : "Needed for DINOv3 and other gated Hub repositories."
+        } catch {
+            hasHuggingFaceToken = false
+            huggingFaceStatus = error.localizedDescription
+        }
+    }
+
+    private func saveHuggingFaceToken() {
+        do {
+            try HuggingFaceTokenStore.save(huggingFaceToken)
+            huggingFaceToken = ""
+            hasHuggingFaceToken = true
+            huggingFaceStatus = "Stored securely in macOS Keychain."
+        } catch {
+            huggingFaceStatus = error.localizedDescription
+        }
+    }
+
+    private func removeHuggingFaceToken() {
+        do {
+            try HuggingFaceTokenStore.remove()
+            huggingFaceToken = ""
+            hasHuggingFaceToken = false
+            huggingFaceStatus = "Token removed from macOS Keychain."
+        } catch {
+            huggingFaceStatus = error.localizedDescription
+        }
+    }
+
     private func openModelsFolder() {
-        // Open the exact directory scripts/setup_models.sh populates by
-        // default (its APP_SUPPORT_DIR default is the app container path).
-        // Opening a different Models folder made installed models look lost.
         let env = ProcessInfo.processInfo.environment
         let folder: URL
         if let override = env["LIBRARIAN_MODELS_DIR"], !override.isEmpty {
             folder = URL(fileURLWithPath: override)
         } else if let appSupport = env["LIBRARIAN_APP_SUPPORT_DIR"], !appSupport.isEmpty {
-            folder = URL(fileURLWithPath: appSupport, isDirectory: true).appendingPathComponent("Models", isDirectory: true)
+            folder = URL(fileURLWithPath: appSupport, isDirectory: true)
+                .appendingPathComponent("Models", isDirectory: true)
         } else {
             let home = env["HOME"] ?? NSHomeDirectory()
             folder = URL(fileURLWithPath: home, isDirectory: true)
@@ -341,8 +478,12 @@ struct SimpleSettingsView: View {
         }
         #endif
         if provisioned { return "Checkpoint ready · runtime checked above" }
-        if descriptor.gated { return "Not installed · accepted gated access is required" }
-        return "Not installed · run the setup command above"
+        if descriptor.gated {
+            return hasHuggingFaceToken
+                ? "Not installed · token ready; gated access must also be approved"
+                : "Not installed · Hugging Face token + approved gated access required"
+        }
+        return "Not installed · use Install Selected Models above"
     }
 
     private func modelStatusColor(_ descriptor: LocalModelDescriptor, provisioned: Bool) -> Color {
