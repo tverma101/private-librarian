@@ -23,12 +23,23 @@ RUNTIME_ONLY=0
 HF_TOKEN_STDIN=0
 HF_TOKEN_VALUE=""
 
+# Clean Macs should not need Homebrew, Xcode, or a global Python install just to
+# use a desktop app. When no suitable Python is already available we install a
+# pinned python-build-standalone runtime directly into the app's private
+# Application Support tree. The archive is checksum-verified before extraction.
+BOOTSTRAP_PYTHON_VERSION="3.11.16"
+BOOTSTRAP_PYTHON_RELEASE="20260825"
+BOOTSTRAP_PYTHON_ARCHIVE="cpython-${BOOTSTRAP_PYTHON_VERSION}+${BOOTSTRAP_PYTHON_RELEASE}-aarch64-apple-darwin-install_only.tar.gz"
+BOOTSTRAP_PYTHON_SHA256="2e50ed6ec49d8714a83c093e9ce74e1b8b21a2c64a49c3b603471d9c4caac76b"
+BOOTSTRAP_PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${BOOTSTRAP_PYTHON_RELEASE}/cpython-${BOOTSTRAP_PYTHON_VERSION}%2B${BOOTSTRAP_PYTHON_RELEASE}-aarch64-apple-darwin-install_only.tar.gz"
+
 usage() {
     cat <<EOF
 Usage: $0 [options]
 
 Installs the optional offline Python runtime and downloads the pinned models
 used by Private Librarian. Apple Vision remains the zero-download baseline.
+A clean Apple-silicon Mac can bootstrap the pinned runtime automatically.
 
 Options:
   --model NAME       install one wired model
@@ -53,7 +64,7 @@ Options:
   -h, --help         show this help
 
 Environment:
-  LIBRARIAN_BOOTSTRAP_PYTHON  Python 3.11+ used to create the runtime
+  LIBRARIAN_BOOTSTRAP_PYTHON  optional existing Python 3.10+ used to create the runtime
   LIBRARIAN_APP_SUPPORT_DIR   app support root override
   LIBRARIAN_MODELS_DIR        default model root override
   LIBRARIAN_SPECIALIST_MODELS_DIR specialist model root override
@@ -64,6 +75,8 @@ Security:
   --hf-token-stdin keeps the token out of argv, shell history, generated files,
   and child-process environment variables. The specialist provisioner reads it
   from stdin and supplies it to huggingface_hub from process memory only.
+  Automatic Python bootstrap uses one pinned GitHub release URL and verifies
+  its SHA-256 before any extracted executable is used.
 EOF
 }
 
@@ -185,48 +198,141 @@ if [ "$INSTALL_SPECIALIST_RUNTIME" -eq 1 ] && [ "$INSTALL_RUNTIME" -eq 0 ] && [ 
     exit 2
 fi
 
-if [ -z "$BASE_PYTHON" ]; then
-    for candidate in /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
-        if [ -x "$candidate" ]; then
-            BASE_PYTHON="$candidate"
-            break
-        fi
+python_is_usable() {
+    local candidate="$1"
+    [ -x "$candidate" ] || return 1
+    "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
+}
+
+bootstrap_standalone_python() {
+    if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
+        echo "Automatic local-AI runtime setup currently supports Apple-silicon macOS." >&2
+        echo "Set LIBRARIAN_BOOTSTRAP_PYTHON to an existing Python 3.10+ on this Mac." >&2
+        return 1
+    fi
+
+    for tool in /usr/bin/curl /usr/bin/shasum /usr/bin/tar; do
+        [ -x "$tool" ] || { echo "Required macOS tool is missing: $tool" >&2; return 1; }
     done
+
+    local parent temp_dir archive actual_sha extracted_python
+    parent="$(dirname "$RUNTIME_DIR")"
+    mkdir -p "$parent"
+    temp_dir="$(mktemp -d "$parent/.private-librarian-python.XXXXXX")"
+    archive="$temp_dir/$BOOTSTRAP_PYTHON_ARCHIVE"
+
+    cleanup_python_bootstrap() {
+        rm -rf "$temp_dir"
+    }
+    trap cleanup_python_bootstrap RETURN
+
+    echo "Preparing Private Librarian's local AI runtime…"
+    /usr/bin/curl \
+        --fail \
+        --location \
+        --proto '=https' \
+        --tlsv1.2 \
+        --retry 3 \
+        --retry-delay 1 \
+        --output "$archive" \
+        "$BOOTSTRAP_PYTHON_URL"
+
+    actual_sha="$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')"
+    if [ "$actual_sha" != "$BOOTSTRAP_PYTHON_SHA256" ]; then
+        echo "Pinned Python runtime checksum mismatch; refusing to execute it." >&2
+        echo "Expected: $BOOTSTRAP_PYTHON_SHA256" >&2
+        echo "Actual:   $actual_sha" >&2
+        return 1
+    fi
+
+    /usr/bin/tar -xzf "$archive" -C "$temp_dir"
+    extracted_python="$temp_dir/python/bin/python3"
+    python_is_usable "$extracted_python" || {
+        echo "Verified Python archive did not contain a usable python/bin/python3." >&2
+        return 1
+    }
+
+    if [ -e "$RUNTIME_DIR" ]; then
+        echo "Runtime directory appeared during setup and was left untouched: $RUNTIME_DIR" >&2
+        return 1
+    fi
+    mv "$temp_dir/python" "$RUNTIME_DIR"
+    echo "Installed pinned Python $BOOTSTRAP_PYTHON_VERSION runtime for Private Librarian."
+    trap - RETURN
+    rm -rf "$temp_dir"
+}
+
+PYTHON=""
+
+# Reuse a previously prepared app-private runtime before looking for any global
+# dependency. This makes second launch and offline inference independent of the
+# user's shell environment.
+if python_is_usable "$RUNTIME_DIR/bin/python3"; then
+    PYTHON="$RUNTIME_DIR/bin/python3"
 fi
 
-if [ -z "$BASE_PYTHON" ] || [ ! -x "$BASE_PYTHON" ]; then
-    echo "No usable Python 3 was found. Set LIBRARIAN_BOOTSTRAP_PYTHON." >&2
-    exit 1
-fi
-
-PY_VERSION="$($BASE_PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-echo "Using bootstrap Python $PY_VERSION: $BASE_PYTHON"
-
-if [ "$INSTALL_RUNTIME" -eq 1 ]; then
-    if [ -e "$RUNTIME_DIR" ] && [ ! -x "$RUNTIME_DIR/bin/python3" ]; then
-        echo "Runtime directory exists but is incomplete: $RUNTIME_DIR" >&2
-        echo "Choose another --runtime-dir or repair it manually; it was not removed." >&2
+if [ -z "$PYTHON" ] && [ "$INSTALL_RUNTIME" -eq 1 ]; then
+    if [ -n "$BASE_PYTHON" ] && ! python_is_usable "$BASE_PYTHON"; then
+        echo "LIBRARIAN_BOOTSTRAP_PYTHON is not a usable Python 3.10+: $BASE_PYTHON" >&2
         exit 1
     fi
-    if [ ! -x "$RUNTIME_DIR/bin/python3" ]; then
+
+    if [ -z "$BASE_PYTHON" ]; then
+        for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+            if python_is_usable "$candidate"; then
+                BASE_PYTHON="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ -e "$RUNTIME_DIR" ] && [ ! -x "$RUNTIME_DIR/bin/python3" ]; then
+        echo "Runtime directory exists but is incomplete: $RUNTIME_DIR" >&2
+        echo "Private Librarian left it untouched instead of deleting unknown files." >&2
+        exit 1
+    fi
+
+    if [ -n "$BASE_PYTHON" ]; then
         mkdir -p "$(dirname "$RUNTIME_DIR")"
+        echo "Preparing Private Librarian's local AI runtime from Python: $BASE_PYTHON"
         "$BASE_PYTHON" -m venv "$RUNTIME_DIR"
+    else
+        bootstrap_standalone_python
     fi
     PYTHON="$RUNTIME_DIR/bin/python3"
+fi
+
+if [ -z "$PYTHON" ]; then
+    if [ -n "${LIBRARIAN_MODEL_PYTHON:-}" ] && python_is_usable "$LIBRARIAN_MODEL_PYTHON"; then
+        PYTHON="$LIBRARIAN_MODEL_PYTHON"
+    elif python_is_usable "$RUNTIME_DIR/bin/python3"; then
+        PYTHON="$RUNTIME_DIR/bin/python3"
+    elif [ -n "$BASE_PYTHON" ] && python_is_usable "$BASE_PYTHON"; then
+        PYTHON="$BASE_PYTHON"
+    else
+        for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+            if python_is_usable "$candidate"; then
+                PYTHON="$candidate"
+                break
+            fi
+        done
+    fi
+fi
+
+[ -n "$PYTHON" ] && python_is_usable "$PYTHON" || {
+    echo "No usable model Python is available. Run setup without --skip-runtime first." >&2
+    exit 1
+}
+
+PY_VERSION="$($PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
+echo "Using model Python $PY_VERSION: $PYTHON"
+
+if [ "$INSTALL_RUNTIME" -eq 1 ]; then
     "$PYTHON" -m pip install --upgrade pip
     "$PYTHON" -m pip install --requirement "$ROOT_DIR/scripts/model-requirements.txt"
     if [ "$INSTALL_SPECIALIST_RUNTIME" -eq 1 ]; then
         "$PYTHON" -m pip install --requirement "$ROOT_DIR/scripts/specialist-requirements.txt"
     fi
-else
-    if [ -n "${LIBRARIAN_MODEL_PYTHON:-}" ]; then
-        PYTHON="$LIBRARIAN_MODEL_PYTHON"
-    elif [ -x "$RUNTIME_DIR/bin/python3" ]; then
-        PYTHON="$RUNTIME_DIR/bin/python3"
-    else
-        PYTHON="$BASE_PYTHON"
-    fi
-    [ -x "$PYTHON" ] || { echo "Model Python is not executable: $PYTHON" >&2; exit 1; }
 fi
 
 run_public_provisioner() {
