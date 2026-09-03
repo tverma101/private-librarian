@@ -107,6 +107,9 @@ public struct ModelSetupResult: Sendable, Equatable {
 /// passed to the helper over stdin; the helper scopes it to the provisioning
 /// subprocess rather than exporting it for the whole application session.
 public enum AppModelSetup {
+    public static let huggingFaceAccountURL = URL(string: "https://huggingface.co/settings/tokens")!
+    public static let dinov3AgreementURL = URL(string: "https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m")!
+
     public static func setupScriptURL() -> URL? {
         let fm = FileManager.default
         let env = ProcessInfo.processInfo.environment
@@ -124,8 +127,26 @@ public enum AppModelSetup {
             if fm.isExecutableFile(atPath: candidate.path) { return candidate }
         }
 
-        // SwiftPM development build: locate the repository without assuming
-        // Terminal's current working directory.
+        // SwiftPM/Xcode development builds do not guarantee that the test or
+        // app executable lives below the checkout. Resolve both the current
+        // working directory and this source file's repository root before
+        // falling back to executable-parent walking. Packaged builds still hit
+        // the Bundle.main Resources path above.
+        let sourceFile = URL(fileURLWithPath: #filePath)
+        let sourceRepositoryRoot = sourceFile
+            .deletingLastPathComponent() // Runtime
+            .deletingLastPathComponent() // LibrarianAppSupport
+            .deletingLastPathComponent() // Sources
+            .deletingLastPathComponent() // repository root
+        let developmentCandidates = [
+            URL(fileURLWithPath: fm.currentDirectoryPath, isDirectory: true)
+                .appendingPathComponent("scripts/setup_models.sh"),
+            sourceRepositoryRoot.appendingPathComponent("scripts/setup_models.sh"),
+        ]
+        if let candidate = developmentCandidates.first(where: { fm.isExecutableFile(atPath: $0.path) }) {
+            return candidate
+        }
+
         var cursor = URL(fileURLWithPath: CommandLine.arguments.first ?? "")
         for _ in 0..<8 {
             let parent = cursor.deletingLastPathComponent()
