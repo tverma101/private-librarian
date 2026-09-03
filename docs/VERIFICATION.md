@@ -4,31 +4,32 @@ This page describes how to verify the current repository and how to interpret de
 
 ## Source of truth
 
-For a current commit, a fresh GitHub Actions run and a fresh local run are the source of truth. Historical benchmark numbers below are comparison data, not release guarantees.
+For a current commit, a fresh GitHub Actions run plus any required host-only macOS/account smoke is the source of truth. Historical benchmark numbers are comparison data, not release guarantees.
 
 The normal CI workflow has three jobs:
 
-- `test` — public-repository hygiene, build, full Swift suite, Tier-2 provider contract, and vendored SQLCipher provenance;
+- `test` — repository hygiene, debug build, Swift 6 warnings-as-errors build, the full Swift suite, large-tree regressions, Tier-2/provider contracts, Hugging Face auth/runtime checks, and vendored SQLCipher provenance;
 - `quality` — deterministic Golden Library metric/schema checks;
-- `entitlement-audit` — release build, local E2E verification, packaged-app entitlement audit, and network-negative probe.
+- `entitlement-audit` — release build, local E2E verification, packaging, and signed packaged-app entitlement audit.
+
+CI runs on `main`, `fix/**`, `feat/**`, pull requests, and manual dispatches. Branch hardening therefore has to pass the same workflow instead of relying on old receipts from another branch.
 
 ## Reproduce the normal checks
 
 ```bash
 swift build
-swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+swift build -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -warnings-as-errors
 swift test
 ```
 
 For the release-style path:
 
 ```bash
-bash scripts/e2e_local.sh "$(swift build --show-bin-path)/librarian-cli"
-scripts/package_app.sh --xcode --install
-python3 scripts/audit_entitlements.py /Applications/PrivateLibrarian.app --expect-hardened
-python3 scripts/test_model_provisioning.py
-sandbox-exec -f <(printf '(version 1)\n(allow default)\n(deny network*)\n') \
-  python3 scripts/network_negative_probe.py
+swift build -c release
+bash scripts/e2e_local.sh .build/release/librarian-cli
+scripts/package_app.sh --xcode --no-dmg
+python3 scripts/audit_entitlements.py \
+  .build/package-stage/PrivateLibrarian.app --expect-hardened
 ```
 
 Quality/performance harnesses:
@@ -42,7 +43,8 @@ python3 scripts/benchmark_librarian.py --files 10000 --search-iters 5 --relation
 
 The suite includes coverage for:
 
-- source immutability;
+- read-only analysis-source behavior;
+- explicit Apply/Undo containment, journaling, and regression cases;
 - symlink refusal and path-swap/TOCTOU handling;
 - catalog encryption and wrong-key refusal;
 - malformed-file resilience;
@@ -58,228 +60,171 @@ The suite includes coverage for:
 - media decoding, transcript persistence/search, ASR provider invalidation, failure/retry/no-transcript semantics, and stale-transcript suppression;
 - provider/indexer/catalog/search integration;
 - organization graph and onboarding coverage;
-- bounded Smart Groups, raw-label suppression, lane diversity limits, and legacy taxonomy pruning.
-- scalable streaming discovery, deterministic large-directory traversal,
-  max-files early stop, SQL-backed missing reconciliation, inaccessible-root
-  backoff, cancellation/pause outcomes, project semantic summaries, bounded
-  semantic fanout, and top-K vector search.
+- bounded Smart Groups, raw-label suppression, lane diversity limits, and legacy taxonomy pruning;
+- scalable streaming discovery and deterministic large-directory traversal;
+- max-files early stop and SQL-backed missing reconciliation;
+- inaccessible-root backoff and reauthorization state;
+- cancellation/pause/remove/replacement outcomes;
+- project semantic summaries and bounded semantic fan-out;
+- SQL-side bounded views and batched top-K vector scoring;
+- model-setup Application Support path resolution and Keychain token validation.
 
-The real provisioned Whisper test is host-conditional. Hosted CI does not ship the user's local Whisper executable/model, so that test is expected to skip there while generated-fixture media tests still exercise the production indexing pipeline.
-
-## Concurrency checking
-
-The integration branch is also built with:
-
-```bash
-swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
-```
-
-This is the regression gate for the app-model callback problem previously tracked in #46. Background indexing remains off the main actor while progress/completion handoff is actor-aware.
+The real provisioned Whisper test is host-conditional. Hosted CI does not ship the user's local Whisper executable/model, so that integration cannot be promoted to a universal CI guarantee.
 
 ## Packaging and sandbox checks
 
-`scripts/package_app.sh` archives the `LibrarianApp` SwiftPM scheme with
-`xcodebuild`, stages the archive product under ignored `.build/` output with
-the app metadata and sandbox entitlements, signs the final bundle with the
-configured identity (automatically preferring a stable local Developer ID or
-Apple Development identity, with ad-hoc as the fallback), and emits a versioned
-`dist/PrivateLibrarian-VERSION.dmg`. The temporary app is removed after DMG
-verification (or after `--install`), leaving one persistent installed app. The archive is generic
-macOS and therefore produces a distributable universal executable on the
-current host. It includes SwiftPM resources, the offline helper, and no CLI
-executable. `--swiftpm` remains available for packaging an existing raw
-SwiftPM release build. `--include-models` and `--include-runtime` are explicit
-opt-ins for a same-host offline bundle; the normal DMG keeps large,
-user-specific model weights in Application Support.
-
-For the final signed bundle, the packager uses the stable certificate and
-bundle identifier but does not invent restricted application-identifier or
-Keychain-group entitlements without a matching provisioning profile. The
-app-owned catalog key therefore uses a dedicated stable traditional Keychain
-service. The GUI first queries that app-owned item. If a legacy
-login-keychain item from an old unsigned CLI is present, startup renders first
-and exposes **Migrate Existing Catalog**; only that explicit action can require
-one macOS approval. The same key is then copied into the new item and future
-launches do not query the legacy ACL. The CLI never accesses the GUI item and
-uses `LIBRARIAN_CATALOG_KEY` for headless catalog checks.
-
-The entitlement audit expects:
-
-- App Sandbox enabled;
-- user-selected read-only file access;
-- app-scoped bookmarks;
-- no source read-write entitlement;
-- no network client/server entitlement.
-
-The network-negative probe runs inside an additional deny-network sandbox and attempts outbound/local network operations. Those attempts must be denied.
+`scripts/package_app.sh` archives the `LibrarianApp` SwiftPM scheme with `xcodebuild`, stages the archive product under ignored `.build/` output with app metadata and entitlements, signs the final bundle with the configured identity, and optionally emits a versioned DMG.
 
 The CLI is a development/verification tool and must not be copied into the production app bundle.
 
-## SQLCipher provenance
+### Expected packaged entitlements
 
-SQLCipher is vendored under `ThirdParty/sqlcipher/` with license and provenance files. CI checks the expected vendored source/provenance so an accidental system SQLite fallback does not go unnoticed. Catalog tests also verify encrypted-on-disk behavior and wrong-key failure.
+The current product requires:
 
-## Optional providers
+- `com.apple.security.app-sandbox`;
+- `com.apple.security.files.user-selected.read-write`;
+- `com.apple.security.files.bookmarks.app-scope`;
+- `com.apple.security.network.client`.
 
-The default app does not require downloaded model artifacts.
+The product must **not** have:
 
-Embedding providers fail closed when expected artifacts, tokenizer data, dependencies, or provenance are incomplete rather than silently switching model spaces.
+- `com.apple.security.network.server`;
+- arbitrary/all-files write entitlements;
+- Apple Events automation privilege;
+- privileged filesystem operations;
+- temporary absolute read/write exceptions introduced as a shortcut.
 
-The Python CLIP helper keeps its pinned resize/center-crop/normalization path in
-`scripts/embed.py` using PIL/NumPy; it does not rely on an undeclared
-`torchvision` import. A readiness check is necessary, but the release smoke
-should also exercise one real image and one real text vector.
+Why read/write? Analysis itself remains read-only through `SourceBroker`, but the user can explicitly confirm **Apply to Finder** and later Undo inside a folder they selected. A read-only sandbox entitlement would make that advertised feature fail in the real packaged app.
 
-The supported Python setup is:
+Why network client? The user can explicitly press **Install Selected Models** in Settings. That provisioning action needs outbound access. Normal inference is separately constrained to local/offline loading, and the app has no inbound/listener entitlement.
 
-```bash
-./scripts/setup_models.sh
-python3 scripts/provision_image_models.py --list \
-  --models-dir "$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models"
-"$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/model-runtime/bin/python3" \
-  scripts/embed.py --check
+A blanket deny-network probe is therefore no longer an accurate packaged-app acceptance test. The relevant checks are:
+
+1. entitlement audit proves no server/listener permission;
+2. model-runtime CI proves production inference forces local/offline loading;
+3. source review keeps network-capable behavior isolated to explicit provisioning/system browser links.
+
+## Hugging Face provisioning verification
+
+The app supports gated Hugging Face repositories without requiring the user to paste a token into a Terminal command.
+
+The in-app credential contract is:
+
+```text
+macOS Keychain
+    ↓ explicit Install action
+Swift model setup
+    ↓ stdin
+setup_models.sh
+    ↓ stdin
+provision_specialist_models.py
+    ↓ in-memory token argument
+huggingface_hub
 ```
 
-The setup script downloads only the two models consumed by `scripts/embed.py`
-at immutable revisions. It uses a temporary sibling directory, verifies every
-downloaded file, writes `provenance.json`, and renames the completed directory
-into place. Existing incomplete or superseded directories are preserved with
-a `.previous-*` name. The app sets the Hugging Face and Transformers offline
-flags for every helper process.
+CI checks that:
 
-The specialist setup is separate and explicit:
+- `--hf-token-stdin` exists in both setup layers;
+- the app-supplied token is not re-exported as a child environment variable;
+- token-like secrets are not tracked in the repository;
+- provisioning code passes the in-memory token explicitly to Hub API/download calls;
+- inference workers retain `local_files_only=True` / offline Hub settings.
+
+The specialist provisioner resolves every checkpoint that actually requires download **before** the first large transfer. If DINOv3 access was not approved for the account, provisioning should fail at preflight rather than first downloading several gigabytes of public checkpoints.
+
+A real gated-model smoke still requires a private user token tied to an account with upstream DINOv3 access. Hosted CI cannot honestly provide that approval.
+
+## Model storage path verification
+
+The packaged app resolves Application Support through Foundation:
+
+```swift
+FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+```
+
+It must not build a container path by appending `Library/Containers/...` to `$HOME`. Inside App Sandbox, `$HOME` already refers to the container home; doing so creates a nested bogus container path and can make a successful setup invisible to runtime checks.
+
+The model setup process receives exact `LIBRARIAN_APP_SUPPORT_DIR`, `LIBRARIAN_MODELS_DIR`, `LIBRARIAN_SPECIALIST_MODELS_DIR`, and `LIBRARIAN_MODEL_RUNTIME_DIR` values derived from that Foundation URL. **Open Models Folder** uses the same resolved model root.
+
+`HuggingFaceModelSetupTests` protects this regression.
+
+## Optional provider/model checks
+
+Apple Vision is the zero-download baseline.
+
+Terminal specialist setup remains available:
 
 ```bash
+# Use normal `hf auth login` state if desired:
 ./scripts/setup_models.sh --specialist-profile embeddings
+
+# Or keep a token out of argv/history:
+printf '%s\n' "$HF_TOKEN" \
+  | ./scripts/setup_models.sh --specialist-profile embeddings --hf-token-stdin
+
 ./scripts/setup_models.sh --specialist-profile balanced
-SPECIALIST_PYTHON="$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/model-runtime/bin/python3"
-LIBRARIAN_SPECIALIST_MODELS_DIR="$HOME/Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models/specialists" \
-  "$SPECIALIST_PYTHON" scripts/specialist.py --check
-"$SPECIALIST_PYTHON" scripts/specialist.py --runtime-check siglip2-so400m-naflex
+./scripts/setup_models.sh --specialist-profile quality
 python3 scripts/test_specialist_contract.py
 ```
 
-The embeddings profile is the recommended macOS baseline. Balanced and quality
-are larger explicit downloads; quality is never automatic. PaddleOCR-VL is
-reported and skipped on macOS because its [upstream runtime documentation](https://paddlepaddle.github.io/PaddleX/3.3/en/pipeline_usage/tutorials/ocr_pipelines/PaddleOCR-VL.html)
-currently excludes CPU and Arm, so this app uses native Vision OCR there. A
-specialist `--check` is structural and offline; the app's specialist preflight
-also imports the required runtime modules before enabling a provider. A
-verified checkpoint is not downloaded again unless `--force` is supplied.
+The current production fp16 specialist registry is intentionally bounded for the target Mac. CI rejects known larger candidates from production routing until a separately tested quantized/MLX runtime exists. A checkpoint fitting on disk is not sufficient evidence that it is safe to expose in the current execution path.
 
-Useful commands include:
+PaddleOCR-VL is reported but skipped on the current macOS target path; Apple Vision OCR is the supported baseline there.
 
-```bash
-python3 scripts/bench_providers.py --providers local fileid coreml --output provider-results.json
-.build/release/librarian-cli provider-smoke --samples 5
-```
+### Python bootstrap limitation
 
-A successful Core ML MobileCLIP smoke run proves that the provider can produce matching-space image/text vectors from broker-supplied data. It does not by itself prove that provider wins a Golden Library retrieval-quality comparison.
+The default release does not yet ship its own Python distribution. In-app model setup needs a usable host Python to create the isolated runtime unless the package was explicitly built with a compatible runtime included.
 
-Local Whisper is opt-in. The app only enables it when the configured executable/model passes preflight. The ASR processing identity includes provider/model generation so configuration changes invalidate unchanged media once and then return to normal incremental skips.
+A pristine consumer Mac without usable Python is therefore a real remaining distribution boundary. Do not label model setup “self-contained on every Mac” until a pinned bootstrap runtime is shipped and verified.
 
-## Smart organization verification
+## Large-tree verification
 
-The organizer deliberately has a second, bounded presentation layer above raw classifications/similarity data. Regression tests require that:
+The current branch contains explicit scale controls rather than relying on a small-fixture extrapolation:
 
-- raw Vision labels do not create arbitrary taxonomy folders;
-- broad stable categories are used instead;
-- singleton taxonomy noise is not promoted;
-- Smart Groups stay globally bounded;
-- duplicate, screenshot, school, project, semantic, and general lanes cannot monopolize the screen;
-- semantic groups require minimum support/confidence;
-- old classifier generations force one reclassification;
-- retired orphan taxonomy nodes are pruned from the encrypted catalog after reindex.
+- bounded discovery batches;
+- external-sort handling for very large sibling sets;
+- catalog scan generations rather than a full in-memory seen-path set;
+- cancellation between safe file/stage boundaries;
+- no destructive missing reconciliation after cancelled/partial/unavailable scans;
+- persisted access backoff with bounded in-memory prefix state;
+- one similarity rebuild per completed scan instead of per discovery batch;
+- SQL-side bounded file/similarity pages;
+- vector-table batches with only top-K retained in Swift memory.
 
-This is the main guard against replacing Finder folder spam with thousands of AI-generated virtual folders.
+These tests prove the intended algorithmic memory shape. They are not a substitute for a completed 24-GB browser-checkout RSS benchmark on the target machine.
 
-## Historical 10k synthetic snapshot
+## Security-scoped bookmark verification
 
-A local 10,000-file synthetic run recorded on August 25, 2026 produced approximately:
+Synthetic tests can verify fail-closed bookmark resolution, lease ownership, cancellation wiring, and Apply containment. Hosted CI cannot manufacture a genuine App Sandbox extension token created when a human selects a folder through `NSOpenPanel`.
 
-| Measurement | Historical result |
-|---|---:|
-| Cold index | 72.183 s |
-| Cold throughput | 138.6 files/s |
-| Warm unchanged index | 1.077 s |
-| One-file change | 1.127 s |
-| Duplicate pass | 0.533 s |
-| FTS search p50 | 117.52 ms |
-| FTS search p95 | 119.54 ms |
-| Graph query p50 | 242.56 ms |
-| Graph query p95 | 244.62 ms |
-| Peak RSS reported by harness | 25.5 MB |
-| Catalog size | 18,243,584 bytes |
+Before calling the permission lifecycle daily-use ready, perform a packaged-app smoke:
 
-Treat these as a historical development snapshot, not an SLA or current-commit benchmark. Re-run the harness for performance-sensitive changes.
+1. select a real folder through the system picker;
+2. index it and verify analysis does not alter source bytes/metadata unexpectedly;
+3. review and confirm one Apply operation;
+4. verify the move is inside the selected root and is journaled;
+5. Undo Last Apply and verify restoration;
+6. quit and relaunch the packaged app;
+7. verify the persisted bookmark restores access;
+8. create/change a file and verify a later FSEvent reindexes it;
+9. pause/remove/reauthorize and verify old access leases are released/replaced.
 
-A 100,000-file run was started during development but did not complete, so the project makes no 100k performance claim.
+That smoke is the evidence needed for the OS-granted permission lifecycle. A green hosted CI run cannot substitute for it.
 
-## One verification gap remains
+## SQLCipher provenance
 
-The implementation now resolves saved bookmarks fail-closed and retains security-scoped leases for live watched roots. What hosted CI cannot create is the genuine App Sandbox extension granted after a human selects a folder in `NSOpenPanel`.
+SQLCipher is vendored under `ThirdParty/sqlcipher/` with license and provenance files. CI checks the expected source/provenance so an accidental system SQLite fallback does not go unnoticed. Catalog tests also verify encrypted-on-disk behavior and wrong-key failure.
 
-Before calling the app daily-use ready, perform the #44 packaged-app smoke:
+## Interpreting CI receipts
 
-1. select a real folder in the packaged app;
-2. index it;
-3. quit and relaunch;
-4. confirm the persisted bookmark restores access;
-5. create/change a file and confirm a later FSEvent reindexes it;
-6. pause/remove/reauthorize and confirm the old access lifetime is released/replaced correctly.
+A green current run means the code compiled, the synthetic/regression suite passed, the package assembled, and its entitlement/runtime contracts matched the repository assertions for that exact commit.
 
-A green hosted CI run verifies the code paths and synthetic regression suite. It cannot substitute for that one OS-granted permission lifecycle test.
+It does **not** by itself prove:
 
-## Current local audit receipt
+- a genuine persisted `NSOpenPanel` security-scope token works after relaunch on the user's host;
+- the user's Hugging Face account has actually been approved for a gated repository;
+- a pristine Mac without Python can bootstrap the optional Python model runtime;
+- public distribution is notarized/stapled unless the release process explicitly performed those steps;
+- large-tree performance meets an SLA that was never benchmarked on that exact commit/hardware.
 
-On 2026-08-30, the integrated PR #57 review checkout passed the full local
-Swift suite with 169 tests and 0 failures after the scalable discovery,
-semantic-compaction, access-backoff, cancellation, Keychain lifecycle, and
-specialist-router changes. The specialist bridge tests cover configured-root
-selection, exact-manifest rejection, and the unsupported macOS Paddle path;
-the specialist contract fixture suite passed separately. Targeted live
-coordinator coverage passed all 19 tests. The scale receipts use synthetic
-data: a 5,000-file large-directory traversal, bounded discovery batches, and
-the existing 100,000-event live-storm test. No 24 GB browser-tree RSS run was
-completed in this audit, so the project does not claim that benchmark.
-
-The Xcode-backed packaging path also passed: `xcodebuild archive` produced a
-generic macOS universal (`arm64` + `x86_64`) `LibrarianApp` executable and dSYM;
-the final staged app and `/Applications/PrivateLibrarian.app` were signed with
-the stable local Apple Development identity, retained only the profile-free
-sandbox/read-only entitlements, passed deep verification and the entitlement
-audit, and produced a verified versioned DMG. The old
-login-keychain item was inspected and confirmed to reference the removed
-`librarian-cli` code identity; the old catalog files were copied into the
-sandbox container without modifying the originals. The installed app was not
-visually inspected through Computer Use in this run, and the one-time legacy
-Keychain approval was not user-confirmed, so a prompt-free post-migration launch
-is not claimed yet. Public distribution still requires a Developer ID
-Application identity, notarization, and stapling.
-
-## Current merged-release and headless install receipt
-
-On 2026-08-31, PR #57 was confirmed merged into `fix/tier2-incremental-ci` at
-`48d4d7789d24ee1486a4f2ed5868f5a0b04879b5`. The canonical post-merge package
-was rebuilt with `scripts/package_app.sh --xcode --install`. The package now
-compiles the checked-in `AppIcon` asset catalog and verifies both
-`Contents/Resources/Assets.car` and `Contents/Resources/AppIcon.icns`; the
-bundle also declares `CFBundleIconName=AppIcon` and `CFBundleIconFile=AppIcon`.
-
-The installed artifact passed strict code-sign verification, the entitlement
-audit, universal-slice inspection, DMG checksum verification, and a read-only
-DMG mount check. The final DMG SHA-256 was
-`ac30e488a934637a51995a2add79e53c0e575c0c553ff736b9a9e67b9f99edd4`.
-`dist/` contains only the versioned DMG, `/Applications` contains exactly one
-Private Librarian bundle, and the production app contains no CLI executable.
-
-The installed app was reviewed headlessly with an explicit isolated
-`open -n -g` launch. `LibrarianApp` remained alive for the smoke window and
-exited cleanly when only the task-created PID was terminated; recent process
-logs contained no crash, fatal, catalog, migration, or repeated-Keychain
-failure. LaunchServices had five stale registrations for old temporary/archive
-bundles; unregistering those exact paths left only
-`/Applications/PrivateLibrarian.app`. No default app handler or file
-association was changed. The local Apple Development artifact is still not
-notarized/stapled, so `spctl` rejection is a public-distribution boundary, not
-an installed-app launch failure.
+Keep those boundaries explicit rather than turning an old successful receipt into a broader release claim.
