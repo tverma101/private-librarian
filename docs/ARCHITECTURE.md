@@ -1,116 +1,197 @@
 # Architecture
 
-Private Local Librarian is a native macOS app + core library that builds a
-searchable, virtually organized catalog of a user's local folders while being
-**technically incapable of modifying the originals**.
+Private Librarian is a native macOS app plus reusable core library that builds a searchable, encrypted catalog of user-selected local folders. Its architecture deliberately separates **read-only analysis** from the one explicit, reviewed source-mutation workflow: **Apply to Finder / Undo**.
 
-> Original files are readable, never writable. The AI layer never receives
-> filesystem-writing capabilities. Organization exists only inside an
-> encrypted catalog.
+> Indexing, OCR, classification, embeddings, search, and transcription never receive write-capable source handles. Real Finder moves happen only through `OrganizationApplier`, after user confirmation, inside a valid read/write security-scoped root, with a catalog journal for Undo.
 
-If you are looking for a quick tour rather than a design reference, start with
-the [project map](PROJECT_MAP.md).
+If you want a quick tour rather than a design reference, start with the [project map](PROJECT_MAP.md).
 
-## Invariant stack (each layer independently enforces the last)
+## Invariant stack
 
-```
-macOS App Sandbox + read-only, user-selected security-scoped access
+```text
+macOS App Sandbox
+  ├─ user-selected read/write security-scoped roots
+  │    ├─ analysis uses SourceBroker read-only APIs
+  │    └─ explicit Apply/Undo uses OrganizationApplier only
+  ├─ app-scoped bookmark persistence
+  └─ outbound network client only for explicit model provisioning
+       (no network-server entitlement)
         +
-deterministic SourceBroker (O_RDONLY|O_NOFOLLOW only; no write syscalls
-anywhere in the source subsystem; symlink + TOCTOU refusal)
+SourceBroker
+  O_RDONLY / no-follow / containment / TOCTOU checks
         +
-deterministic rule-based classification behind a strict output-schema wall
-(the ClassifierContract discards any output that fails validation — the
-same gate a future LLM classifier would face; prompt injection inside
-document text cannot cross it because there is no tool to call)
+classifier + model output contracts
+  derived evidence cannot directly become a filesystem action
         +
-SQLCipher-encrypted catalog on disk (key generated once, held in the stable
-app-owned macOS Keychain item, never written next to the db) with FTS5
-full-text search
+SQLCipher encrypted catalog
+  writable knowledge, scan state, review state, move journal
         +
-virtual organization only — categories are rows in `virtual_categories`,
-never directories; nothing is ever moved, renamed, deleted, re-tagged,
-or permission-changed at the source
+virtual organization by default
+  Finder changes require an explicit reviewed Apply plan
 ```
 
-## Module map
+This distinction matters: the app **has** read/write sandbox authority for roots the user selects because Apply/Undo is a product feature, but the analysis subsystem remains technically read-only.
 
-| Module | Responsibility |
+## Target/module map
+
+```text
+SQLCipher
+    ↓
+LibrarianCore
+    ↓
+LibrarianAppSupport ─────┐
+                         ├─ LibrarianApp
+LibrarianCore ───────────┘
+    ↓
+ librarian-cli
+
+LibrarianCore + LibrarianAppSupport → LibrarianTests
+```
+
+| Module / component | Responsibility |
 |---|---|
-| `SourceBroker` | The ONLY component that touches source paths. Opens files read-only with component-safe `openat` + `O_NOFOLLOW` traversal, re-stats the opened fd, refuses symlinks and non-regular files, and exposes bounded evidence reads plus complete fail-closed decoder snapshots (`completeSnapshot` / `streamCompleteSnapshot`). Enumeration walks breadth-first with per-directory sort, records symlinks as metadata and **never descends into them**, skips packages/bundles. Reported paths are built by joining names onto the caller's root spelling — see "One path dialect" below. |
-| `SafeReader` semantics | Every read goes through the broker's no-follow fd; a file swapped for a symlink between stat and open fails with ELOOP instead of leaking content. |
-| `FileIdentity` / `FileID` | lstat-level identity (size, mtime, ctime, fs file id). Catalog ids are SHA-256 of the path only — stable across edits so child rows (text, classifications, hashes) survive re-indexing. |
-| `EvidenceExtractor` | Bounded evidence: UTF-8 sample, magic-byte sniffing, cloud-placeholder detection (never hydrates). |
-| `PDFText` / `OfficeContainer` | Content extraction through broker-owned bytes; PDF/container decoders receive a complete snapshot within an explicit cap, or no input. Malformed input yields empty evidence, never a crash. |
-| `ScreenshotIntelligence` | Broker-byte image metadata/dimensions plus weak filename, OCR, and optional Vision labels form explainable Tier-1 screenshot evidence. It emits subtype, confidence, and reason codes; uncertain results also join `Review`. No filename-only detection and no provider-specific semantic model. |
-| `VisionOCR` | On-device Vision text recognition from broker-supplied image bytes; scanned PDFs are rendered from a complete broker snapshot and only rendered page images are capped. |
-| `BrokerPCMDecoder` / `WhisperCLITranscriptionProvider` | Optional local-only media path: complete broker snapshot → PCM decode → bounded timestamped chunks → preflighted local ASR. Uncompressed RIFF/WAVE-PCM is demuxed internally (pure Foundation — deterministic on hosts without ffmpeg, including CI); compressed containers fall back to the ffmpeg stdin path and fail closed when it is absent. No indexed source path is passed to the decoder or model. |
-| `RuleBasedClassifier` + `ClassifierContract` | Deterministic classifier; screenshot results add virtual `Screenshots/<subtype>` memberships and retain the strict output contract. |
-| `LearnedRuleEngine` | Applies only enabled, evidence-bound correction rules after contract validation; promotion requires three distinct matching additive corrections, remains disabled by default, and negative corrections block promotion. |
-| `Scheduler` | Serializes work into LOW/MEDIUM/HIGH slots so indexing never starves interactive work; also the seam where an LLM stage would be rate-limited later. |
-| `Catalog` | All SQLCipher/FTS5 access: files, virtual categories, memberships, screenshot assessments, hashes, errors, correction-bound learned rules, similarity clusters, and per-root onboarding coverage. Key from `CatalogKeychain` (app-owned generic-password item in a dedicated stable service). |
-| `EmbeddingProvider` | Provider-neutral image/text contract. Python and Core ML artifacts are admitted only with pinned provenance manifests; `CoreMLMobileCLIPProvider` loads the genuine MobileCLIP S0 image/text pair lazily, validates 512-D output, and accepts broker bytes only. An explicitly requested unavailable provider stays unavailable instead of silently switching model spaces. |
-| `LocalModelRouter` / `SpecialistModelBridge` | Explicit, cheap-first local specialist registry and bounded JSONL worker. SigLIP2 is the shared image/text space, DINOv3 is a separate visual space, OCR/VLMs receive broker bytes or derived text only, heavy models are transient with bounded offload cleanup, and every snapshot is checked against its pinned manifest before loading. PaddleOCR-VL is excluded on macOS when the upstream runtime is unsupported. |
-| `MobileCLIPTokenizer` | Local CLIP BPE tokenizer for the Core ML text input (`[1,77]` Int32); it reads only the provisioned vocab/merges assets and never receives a source path. |
-| `OrganizationGraphBuilder` | Deterministic multi-label file/category/review/missing relationships persisted as encrypted catalog edges. Graph output is virtual and never performs source filesystem operations. |
-| `ReviewInbox` | Low-confidence queue plus catalog-only correction actions. Corrections persist category overrides so a later re-index cannot silently undo a user's choice. |
-| `Indexer` | Pipeline: enumerate → identity → extract → classify → commit, with identity re-stat immediately before commit ("changed-during-index" discard). End-of-run missing-sweep marks vanished files `missing` — never deletes anything anywhere. |
-| `DuplicateDetector` | Size-bucket → partial fingerprint (head/middle/tail 64 KiB) → full SHA-256 within matching partial groups. Report-only verdicts. |
-| `scripts/benchmark_quality.py` | Model/provider-neutral Golden Library metrics: screenshot subtype accuracy/macro-F1, exact/near-duplicate precision/recall/F1, semantic Recall@10, cluster purity/completeness, OCR recovery, review precision/coverage, correction reduction, and explicit model/preprocessing/runtime comparison records. |
-| `SimilarityClustering` | Provider-neutral exact-hash, feature-print, and embedding adapters feed explicit near-duplicate/semantic threshold edges. Stable family/cluster IDs, representatives, weakest-link confidence, and signal reasons are persisted in SQLCipher; incremental updates rescore only changed neighborhoods and remove missing-node edges. |
-| `SearchService` | FTS5 query front-end plus optional provider-backed MiniLM/CLIP/SigLIP2 and Vision search; indexing and query-time semantic search select the same provider space, vector paths join only indexed catalog rows, collapse chunk hits, apply virtual/date/duplicate filters, and quote-escape FTS input. |
-| `LiveIndexCoordinator` | Optional read-only FSEvents reconciliation for authorized roots. Streams use `kFSEventStreamCreateFlagUseCFTypes` and decode bounded CFArray path delivery; catalog, model, cache, and temporary paths remain excluded even beneath watched roots. Dropped events trigger the existing bounded full-rescan fallback. |
-| `librarian-cli` | Read-only verification harness: `index` / `search` / `status` / `dupes` / `tree` / `graph-stats` / `provider-smoke`; it reports work, similarity, embedding, and graph metrics without exposing source writes. It requires `LIBRARIAN_CATALOG_KEY` and never opens the GUI Keychain item. |
-| `LibrarianApp` | SwiftUI dashboard with persisted read-only security-scoped root onboarding, per-root pause/remove/reauthorize, exclusions, overview, screenshot/missing explorers, review inbox, graph view, and privacy status; sandboxed `.app` packaging via `scripts/package_app.sh` or `script/build_and_run.sh`. |
+| `SourceBroker` | Analysis source-access boundary. Opens regular files read-only, rejects unsafe symlink traversal, verifies identity around reads, and provides bounded/complete broker-owned snapshots to downstream code. It exposes no general source-write API. |
+| `SourceBroker+StreamingEnumeration` | Deterministic bounded-memory traversal for large trees, including early max-file stop, unreadable-directory reporting, and external sorting for huge sibling sets. |
+| `SafeReader` semantics | Every analysis read goes through the broker's no-follow fd. A path swapped for a symlink between stat/open fails rather than leaking or following it. |
+| `FileIdentity` / `FileID` | lstat-level identity and stable catalog IDs used for incremental processing and TOCTOU checks. |
+| `EvidenceExtractor` | Bounded UTF-8/magic/cloud-placeholder evidence. |
+| `PDFText` / `OfficeContainer` | Decode only broker-owned complete snapshots within explicit caps; malformed inputs fail closed. |
+| `ScreenshotIntelligence` | Explainable screenshot evidence from dimensions, OCR, filename hints, and optional Vision/model signals; uncertain cases can enter Review. |
+| `VisionOCR` / `VisionImageAnalyzer` | Apple on-device OCR/image feature paths receiving bytes, not write-capable source handles. |
+| `BrokerPCMDecoder` / `WhisperCLITranscriptionProvider` | Broker snapshot → local decode/PCM → optional local ASR. No cloud fallback is part of the normal runtime. |
+| `RuleBasedClassifier` + `ClassifierContract` | Deterministic baseline classification and strict canonical output wall. Model/document content cannot call filesystem actions. |
+| `LearnedRuleEngine` | Evidence-bound, reversible learned corrections in catalog state. |
+| `Scheduler` | Coordinates expensive stages so indexing does not starve interactive work. |
+| `Catalog` | SQLCipher/FTS5 authority for files, text, categories, screenshots, hashes, errors, learned rules, similarity, scan generations, access backoff, project summaries, and Apply journals. |
+| `CatalogKeychain` | Stable app-owned generic-password Keychain service for the catalog key. |
+| `EmbeddingProvider` | Provider-neutral image/text embedding contract. Unavailable providers fail closed rather than silently switching vector spaces. |
+| `LocalModelRouter` / `SpecialistModelBridge` | Cheap-first specialist routing. SigLIP2 uses semantic image/text space; DINOv3 uses a separate visual space; VLMs are transient and unloaded according to the target-Mac memory contract. Production inference uses local/offline loading. |
+| `HuggingFaceTokenStore` | App-only Keychain service for a user-supplied Hugging Face token. It is not stored in UserDefaults or model provenance. |
+| `AppModelSetup` | Explicit Settings-triggered model provisioning. Resolves the packaged setup helper and Foundation Application Support paths, passes the Keychain token via stdin, captures bounded logs, and never runs as an indexing side effect. |
+| `OrganizationGraphBuilder` | Builds virtual relationships/groups in the encrypted catalog. It never mutates Finder. |
+| `ReviewInbox` | Low-confidence review and catalog-only corrections. |
+| `Indexer` | Per-file processing authority: identity → extraction → classification/providers → commit. Changed-during-index generations are discarded. |
+| `ScalableIndexSession` | Large-root orchestration: bounded discovery batches, disk-backed scan generations, cancellation, access backoff, safe missing reconciliation, and one aggregate similarity refresh. |
+| `DuplicateDetector` | Report-only exact duplicate pipeline. It never deletes originals. |
+| `SimilarityClustering` | Derived exact/feature/embedding relationships persisted in catalog; relations remain signal-space explicit. |
+| `SearchService` | FTS5 plus optional semantic/visual search. Vector rows are scored in fixed batches while only top-K candidates stay in Swift memory. |
+| `LiveIndexCoordinator` | FSEvents reconciliation for authorized roots. The app owns active security-scoped leases for watched roots and releases/replaces them on pause/remove/reauthorize/restart. |
+| `OrganizationApplier` | **Only deliberate Finder mutation boundary.** Validates a reviewed move plan against an active security-scoped root, performs journaled moves, and supports Undo Last Apply. Models/classifiers do not call it directly. |
+| `LibrarianModel` | Main-actor app coordinator for bookmarks, indexing sessions, live leases, settings, model setup status, review/apply UI state, and shutdown. |
+| `LibrarianApp` | SwiftUI product shell. The packaged app is sandboxed with user-selected read/write + app bookmarks + outbound network client for explicit provisioning. |
+| `librarian-cli` | Headless development/verification harness. It is intentionally not shipped in the production app bundle. |
 
-Decoder boundary: compressed PDF/image containers must use the broker's
-complete snapshot/stream API. The normal 8 MiB evidence cap is not a decoder
-cap: a valid container above it is read whole when within policy, otherwise it
-is rejected before decoding. Downstream Vision/search/model helpers receive
-bytes only and never source paths. The media decoder adopts this same API.
+## Source authorization lifecycle
 
-## One path dialect (enumeration contract)
+### Folder selection
 
-`SourceBroker.enumerate(root:)` reports every discovered path as
-`<root.path>/<component>/…`, built from its own walk — **not** the canonicalized
-child URLs `FileManager.contentsOfDirectory(at:)` returns (on macOS those come
-back as `/private/var/...` even when you passed `/var/...`). Emitting raw child
-URLs put two spellings of one tree into a single run and silently broke the
-missing-file sweep's set comparisons. Contract now: enumerate output, catalog
-rows, and the sweep's seen-set/prefix all share the caller's spelling by
-construction. Disk operations inside enumerate keep using the real URLs.
+`NSOpenPanel` gives the app a user-selected security-scoped URL. The app persists bookmark data with security scope. Because the user-facing product can perform Apply/Undo, the packaged entitlement is read/write rather than read-only.
+
+### Manual analysis
+
+The app resolves the saved bookmark, starts security-scoped access, and holds a `SecurityScopedBookmarkLease` for the analysis lifetime. The `Indexer` still opens files through `SourceBroker` read-only methods.
+
+### Live indexing
+
+`LibrarianModel` resolves active watched roots before starting `LiveIndexCoordinator` and retains those leases while the coordinator is alive. Pause/remove/restart/reauthorize drops or replaces the corresponding lease.
+
+If restoration fails or a root becomes unavailable, the app marks it as needing reauthorization and does **not** silently continue through a raw path.
+
+### Apply to Finder
+
+The user reviews a move plan in the app. Only then does `OrganizationApplier` use the already-authorized read/write scope to move files inside that root. Every move is journaled for Undo. This boundary is intentionally outside `LibrarianCore`'s read-only analysis APIs.
+
+## Model provisioning and runtime networking
+
+Normal model inference is local/offline. The packaged app nevertheless needs outbound `network.client` permission because **Install Selected Models** is an explicit in-app operation.
+
+Provisioning flow:
+
+```text
+Settings
+  ↓ explicit user click
+HuggingFaceTokenStore (Keychain)
+  ↓ stdin
+AppModelSetup → setup_models.sh
+  ↓ stdin
+provision_specialist_models.py
+  ↓ token passed in memory
+huggingface_hub
+  ↓
+pinned staged checkpoint + SHA-256 provenance
+```
+
+Important constraints:
+
+- no network-server/listener entitlement;
+- no inference telemetry/cloud fallback implied by client permission;
+- normal workers force local/offline model loading;
+- gated Hub approval is preflighted before multi-GB transfers begin;
+- app-supplied token does not enter argv, shell history, UserDefaults, child environment variables, or model manifests;
+- model snapshots are pinned to immutable revisions and verified before activation;
+- specialist workers are serialized/unloaded under the current target-Mac memory ceiling.
+
+The current default package still needs a usable bootstrap Python to create the isolated Python model runtime unless a compatible runtime was included in packaging. That is a distribution boundary, not something indexing silently installs around.
+
+## Large-tree indexing
+
+`ScalableIndexSession` wraps the per-file `Indexer` so browser-sized trees do not require memory proportional to total file count.
+
+The root flow is:
+
+```text
+security-scoped root lease
+    ↓
+streaming/batched discovery
+    ↓
+per-file incremental Indexer work
+    ↓
+catalog scan-generation markers
+    ↓
+only after a complete uncancelled scan:
+missing-file reconciliation
+    ↓
+one similarity refresh + project summary refresh
+```
+
+Safety properties:
+
+- discovery batches are bounded;
+- huge direct-child sets can use a disk-backed sort path;
+- cancellation is checked between files/stages, never by tearing an atomic catalog commit;
+- cancelled/limited/unavailable scans do not claim filesystem absence;
+- inaccessible prefixes have bounded in-memory tracking and catalog backoff;
+- a manual retry/reauthorization can clear relevant backoff;
+- similarity is rebuilt once per scan rather than once per batch.
+
+## Search memory shape
+
+Exact FTS/search filters remain catalog queries. Semantic and visual vector scoring read vector rows in fixed SQL batches and retain only top-K candidates in memory. SigLIP/CLIP semantic space and DINO/Vision structural space remain distinct; vectors from different model spaces are never compared as if interchangeable.
+
+## Path spelling contract
+
+Enumeration reports paths using the caller-selected root spelling while disk operations may use the real URL internally. This prevents one scan from mixing aliases such as `/var/...` and `/private/var/...` and then incorrectly treating one spelling as missing.
 
 ## Missing-file semantics
 
-When a previously indexed file under the scanned root is absent at the next
-scan, its row is marked `status='missing'`. Nothing is ever reconstructed,
-re-downloaded, or deleted twice; the record exists so search results can be
-annotated honestly. Rows outside the current root prefix are never touched.
+A previously indexed file is marked `missing` only after a complete eligible scan can establish absence. Cancelled, explicitly limited, inaccessible, excluded, or permission-lost regions do not trigger destructive missing reconciliation. Missing catalog state never deletes or reconstructs the source file.
 
 ## Similarity semantics
 
-Similarity is derivative catalog state, never a source-file operation. Exact
-hash and feature-print adapters produce `nearDuplicate` relations; embedding
-adapters produce `semantic` relations. Adapters own their providers and score
-spaces, while the graph engine only applies deterministic thresholds and
-connected components. Cluster and family IDs hash the sorted member IDs and
-relation, and representative selection uses weighted graph degree followed by
-optional confidence and lexical tie-breaks. A changed or added node causes
-only its incident neighborhood to be regenerated; a missing node loses its
-edges and catalog membership but is not deleted from the catalog.
-When both signals connect the same files, near-duplicate and semantic
-components remain separate clusters rather than being relabeled by whichever
-relation has more edges.
-Rows intentionally excluded by onboarding are skipped during enumeration and
-are not treated as vanished during the missing-file sweep. Removing an
-exclusion makes the same catalog row eligible for normal incremental
-reconciliation again.
+Similarity is derivative catalog state. Exact hashes and visual feature spaces produce near-duplicate/structural relations; semantic embedding spaces produce semantic relations. Stable IDs and reasons are persisted so one signal does not get mislabeled as another. A missing node loses derived membership/edges but is not deleted from the user's filesystem.
 
 ## Fixture honesty
 
-The symlink-breakout fixture places `Forbidden/` **outside** the scanned root
-(sibling of `TestLibrary`) with `Symlinks/escape -> ../Forbidden` inside it.
-This makes the invariant directly observable: any appearance of
-`Forbidden/secret.txt` in the catalog means real containment failure, not a
-legitimate in-scope copy. Both the Swift test fixture and `gen_fixtures.py`
-follow this shape.
+Security fixtures must make containment failures directly observable. For example, symlink-breakout fixtures place protected data outside the selected root and create only an in-root symlink pointing outward. A protected file appearing in catalog results then represents a real boundary failure rather than an ambiguous fixture.
+
+## Acceptance boundaries
+
+Hosted CI can verify the code paths, package entitlements, synthetic bookmark failure handling, source immutability, Apply containment, auth plumbing, and offline-worker settings.
+
+It cannot manufacture:
+
+- a genuine `NSOpenPanel` App Sandbox extension token and prove it after a real quit/relaunch;
+- the user's private gated Hugging Face approval;
+- a self-contained Python bootstrap on a pristine Mac when no runtime is bundled.
+
+Those remain explicit host/account acceptance tests and should not be converted into claims based on unrelated green CI.
