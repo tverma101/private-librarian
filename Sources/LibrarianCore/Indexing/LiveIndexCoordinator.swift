@@ -87,10 +87,13 @@ public final class LiveCoalescingQueue: @unchecked Sendable {
     }
 
     public static func isDroppedEvent(flags: UInt32) -> Bool {
+        // historyDone is deliberately NOT here: macOS delivers exactly one
+        // historyDone sentinel per stream start, and treating it as a drop
+        // forced a full indexRoot over every watched root after every
+        // coordinator start (source add/remove/pause, each cleanup completion).
         let mask = LiveRawEvent.mustScanSubDirs
             | LiveRawEvent.userDropped
             | LiveRawEvent.kernelDropped
-            | LiveRawEvent.historyDone
             | LiveRawEvent.rootChanged
         return (flags & mask) != 0
     }
@@ -410,7 +413,11 @@ public final class LiveIndexCoordinator: @unchecked Sendable {
         let exclusions = exclusionPrefixes
         lock.unlock()
         let filtered = events.filter {
-            isUnderWatchedRoot($0.path)
+            // Ignore the historyDone sentinel entirely: it carries no change
+            // information, and letting it through would enqueue a spurious
+            // scan of whatever path it happens to be delivered with.
+            $0.flags & LiveRawEvent.historyDone == 0
+                && isUnderWatchedRoot($0.path)
                 && !LiveExclusions.isExcluded(path: $0.path, prefixes: exclusions,
                                               directoryNames: options.excludedDirectoryNames)
         }

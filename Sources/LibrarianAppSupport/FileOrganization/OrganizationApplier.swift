@@ -45,6 +45,10 @@ public enum OrganizationApplier {
         public let items: [Item]
         public let missingPaths: [String]
         public let skippedOtherRoots: Int
+        /// Members that already live inside this group's destination folder.
+        /// Re-applying is a no-op for them, so the sheet can say so instead of
+        /// opening a dead "Move 0 Files" confirmation.
+        public let alreadyInPlace: Int
 
         /// Catalog-space destination folder path (what the user will see).
         public var destinationFolderPath: String {
@@ -62,7 +66,8 @@ public enum OrganizationApplier {
                  candidateRootPaths: candidateRootPaths,
                  items: items.filter { !fileIDs.contains($0.fileID) },
                  missingPaths: missingPaths,
-                 skippedOtherRoots: skippedOtherRoots)
+                 skippedOtherRoots: skippedOtherRoots,
+                 alreadyInPlace: alreadyInPlace)
         }
     }
 
@@ -91,6 +96,7 @@ public enum OrganizationApplier {
     public enum ApplyError: Error, LocalizedError, Equatable {
         case noMembers
         case noAuthorizedRoot
+        case destinationCreateFailed(path: String, reason: String)
         case journalPersistenceFailed(reason: String, rollbackFailures: [Outcome.Failure])
 
         public var errorDescription: String? {
@@ -99,6 +105,8 @@ public enum OrganizationApplier {
                 return "This group has no movable files."
             case .noAuthorizedRoot:
                 return "The folder holding these files is no longer authorized. Re-authorize it and try again."
+            case let .destinationCreateFailed(path, reason):
+                return "Could not create the destination folder at \(path): \(reason)"
             case let .journalPersistenceFailed(reason, rollbackFailures):
                 if rollbackFailures.isEmpty {
                     return "The move was rolled back because its recovery record could not be saved: \(reason)"
@@ -151,10 +159,20 @@ public enum OrganizationApplier {
             throw ApplyError.noAuthorizedRoot
         }
 
-        let folderName = sanitizedFolderName(from: group.title)
+        // Every near-duplicate family shares the same title; without a suffix,
+        // applying two families into one root would silently merge both into
+        // a single "Near-duplicate family" folder.
+        var folderName = sanitizedFolderName(from: group.title)
+        if group.kind == .nearDuplicate {
+            let compact = group.id.filter { $0.isLetter || $0.isNumber }
+            if !compact.isEmpty {
+                folderName = String(folderName.prefix(72)) + " " + String(compact.suffix(6))
+            }
+        }
         let destinationMembers = byRoot[destinationRoot] ?? []
         var missingPaths: [String] = []
         var items: [Plan.Item] = []
+        var alreadyInPlace = 0
         var reservedDestinationNames: Set<String> = []
         let destinationPath = destinationRoot + "/" + folderName
         let broker = SourceBroker()
@@ -162,6 +180,7 @@ public enum OrganizationApplier {
             // Applying the same group again must be a no-op for files already
             // inside its destination, not a path-nesting operation.
             guard !SourceBroker.isPath(member.path, under: destinationPath) else {
+                alreadyInPlace += 1
                 continue
             }
             guard broker.isRegularFile(at: member.path) else {
@@ -187,7 +206,8 @@ public enum OrganizationApplier {
             candidateRootPaths: byRoot.keys.sorted(),
             items: items,
             missingPaths: missingPaths.sorted(),
-            skippedOtherRoots: skippedOtherRoots)
+            skippedOtherRoots: skippedOtherRoots,
+            alreadyInPlace: alreadyInPlace)
     }
 
     /// Folder names stay single-level and filesystem-safe.
@@ -220,7 +240,9 @@ public enum OrganizationApplier {
             try FileManager.default.createDirectory(at: destinationURL,
                                                     withIntermediateDirectories: true)
         } catch {
-            throw ApplyError.noAuthorizedRoot
+            throw ApplyError.destinationCreateFailed(
+                path: plan.destinationFolderPath,
+                reason: error.localizedDescription)
         }
 
         var moved: Int = 0
@@ -398,8 +420,28 @@ public enum OrganizationApplier {
 
         if !undone.isEmpty, restored == entries.count, failures.isEmpty {
             try? catalog.deleteApplyBatch(batchID: batchID)
+            removeDestinationFolderIfEmpty(entries: entries, leaseForRoot: leaseForRoot, rootFor: rootFor)
         }
         return UndoOutcome(batchID: batchID, restored: restored, failures: failures)
+    }
+
+    /// Best-effort: after Undo restores every file, the destination folder the
+    /// apply created would otherwise linger as an empty surprise in the user's
+    /// source root. Only removed when every entry shared one folder and that
+    /// folder is now completely empty — any other content keeps it.
+    private static func removeDestinationFolderIfEmpty(
+        entries: [Catalog.ApplyJournalEntry],
+        leaseForRoot: (String) throws -> any OrganizationLease,
+        rootFor: (String) -> String?
+    ) {
+        let parents = Set(entries.map { ($0.toPath as NSString).deletingLastPathComponent })
+        guard parents.count == 1, let folderPath = parents.first else { return }
+        guard let root = rootFor(folderPath),
+              let lease = try? leaseForRoot(root),
+              let folderURL = lease.targetURL(for: folderPath, originalRootPath: root) else { return }
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: folderURL.path)) ?? ["keep"]
+        guard contents.isEmpty else { return }
+        try? FileManager.default.removeItem(at: folderURL)
     }
 
     // MARK: - Internals

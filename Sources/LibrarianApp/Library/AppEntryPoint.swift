@@ -155,7 +155,13 @@ final class LibrarianModel: ObservableObject {
     @Published var sources: [SourceFolder] = []
     @Published var statusLines: [String] = []
     @Published var searchResults: [SearchResult] = []
-    @Published var query: String = ""
+    @Published var query: String = "" {
+        didSet {
+            // Old "No results" text must never describe a query that was
+            // never submitted.
+            if query != oldValue, searchFoundNothing { searchFoundNothing = false }
+        }
+    }
     @Published var isIndexing = false
     @Published var selectedSection: LibrarySection = .overview
     @Published var excludedPaths: [String] = []
@@ -191,12 +197,32 @@ final class LibrarianModel: ObservableObject {
     @Published private(set) var tier2Status = "Checking local model readiness…"
     @Published private(set) var isSearching = false
     @Published private(set) var searchFoundNothing = false
+    /// True while an apply preview is being computed (first plan or a replan).
+    /// The apply sheet and every Apply button disable on this so a stale plan
+    /// can never execute for a destination the user just switched away from.
+    @Published private(set) var isPreparingPlan = false
+    /// Per-file failures from the last apply or undo. The status line only has
+    /// room for "N failed" — these rows answer "which files, and why".
+    struct ApplyFailureReport: Identifiable, Equatable {
+        let id = UUID()
+        let title: String
+        let failures: [OrganizationApplier.Outcome.Failure]
+    }
+    @Published private(set) var lastApplyFailureReport: ApplyFailureReport?
+    /// Context for the Undo button: how many files the latest journal batch
+    /// holds, so Undo after a restart isn't a blind action.
+    @Published private(set) var undoBatchFileCount: Int = 0
     @Published var localTranscriptionEnabled: Bool {
         didSet {
             UserDefaults.standard.set(localTranscriptionEnabled, forKey: AppLocalTranscription.enabledDefaultsKey)
             restartLiveCoordinator()
             refreshDashboard()
-            startIndexing()
+            // Enabling transcription changes how audio is processed, so a
+            // re-analysis applies it. Disabling keeps the existing transcripts
+            // valid — starting a multi-hour scan for no change would be churn.
+            if localTranscriptionEnabled {
+                startIndexing()
+            }
         }
     }
     @Published var localEmbeddingsEnabled: Bool {
@@ -229,6 +255,35 @@ final class LibrarianModel: ObservableObject {
     private var modelStatusGeneration = 0
     private var searchTask: Task<Void, Never>?
     private var searchGeneration = 0
+    private var reprobeObserver: NSObjectProtocol?
+    private var dashboardRefreshTask: Task<Void, Never>?
+    private var lastDashboardRefreshAt: Date = .distantPast
+
+    /// Coalesce live-event dashboard refreshes to at most one per second.
+    /// Actions that need an immediate refresh (apply, undo, cleanup unwind)
+    /// call `refreshDashboard()` directly and reset the timer window.
+    func scheduleDashboardRefresh() {
+        guard dashboardRefreshTask == nil else { return }
+        let delay = max(0, 1.0 - Date().timeIntervalSince(lastDashboardRefreshAt))
+        dashboardRefreshTask = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.dashboardRefreshTask = nil
+            self.lastDashboardRefreshAt = Date()
+            self.refreshDashboard()
+        }
+    }
+    /// A requested analysis that is waiting for the current one to unwind.
+    /// Set when a rule/setting change asks for a replacement while a run is
+    /// active; consumed at unwind so the promise "restarting after this pass"
+    /// is actually kept.
+    private var pendingReplacementSource: SourceFolder?
+    /// Root paths owned by the active analysis, so pausing an unrelated
+    /// folder does not kill a run that never touched it.
+    private var activeAnalysisPaths: Set<String> = []
+    private var changedGroupIDsUpdatedAt: Date?
 
     static var appSupportDir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -282,6 +337,15 @@ final class LibrarianModel: ObservableObject {
         if catalogReady {
             reconcileAuthorizedSources()
         }
+        if reprobeObserver == nil {
+            reprobeObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.reprobeUnavailableSources()
+                }
+            }
+        }
     }
 
     /// Readiness checks can enumerate large model snapshots and invoke a small
@@ -326,7 +390,7 @@ final class LibrarianModel: ObservableObject {
             } else if !readiness.specialistIDs.isEmpty {
                 self.tier2Status = "Specialist checkpoints found; their offline runtime is unavailable"
             } else {
-                self.tier2Status = "Tier-2 not provisioned — run scripts/setup_models.sh"
+                self.tier2Status = "Tier-2 not provisioned — use the setup command in Settings › Local models"
             }
         }
     }
@@ -477,7 +541,7 @@ final class LibrarianModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
-        panel.message = "Choose folders to index. Access is READ-ONLY; files are never modified."
+        panel.message = "Indexing is read-only. Files move only when you explicitly apply a plan — and every move is undoable."
         panel.begin { [weak self] resp in
             guard let self, resp == .OK else { return }
             for url in panel.urls {
@@ -492,10 +556,17 @@ final class LibrarianModel: ObservableObject {
                 if !self.sources.contains(where: { $0.path == url.path }) {
                     self.sources.append(SourceFolder(id: UUID(), path: url.path))
                 }
-                try? self.catalog?.restoreRootScope(root: url.path)
+                do {
+                    try self.catalog?.restoreRootScope(root: url.path)
+                } catch {
+                    self.log("could not restore \(url.path) into the catalog: \(error); run an analysis to bring its files back")
+                }
             }
             self.saveBookmarks()
             self.restartLiveCoordinator()
+            // Re-adding a previously removed root flips rows unscoped →
+            // pending, which changes the coverage and cataloged counts.
+            self.refreshDashboard()
         }
     }
 
@@ -511,8 +582,15 @@ final class LibrarianModel: ObservableObject {
             isPausing = true
         }
         if isPausing, isIndexing {
-            activeIndexCancellation?.cancel(reason: .paused)
-            log("stopping current cleanup after this file…")
+            // Only stop the run when the paused folder is part of it. Killing
+            // a scoped analysis of a different folder would look like the
+            // app randomly abandoning its work.
+            if activeAnalysisPaths.contains(source.path) {
+                activeIndexCancellation?.cancel(reason: .paused)
+                log("paused folder is part of the current analysis · stopping after this file…")
+            } else {
+                log("paused \(source.path) · the current analysis is unaffected")
+            }
         }
         savePausedPaths()
         restartLiveCoordinator()
@@ -521,7 +599,13 @@ final class LibrarianModel: ObservableObject {
 
     func removeSource(_ source: SourceFolder) {
         if isIndexing { activeIndexCancellation?.cancel(reason: .removed) }
-        try? catalog?.markRootUnscoped(root: source.path)
+        do {
+            try catalog?.markRootUnscoped(root: source.path)
+        } catch {
+            // If unscoping fails, the removed folder's rows would keep showing
+            // up everywhere as if it were still authorized — say so loudly.
+            log("could not remove \(source.path) from the catalog view: \(error)")
+        }
         sources.removeAll { $0.id == source.id }
         bookmarkDataByPath.removeValue(forKey: source.path)
         pausedPaths.remove(source.path)
@@ -537,7 +621,7 @@ final class LibrarianModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.message = "Choose the replacement folder. Access remains READ-ONLY."
+            panel.message = "Choose the replacement folder. Indexing stays read-only; files move only when you apply a plan."
         panel.begin { [weak self] response in
             guard let self, response == .OK, let url = panel.url else { return }
             guard let data = try? url.bookmarkData(
@@ -617,6 +701,24 @@ final class LibrarianModel: ObservableObject {
         }
     }
 
+    /// A transient bookmark failure (network volume not yet mounted, briefly
+    /// locked external drive) must not brand a folder "Needs permission"
+    /// forever. Re-probe flagged folders whenever the app becomes active; a
+    /// healed lease clears the flag and live indexing resumes for it.
+    func reprobeUnavailableSources() {
+        guard !sourcesNeedingReauthorization.isEmpty, !isIndexing, !isReconciling else { return }
+        var healed: [SourceFolder] = []
+        for source in sources where sourcesNeedingReauthorization.contains(source.path) {
+            if sourceLease(for: source) != nil {
+                healed.append(source)
+            }
+        }
+        guard !healed.isEmpty else { return }
+        log("folder access recovered for \((healed.map { ($0.path as NSString).lastPathComponent }).joined(separator: ", "))")
+        restartLiveCoordinator()
+        refreshDashboard()
+    }
+
     private var effectiveExcludedPaths: [String] {
         let defaults = OnboardingExclusions.defaultPaths(
             catalogPath: catalogURL.path,
@@ -689,7 +791,11 @@ final class LibrarianModel: ObservableObject {
             Task { @MainActor [weak self, weak coordinator] in
                 guard let self else { return }
                 self.livePendingEvents = coordinator?.pendingCount ?? 0
-                self.refreshDashboard()
+                // Every delivered batch fires this callback. The pending-event
+                // counter updates instantly; the full dashboard refresh (≈9
+                // catalog queries plus section reloads) is debounced so a live
+                // file-change storm cannot stall the main actor.
+                self.scheduleDashboardRefresh()
             }
         }
         coordinator.onRootAccessLost = { [weak self, weak coordinator] resolvedPath, reason in
@@ -777,9 +883,17 @@ final class LibrarianModel: ObservableObject {
     /// folder. Nothing moves until `confirmApply()` runs.
     func prepareApply(group: SmartOrganizationGroup, destinationRootPath: String? = nil) {
         guard catalogReady, let catalog, !isApplyOperationInProgress,
-              !isReconciling, pendingApplyPlan == nil else { return }
+              !isReconciling, !isPreparingPlan, pendingApplyPlan == nil else {
+            if isPreparingPlan || pendingApplyPlan != nil {
+                log("an apply preview is already being prepared or shown")
+            }
+            return
+        }
+        isPreparingPlan = true
+        applyReplanGeneration += 1
+        let generation = applyReplanGeneration
         let roots = sources.map(\.path)
-        Task.detached(priority: .userInitiated) { [weak self, catalog, group, roots, destinationRootPath] in
+        Task.detached(priority: .userInitiated) { [weak self, catalog, group, roots, destinationRootPath, generation] in
             do {
                 let plan = try OrganizationApplier.plan(
                     group: group,
@@ -787,14 +901,33 @@ final class LibrarianModel: ObservableObject {
                     sourceRoots: roots,
                     destinationRootPath: destinationRootPath)
                 await MainActor.run { [weak self] in
-                    self?.pendingApplyPlan = plan
+                    guard let self, self.applyReplanGeneration == generation else { return }
+                    self.isPreparingPlan = false
+                    if plan.items.isEmpty {
+                        // Re-apply of a settled group must not open a dead
+                        // "Move 0 Files" sheet — say what happened instead.
+                        self.lastApplyMessage = Self.emptyPlanMessage(plan: plan)
+                        self.lastApplyFailureReport = nil
+                    } else {
+                        self.pendingApplyPlan = plan
+                    }
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    self?.log("could not prepare apply: \(error.localizedDescription)")
+                    guard let self, self.applyReplanGeneration == generation else { return }
+                    self.isPreparingPlan = false
+                    self.lastApplyMessage = "Could not prepare apply: \(error.localizedDescription)"
+                    self.log("could not prepare apply: \(error.localizedDescription)")
                 }
             }
         }
+    }
+
+    private static func emptyPlanMessage(plan: OrganizationApplier.Plan) -> String {
+        if !plan.missingPaths.isEmpty {
+            return "No files from “\(plan.groupTitle)” are available to move right now (\(plan.missingPaths.count) unavailable)."
+        }
+        return "All \(plan.alreadyInPlace) files from “\(plan.groupTitle)” are already in “\(plan.folderName)” — nothing to move."
     }
 
     /// Rebuild the preview when the user chooses a different authorized root.
@@ -811,6 +944,7 @@ final class LibrarianModel: ObservableObject {
         guard catalogReady, let catalog else { return }
         applyReplanGeneration += 1
         let generation = applyReplanGeneration
+        isPreparingPlan = true
         let roots = sources.map(\.path)
         Task.detached(priority: .userInitiated) { [weak self, catalog, group, roots, rootPath, generation] in
             do {
@@ -821,11 +955,13 @@ final class LibrarianModel: ObservableObject {
                     destinationRootPath: rootPath)
                 await MainActor.run { [weak self] in
                     guard let self, self.applyReplanGeneration == generation else { return }
+                    self.isPreparingPlan = false
                     self.pendingApplyPlan = plan
                 }
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self, self.applyReplanGeneration == generation else { return }
+                    self.isPreparingPlan = false
                     self.log("apply preview failed: \(error.localizedDescription)")
                 }
             }
@@ -863,9 +999,9 @@ final class LibrarianModel: ObservableObject {
                     self.lastApplyMessage = outcome.succeeded
                         ? "Moved \(outcome.moved) files to \(outcome.destinationFolderPath)"
                         : "Moved \(outcome.moved) of \(outcome.moved + outcome.failures.count) files · \(outcome.failures.count) failed"
-                    if !outcome.failures.isEmpty {
-                        self.log("apply failures: \(outcome.failures.prefix(5).map { "\($0.path): \($0.reason)" }.joined(separator: " · "))")
-                    }
+                    self.lastApplyFailureReport = outcome.succeeded ? nil : ApplyFailureReport(
+                        title: "Failed moves for \"\(plan.groupTitle)\"",
+                        failures: outcome.failures)
                     self.log("applied \"\(plan.groupTitle)\" · \(outcome.destinationFolderPath)")
                     self.refreshDashboard()
                     self.updateUndoAvailability()
@@ -876,6 +1012,7 @@ final class LibrarianModel: ObservableObject {
                     self.isApplyOperationInProgress = false
                     self.log("apply failed: \(error.localizedDescription)")
                     self.lastApplyMessage = "Apply failed: \(error.localizedDescription)"
+                    self.lastApplyFailureReport = nil
                 }
             }
         }
@@ -900,9 +1037,13 @@ final class LibrarianModel: ObservableObject {
                     self.lastApplyMessage = outcome.succeeded
                         ? "Undo complete · \(outcome.restored) files restored"
                         : "Undo restored \(outcome.restored) files · \(outcome.failures.count) failed"
+                    self.lastApplyFailureReport = outcome.succeeded ? nil : ApplyFailureReport(
+                        title: "Failed undo restores",
+                        failures: outcome.failures)
                     self.log(self.lastApplyMessage ?? "")
                 } else {
                     self.lastApplyMessage = "Nothing left to undo"
+                    self.lastApplyFailureReport = nil
                 }
                 self.refreshDashboard()
                 self.updateUndoAvailability()
@@ -913,9 +1054,18 @@ final class LibrarianModel: ObservableObject {
     private func updateUndoAvailability() {
         guard let catalog else {
             canUndoApply = false
+            undoBatchFileCount = 0
             return
         }
-        canUndoApply = ((try? catalog.latestApplyBatchID()) ?? nil) != nil
+        if let batchID = (try? catalog.latestApplyBatchID()) ?? nil {
+            canUndoApply = true
+            // "Undo what, exactly?" — surface the batch size so Undo after a
+            // restart is not a blind action.
+            undoBatchFileCount = ((try? catalog.applyBatchEntries(batchID: batchID)) ?? []).count
+        } else {
+            canUndoApply = false
+            undoBatchFileCount = 0
+        }
     }
 
     func shutdown() {
@@ -923,12 +1073,17 @@ final class LibrarianModel: ObservableObject {
         modelStatusTask?.cancel()
         searchTask?.cancel()
         stopLiveCoordinator()
+        if let observer = reprobeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            reprobeObserver = nil
+        }
     }
 
     func startIndexing() {
         if isIndexing {
+            pendingReplacementSource = nil
             activeIndexCancellation?.cancel(reason: .replaced)
-            log("replacement cleanup requested; stopping after the current file…")
+            log("settings changed · restarting analysis over all folders after this pass…")
             return
         }
         let jobs: [(SourceFolder, SecurityScopedBookmarkLease)] = sources
@@ -942,8 +1097,10 @@ final class LibrarianModel: ObservableObject {
 
     func startIndexing(source: SourceFolder) {
         if isIndexing {
+            pendingReplacementSource = source
             activeIndexCancellation?.cancel(reason: .replaced)
-            log("replacement cleanup requested; stopping after the current file…")
+            let name = (source.path as NSString).lastPathComponent
+            log("restarting analysis of \(name) after this pass…")
             return
         }
         guard !pausedPaths.contains(source.path) else { return }
@@ -961,6 +1118,13 @@ final class LibrarianModel: ObservableObject {
         scopeLabel: String
     ) {
         guard let indexer = makeIndexer(), let catalog, !isIndexing else { return }
+        guard !isReconciling else {
+            // The startup folder check is a short lstat pass; the home screen
+            // shows "Checking known files…" while it runs. Ask for a retry
+            // instead of racing two passes over the same roots.
+            log("still checking known files — try again in a moment")
+            return
+        }
         guard !jobs.isEmpty else {
             log("no authorized source folders available for cleanup")
             return
@@ -978,6 +1142,7 @@ final class LibrarianModel: ObservableObject {
         let token = IndexCancellationToken()
         activeIndexCancellation = token
         isIndexing = true
+        activeAnalysisPaths = Set(jobs.map(\.0.path))
         // Snapshot group sizes so completion can show exactly which groups the
         // cleanup created or grew ("what did it just organize?").
         let groupSizesBefore = Dictionary(uniqueKeysWithValues: smartGroups.map { ($0.id, $0.fileIDs.count) })
@@ -1027,6 +1192,7 @@ final class LibrarianModel: ObservableObject {
                 }
                 self.activeIndexCancellation = nil
                 self.isIndexing = false
+                self.activeAnalysisPaths = []
                 self.refreshDashboard()
                 if !reportSnapshot.isEmpty {
                     self.lastCleanupReport = CleanupReport(
@@ -1037,6 +1203,7 @@ final class LibrarianModel: ObservableObject {
                     self.changedGroupIDs = Set(sizesAfter.filter { id, count in
                         (groupSizesBefore[id] ?? 0) < count
                     }.keys)
+                    self.changedGroupIDsUpdatedAt = Date()
                 }
                 let processedTotal = reportSnapshot.reduce(0) { $0 + $1.processed }
                 let missingTotal = reportSnapshot.reduce(0) { $0 + $1.missingMarked }
@@ -1049,12 +1216,29 @@ final class LibrarianModel: ObservableObject {
                              + (missingTotal == 0 ? "" : " · \(missingTotal) missing"))
                 }
                 self.restartLiveCoordinator()
+                // A requested replacement (rule/setting change mid-run) must
+                // actually run, or the status line's promise is a lie. Only a
+                // `.replaced` stop restarts; a user cancel stays stopped.
+                let replacement = (token.reason == .replaced) ? self.pendingReplacementSource : nil
+                self.pendingReplacementSource = nil
+                if let replacement {
+                    self.startIndexing(source: replacement)
+                } else if token.reason == .replaced {
+                    self.startIndexing()
+                }
             }
         }
     }
 
     func refreshDashboard() {
         guard let catalog else { return }
+        // "· just updated" chips stop being true once the data has moved on.
+        if let updated = changedGroupIDsUpdatedAt,
+           Date().timeIntervalSince(updated) > 600,
+           !changedGroupIDs.isEmpty {
+            changedGroupIDs = []
+            changedGroupIDsUpdatedAt = nil
+        }
         do {
             // The dashboard only needs aggregate graph counts. Do not load the
             // full organization graph or every similarity family onto the main

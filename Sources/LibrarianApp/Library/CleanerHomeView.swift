@@ -10,10 +10,26 @@ struct CleanerHomeView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var selectedSourceID: UUID?
     @State private var confirmCatalogReset = false
+    @State private var confirmStartFresh = false
+    @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
     @FocusState private var searchFocused: Bool
 
     private var eligibleSources: [LibrarianModel.SourceFolder] {
         model.sources.filter { !model.isPaused($0) && !model.needsReauthorization($0) }
+    }
+
+    /// Why the Analyze button is disabled, in the user's words. Nil when it
+    /// is enabled.
+    private var analyzeDisabledReason: String? {
+        if !model.catalogReady { return "The encrypted catalog is not open — see the message below." }
+        if model.sources.isEmpty { return "Choose a folder first — Private Librarian only looks at folders you hand it." }
+        if eligibleSources.isEmpty {
+            return "All folders are paused or need permission — resume or re-authorize one to analyze."
+        }
+        if !selectedProfileReady {
+            return "Balanced and Quality need the downloaded local models — use Set Up above, or switch to Fast."
+        }
+        return nil
     }
 
     private var selectedSource: LibrarianModel.SourceFolder? {
@@ -96,6 +112,19 @@ struct CleanerHomeView: View {
                 self.selectedSourceID = nil
             }
         }
+        .confirmationDialog(
+            "Remove “\(sourcePendingRemoval.map { ($0.path as NSString).lastPathComponent } ?? "")”?",
+            isPresented: Binding(get: { sourcePendingRemoval != nil },
+                                 set: { if !$0 { sourcePendingRemoval = nil } }),
+            titleVisibility: .visible) {
+            Button("Remove from Library", role: .destructive) {
+                if let source = sourcePendingRemoval { model.removeSource(source) }
+                sourcePendingRemoval = nil
+            }
+            Button("Cancel", role: .cancel) { sourcePendingRemoval = nil }
+        } message: {
+            Text("The folder's files are never touched, but they disappear from search, groups, and duplicates until you add the folder again.")
+        }
     }
 
     private var header: some View {
@@ -115,8 +144,10 @@ struct CleanerHomeView: View {
             Spacer()
 
             HStack(spacing: 6) {
+                // In Fast mode the local-model stack is irrelevant; showing a
+                // gray dot there reads as "something is wrong".
                 Circle()
-                    .fill(model.isTier2Provisioned ? Color.green : Color.secondary)
+                    .fill(model.isTier2Provisioned || model.localModelProfile == .fast ? Color.green : Color.secondary)
                     .frame(width: 7, height: 7)
                 Text(model.localModelProfile.shortDisplayName)
                     .font(.caption.weight(.medium))
@@ -225,7 +256,15 @@ struct CleanerHomeView: View {
                     .controlSize(.large)
                     .keyboardShortcut(.return, modifiers: [.command])
                     .disabled(!model.catalogReady || eligibleSources.isEmpty || !selectedProfileReady)
-                    .help("Read and understand files without moving them")
+                    .help(analyzeDisabledReason ?? "Read and understand files without moving them")
+                }
+                if !model.isIndexing, !model.isReconciling, let reason = analyzeDisabledReason,
+                   !model.sources.isEmpty || !model.catalogReady {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 420)
                 }
             }
 
@@ -307,7 +346,7 @@ struct CleanerHomeView: View {
                 }
                 Button("Re-authorize…") { model.reauthorizeSource(source) }
                 Divider()
-                Button("Remove", role: .destructive) { model.removeSource(source) }
+                Button("Remove…", role: .destructive) { sourcePendingRemoval = source }
             } label: {
                 Image(systemName: "ellipsis.circle")
             }
@@ -440,11 +479,65 @@ struct CleanerHomeView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+
+                applyOutcomeFooter
             }
             .padding(18)
             .background(
                 (anyProblem ? Color.orange.opacity(0.08) : Color.accentColor.opacity(0.08)),
                 in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+
+    /// After the user has applied a plan in the Library window, the home
+    /// screen shows the outcome and the Undo affordance — the move must not
+    /// be invisible on the surface most people keep open.
+    @ViewBuilder
+    private var applyOutcomeFooter: some View {
+        if model.canUndoApply || model.lastApplyMessage != nil || model.lastApplyFailureReport != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                Divider()
+                HStack(spacing: 10) {
+                    if model.canUndoApply {
+                        Button("Undo Last Apply") { model.undoLastApply() }
+                            .disabled(model.isApplyOperationInProgress || model.isReconciling)
+                    }
+                    if model.isApplyOperationInProgress {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("Moving files…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let message = model.lastApplyMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    Spacer()
+                }
+                if let report = model.lastApplyFailureReport {
+                    DisclosureGroup {
+                        ForEach(Array(report.failures.enumerated()), id: \.offset) { _, failure in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text((failure.path as NSString).lastPathComponent)
+                                    .font(.caption.weight(.medium))
+                                Text("\(failure.path) — \(failure.reason)")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    } label: {
+                        Label("\(report.title) · \(report.failures.count) file\(report.failures.count == 1 ? "" : "s")", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
         }
     }
 
@@ -522,7 +615,18 @@ struct CleanerHomeView: View {
                 HStack {
                     Button("Migrate Existing Catalog") { model.migrateCatalog() }
                         .buttonStyle(.borderedProminent)
-                    Button("Start Fresh") { model.startFreshCatalog() }
+                    Button(confirmStartFresh
+                           ? "Confirm: Switch to an Empty Catalog"
+                           : "Start Fresh") {
+                        if confirmStartFresh {
+                            model.startFreshCatalog()
+                            confirmStartFresh = false
+                        } else {
+                            confirmStartFresh = true
+                        }
+                    }
+                    .foregroundStyle(.red)
+                    .help("Your existing library will no longer open in the app. The old encrypted catalog stays safe on disk. Use only when you know you want a blank start.")
                 }
             }
             .padding(16)

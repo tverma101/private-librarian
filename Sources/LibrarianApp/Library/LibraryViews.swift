@@ -114,6 +114,7 @@ enum LibrarySection: String, CaseIterable, Identifiable {    case overview
 
 struct MagicContentView: View {
     @EnvironmentObject private var model: LibrarianModel
+    @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
 
     var body: some View {
         NavigationSplitView {
@@ -140,6 +141,7 @@ struct MagicContentView: View {
                                     }.buttonStyle(.borderless)
                                         .frame(width: 28, height: 28)
                                         .contentShape(Rectangle())
+                                        .help(model.isPaused(source) ? "Resume analysis for this folder" : "Pause analysis for this folder")
                                         .accessibilityLabel(model.isPaused(source) ? "Resume source" : "Pause source")
                                     Button { model.reauthorizeSource(source) } label: {
                                         Image(systemName: "arrow.triangle.2.circlepath")
@@ -148,12 +150,12 @@ struct MagicContentView: View {
                                         .contentShape(Rectangle())
                                         .help("Re-authorize folder")
                                         .accessibilityLabel("Re-authorize folder")
-                                    Button { model.removeSource(source) } label: {
+                                    Button { sourcePendingRemoval = source } label: {
                                         Image(systemName: "trash")
                                     }.buttonStyle(.borderless)
                                         .frame(width: 28, height: 28)
                                         .contentShape(Rectangle())
-                                        .help("Remove root from the catalog view")
+                                        .help("Remove folder from the catalog view (its files stay on disk)")
                                         .accessibilityLabel("Remove source from catalog")
                                 }
                                 Text(source.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
@@ -182,9 +184,9 @@ struct MagicContentView: View {
                         }
                     }
                     if model.isIndexing {
-                        Button("Stop Cleanup") { model.cancelIndexing() }
+                        Button("Stop Analysis") { model.cancelIndexing() }
                     } else {
-                        Menu("Clean Up") {
+                        Menu("Analyze Folder") {
                             Button("All Authorized Folders") { model.startIndexing() }
                             Divider()
                             ForEach(model.sources.filter { !model.isPaused($0) && !model.needsReauthorization($0) }) { source in
@@ -195,6 +197,12 @@ struct MagicContentView: View {
                             }
                         }
                         .disabled(model.sources.isEmpty || model.sources.allSatisfy { model.isPaused($0) || model.needsReauthorization($0) })
+                        .disabled(model.isReconciling)
+                        .help(model.sources.isEmpty
+                              ? "Add a folder first"
+                              : (model.sources.allSatisfy { model.isPaused($0) || model.needsReauthorization($0) }
+                                 ? "All folders are paused or need permission — resume or re-authorize one"
+                                 : "Read and understand files without moving them"))
                     }
                 }
             }
@@ -246,11 +254,25 @@ struct MagicContentView: View {
                         .padding(20)
                 } else {
                     if !model.searchResults.isEmpty {
-                        GroupBox("Search results") {
-                            ForEach(model.searchResults) { result in
-                                SearchResultRow(result: result)
+                        GroupBox("Search results · \(model.searchResults.count)") {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    ForEach(Array(model.searchResults.prefix(50).enumerated()), id: \.element.id) { index, result in
+                                        SearchResultRow(result: result)
+                                        if index < min(50, model.searchResults.count) - 1 {
+                                            Divider()
+                                        }
+                                    }
+                                    if model.searchResults.count > 50 {
+                                        Text("+ \(model.searchResults.count - 50) more results — narrow the search to see them")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .padding(.top, 6)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(maxHeight: 240)
                         }
                         .padding(.horizontal, 20)
                         .padding(.top, 8)
@@ -291,6 +313,19 @@ struct MagicContentView: View {
             }
         }
         .onAppear { model.start() }
+        .confirmationDialog(
+            "Remove “\(sourcePendingRemoval.map { ($0.path as NSString).lastPathComponent } ?? "")”?",
+            isPresented: Binding(get: { sourcePendingRemoval != nil },
+                                 set: { if !$0 { sourcePendingRemoval = nil } }),
+            titleVisibility: .visible) {
+            Button("Remove from Library", role: .destructive) {
+                if let source = sourcePendingRemoval { model.removeSource(source) }
+                sourcePendingRemoval = nil
+            }
+            Button("Cancel", role: .cancel) { sourcePendingRemoval = nil }
+        } message: {
+            Text("The folder's files are never touched, but they disappear from search, groups, and duplicates until you add the folder again.")
+        }
     }
 
     @ViewBuilder
@@ -330,6 +365,20 @@ private struct OverviewView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
+            if model.dashboard.total == 0 {
+                ContentUnavailableView {
+                    Label("Nothing indexed yet", systemImage: "sparkles.rectangle.stack")
+                } description: {
+                    Text("Add a folder on the home screen (or in the sidebar) and run an analysis. Your files stay exactly where they are — Private Librarian builds a private, searchable map of them here.")
+                } actions: {
+                    if model.sources.isEmpty {
+                        Button("Add a Folder") { model.addSourceFolder() }
+                    } else {
+                        Button("Analyze Folders") { model.startIndexing() }
+                    }
+                }
+                .padding(.top, 40)
+            }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 12)], spacing: 12) {
                 MetricCard(title: "Cataloged", value: model.dashboard.total, icon: "books.vertical")
                 MetricCard(title: "Indexed", value: model.dashboard.indexed, icon: "checkmark.circle")
@@ -482,19 +531,53 @@ private struct SmartGroupsView: View {
                 }
             }
 
-            if model.canUndoApply || model.lastApplyMessage != nil {
-                HStack(spacing: 10) {
-                    if model.canUndoApply {
-                        Button("Undo Last Apply") { model.undoLastApply() }
-                        .disabled(model.isApplyOperationInProgress)
+            if model.canUndoApply || model.lastApplyMessage != nil || model.lastApplyFailureReport != nil {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        if model.canUndoApply {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Button("Undo Last Apply") { model.undoLastApply() }
+                                    .disabled(model.isApplyOperationInProgress || model.isReconciling)
+                                Text("restores \(model.undoBatchFileCount) file\(model.undoBatchFileCount == 1 ? "" : "s") from the last apply")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if model.isApplyOperationInProgress {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Moving files…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if let message = model.lastApplyMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Spacer()
                     }
-                    if let message = model.lastApplyMessage {
-                        Text(message)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                    if let report = model.lastApplyFailureReport {
+                        DisclosureGroup {
+                            ForEach(Array(report.failures.enumerated()), id: \.offset) { _, failure in
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text((failure.path as NSString).lastPathComponent)
+                                        .font(.caption.weight(.medium))
+                                    Text("\(failure.path) — \(failure.reason)")
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                                .padding(.vertical, 2)
+                            }
+                        } label: {
+                            Label("\(report.title) · \(report.failures.count) file\(report.failures.count == 1 ? "" : "s")", systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                     }
-                    Spacer()
                 }
             }
         }
@@ -535,6 +618,7 @@ private struct SmartGroupCard: View {
                             .lineLimit(1)
                     }
                     .font(.caption)
+                    .opacity(model.filePath(for: id).isEmpty ? 0.5 : 1.0)
                 }
                 if group.fileIDs.count > 6 {
                     Text("+ \(group.fileIDs.count - 6) more")
@@ -545,9 +629,17 @@ private struct SmartGroupCard: View {
                     Button {
                         model.prepareApply(group: group)
                     } label: {
-                        Label("Apply to Finder…", systemImage: "folder.badge.gearshape")
+                        if model.isPreparingPlan {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Preparing…")
+                            }
+                        } else {
+                            Label("Apply to Finder…", systemImage: "folder.badge.gearshape")
+                        }
                     }
-                    .disabled(!model.catalogReady)
+                    .disabled(!model.catalogReady || model.isPreparingPlan
+                              || model.isApplyOperationInProgress || model.isReconciling)
                     .help("Create a folder named after this group and move the member files into it. Nothing moves until you confirm.")
                     Text("You confirm every move; originals are moved, never copied or deleted, and it is undoable.")
                         .font(.caption2)
@@ -574,13 +666,16 @@ private struct ApplyPlanConfirmationSheet: View {
     @State private var selectedRootPath = ""
     @State private var excludedFileIDs: Set<String> = []
 
+    private var selectedCount: Int { plan.items.count - excludedFileIDs.count }
+
     private var rootSelection: Binding<String> {
         Binding(
             get: { selectedRootPath.isEmpty ? plan.destinationRootPath : selectedRootPath },
             set: { newRoot in
                 selectedRootPath = newRoot
-                // Replans swap the presented plan in place; exclusions carry
-                // over because they are keyed by stable catalog file IDs.
+                // Replans swap the presented plan in place while the sheet
+                // stays up; the Move button is disabled until the new preview
+                // arrives so the old destination can never execute.
                 model.replanApply(to: newRoot)
             })
     }
@@ -600,6 +695,7 @@ private struct ApplyPlanConfirmationSheet: View {
                         Text(root).tag(root)
                     }
                 }
+                .disabled(model.isPreparingPlan)
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -609,7 +705,12 @@ private struct ApplyPlanConfirmationSheet: View {
                         .textSelection(.enabled)
                 }
                 LabeledContent("Files selected") {
-                    Text("\(plan.items.count - excludedFileIDs.count)")
+                    Text("\(selectedCount)")
+                }
+                if plan.alreadyInPlace > 0 {
+                    LabeledContent("Already in destination") {
+                        Text("\(plan.alreadyInPlace) (will not move again)")
+                    }
                 }
                 if plan.skippedOtherRoots > 0 {
                     LabeledContent("Left in other folders") {
@@ -623,12 +724,20 @@ private struct ApplyPlanConfirmationSheet: View {
                 }
             }
             .font(.subheadline)
+            .opacity(model.isPreparingPlan ? 0.5 : 1.0)
 
-            if !plan.items.isEmpty {
+            if model.isPreparingPlan {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Updating preview…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            } else if !plan.items.isEmpty {
                 GroupBox("Exact moves") {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 7) {
-                            ForEach(Array(plan.items.prefix(40)), id: \.fileID) { item in
+                        LazyVStack(alignment: .leading, spacing: 7) {
+                            ForEach(plan.items, id: \.fileID) { item in
                                 Toggle(isOn: Binding(
                                     get: { !excludedFileIDs.contains(item.fileID) },
                                     set: { included in
@@ -648,16 +757,12 @@ private struct ApplyPlanConfirmationSheet: View {
                                     }
                                 }
                                 .toggleStyle(.checkbox)
-                                if item.fileID != plan.items.prefix(40).last?.fileID {
+                                if item.fileID != plan.items.last?.fileID {
                                     Divider()
                                 }
                             }
-                            if plan.items.count > 40 {
-                                Text("+ \(plan.items.count - 40) more moves")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
                         }
+                        .padding(.vertical, 2)
                     }
                     .frame(maxHeight: 230)
                 }
@@ -669,23 +774,30 @@ private struct ApplyPlanConfirmationSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack {
-                Text("\(excludedFileIDs.count) excluded")
+                Text(excludedFileIDs.isEmpty
+                     ? "Nothing excluded"
+                     : "\(excludedFileIDs.count) excluded")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { model.cancelApply() }
                     .keyboardShortcut(.cancelAction)
-                Button("Move \(plan.items.count - excludedFileIDs.count) Files") {
+                Button("Move \(selectedCount) Files") {
                     model.confirmApply(excluding: excludedFileIDs)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(plan.items.isEmpty || excludedFileIDs.count >= plan.items.count)
+                .disabled(selectedCount == 0 || model.isPreparingPlan)
                 .keyboardShortcut(.defaultAction)
             }
         }
         .padding(24)
         .frame(width: 620)
         .onAppear { selectedRootPath = plan.destinationRootPath }
+        .onChange(of: plan.id) { _, _ in
+            // A replan replaces the plan items; exclusions that no longer
+            // match an item in the new plan would silently skew every count.
+            excludedFileIDs.formIntersection(Set(plan.items.map(\.fileID)))
+        }
     }
 }
 
@@ -875,7 +987,7 @@ private struct ReviewInboxView: View {
                             Text(item.reasonCodes.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
                             HStack {
                                 TextField("Category", text: Binding(
-                                    get: { categoryDrafts[item.fileID] ?? "Review/Confirmed" },
+                                    get: { categoryDrafts[item.fileID] ?? "" },
                                     set: { categoryDrafts[item.fileID] = $0 }))
                                     .textFieldStyle(.roundedBorder)
                                 if let candidate = item.categories.first {
@@ -883,8 +995,20 @@ private struct ReviewInboxView: View {
                                         apply(item: item, category: candidate, action: .addCategory)
                                     }
                                 }
-                                Button("Add") { apply(item: item, category: categoryDrafts[item.fileID] ?? "Review/Confirmed", action: .addCategory) }
-                                Button("Remove") { apply(item: item, category: categoryDrafts[item.fileID] ?? "Review/Confirmed", action: .removeCategory) }
+                                Button("Add") {
+                                    let name = (categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces)
+                                    guard !name.isEmpty else { return }
+                                    apply(item: item, category: name, action: .addCategory)
+                                }
+                                .disabled((categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
+                                .help("Type a category name first")
+                                Button("Remove") {
+                                    let name = (categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces)
+                                    guard !name.isEmpty else { return }
+                                    apply(item: item, category: name, action: .removeCategory)
+                                }
+                                .disabled((categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
+                                .help("Type the category to remove first")
                                 Button("Unknown") { apply(item: item, category: "", action: .markUnknown) }
                             }
                         }
@@ -903,6 +1027,7 @@ private struct ReviewInboxView: View {
 private struct CatalogBlockedView: View {
     @EnvironmentObject private var model: LibrarianModel
     @State private var confirmReset = false
+    @State private var confirmStartFresh = false
 
     var body: some View {
         ContentUnavailableView {
@@ -931,7 +1056,17 @@ private struct CatalogBlockedView: View {
                     .help("Moves the old encrypted catalog files aside (they are never deleted), removes the unreadable key, and creates a new encrypted catalog. Use this when every launch asks for keychain access and then fails.")
                 }
             } else if !model.catalogMigrationAttempted {
-                Button("Start New Catalog") { model.startFreshCatalog() }
+                Button(confirmStartFresh
+                       ? "Confirm: Switch to an Empty Catalog"
+                       : "Start New Catalog") {
+                    if confirmStartFresh {
+                        model.startFreshCatalog()
+                        confirmStartFresh = false
+                    } else {
+                        confirmStartFresh = true
+                    }
+                }
+                .help("Your existing library will no longer open in the app (it stays safe on disk). Use only when you know you want a blank start.")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -940,6 +1075,7 @@ private struct CatalogBlockedView: View {
 
 private struct CatalogMigrationBanner: View {
     @EnvironmentObject private var model: LibrarianModel
+    @State private var confirmStartFresh = false
 
     var body: some View {
         GroupBox {
@@ -963,10 +1099,16 @@ private struct CatalogMigrationBanner: View {
                         .disabled(model.catalogMigrationAttempted)
                         .accessibilityHint("Reads the legacy catalog key once and does not modify source files")
                         if !model.catalogMigrationAttempted {
-                            Button("Start New Catalog") {
-                                model.startFreshCatalog()
+                            Button(confirmStartFresh ? "Confirm: Switch to an Empty Catalog" : "Start New Catalog") {
+                                if confirmStartFresh {
+                                    model.startFreshCatalog()
+                                    confirmStartFresh = false
+                                } else {
+                                    confirmStartFresh = true
+                                }
                             }
                             .buttonStyle(.bordered)
+                            .help("Your existing library will no longer open in the app (it stays safe on disk). Use only when you know you want a blank start.")
                             .accessibilityHint("Creates a separate encrypted catalog and leaves the existing catalog untouched")
                         }
                     }

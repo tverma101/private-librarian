@@ -9,23 +9,12 @@ struct SimpleSettingsView: View {
     @EnvironmentObject private var model: LibrarianModel
     @State private var showAllModels = false
     @State private var copiedCommand = false
-
-    private var profileBinding: Binding<LocalModelProfile> {
-        Binding(
-            get: { model.localModelProfile },
-            set: { profile in
-                model.localModelProfile = profile
-                if profile != .fast {
-                    model.localEmbeddingsEnabled = true
-                }
-            }
-        )
-    }
+    @State private var terminalLaunchFailed = false
 
     var body: some View {
         Form {
             Section("Intelligence") {
-                Picker("Mode", selection: profileBinding) {
+                Picker("Mode", selection: $model.localModelProfile) {
                     Text("Fast").tag(LocalModelProfile.fast)
                     Text("Balanced").tag(LocalModelProfile.balanced)
                     Text("Quality").tag(LocalModelProfile.quality)
