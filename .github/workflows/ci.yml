@@ -89,10 +89,17 @@ jobs:
           grep -F 'kwargs["torch_dtype"] = torch.float16' scripts/specialist.py
           python3 scripts/provision_specialist_models.py --list >/dev/null
 
-          # Gated-model auth must be possible without putting a token in argv,
-          # source, UserDefaults, or a generated manifest.
+          # Gated-model auth must be possible without putting an app-supplied
+          # token in argv, source, UserDefaults, generated manifests, or child
+          # process environment variables. setup_models.sh reads stdin once;
+          # provision_specialist_models.py receives that secret on stdin too.
           grep -F -- '--hf-token-stdin' scripts/setup_models.sh >/dev/null
-          grep -F 'HF_TOKEN="$HF_TOKEN_VALUE" "$PYTHON"' scripts/setup_models.sh >/dev/null
+          grep -F -- '--hf-token-stdin' scripts/provision_specialist_models.py >/dev/null
+          grep -F 'token=token' scripts/provision_specialist_models.py >/dev/null
+          if grep -F 'HF_TOKEN="$HF_TOKEN_VALUE"' scripts/setup_models.sh; then
+            echo "App-supplied Hugging Face token must not be exported to a child environment" >&2
+            exit 1
+          fi
           if git grep -nE 'hf_[A-Za-z0-9]{20,}' -- . ':(exclude)ThirdParty/**'; then
             echo "A Hugging Face token-like secret is tracked in source" >&2
             exit 1

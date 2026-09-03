@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Provision the final local specialist stack with immutable provenance.
 
-The app never calls this script automatically. Downloads are an explicit operator action.
-Runtime inference is offline-only; this provisioner is the only component that needs network.
+Downloads happen only after an explicit user/setup action. Normal inference is
+local-files-only. Gated Hub credentials may be supplied over stdin so an app
+Keychain token never needs to enter argv, shell history, or a child process
+environment.
 
 Examples:
   python3 scripts/provision_specialist_models.py --list
   python3 scripts/provision_specialist_models.py --profile embeddings
   python3 scripts/provision_specialist_models.py --profile balanced
-  python3 scripts/provision_specialist_models.py --model minicpm-v-4.6
+  printf '%s\n' "$HF_TOKEN" | python3 scripts/provision_specialist_models.py --profile embeddings --hf-token-stdin
   python3 scripts/provision_specialist_models.py --profile balanced --verify-only
 
-`quality` intentionally includes very large models and must be explicitly requested.
+`quality` intentionally includes large models and must be explicitly requested.
 """
 from __future__ import annotations
 
@@ -28,7 +30,7 @@ from typing import Iterable
 ROOT = Path(__file__).resolve().parent.parent
 MODELS_ROOT = Path(os.environ.get("LIBRARIAN_SPECIALIST_MODELS_DIR", ROOT / "Models" / "specialists"))
 
-# Keep this table in lock-step with Sources/LibrarianCore/LocalModelRouter.swift.
+# Keep this table in lock-step with Sources/LibrarianCore/LocalModels/LocalModelRouter.swift.
 # revision_prefix is an immutable commit prefix verified against the Hub before download.
 MODELS = {
     "siglip2-so400m-naflex": {
@@ -100,9 +102,13 @@ def selected_for_profile(profile: str) -> list[str]:
     return [name for name, spec in MODELS.items() if PROFILE_ORDER[spec["profile"]] <= ceiling]
 
 
-def resolve_full_revision(hf, spec: dict) -> str:
+def resolve_full_revision(hf, spec: dict, *, token: str | None = None) -> str:
     try:
-        info = hf.HfApi().model_info(spec["hf_id"], revision=spec["revision_prefix"])
+        # Passing the in-memory token explicitly avoids exporting the app's
+        # Keychain credential into the provisioning process environment. When
+        # token is None, huggingface_hub may still use the operator's normal
+        # `hf auth login`/HF_TOKEN configuration for Terminal workflows.
+        info = hf.HfApi(token=token).model_info(spec["hf_id"], revision=spec["revision_prefix"])
     except Exception as exc:
         extra = " This model is gated; accept its terms and authenticate with Hugging Face first." if spec.get("gated") else ""
         raise RuntimeError(f"cannot resolve {spec['hf_id']}@{spec['revision_prefix']}: {exc}.{extra}") from exc
@@ -213,7 +219,13 @@ def verify_one(name: str, require_revision: str | None = None) -> bool:
     return _verify_snapshot(name, MODELS_ROOT / name, require_revision=require_revision)
 
 
-def provision_one(name: str, *, force: bool = False) -> bool:
+def provision_one(
+    name: str,
+    *,
+    force: bool = False,
+    token: str | None = None,
+    resolved_revision: str | None = None,
+) -> bool:
     spec = MODELS[name]
     if reason := unsupported_reason(name):
         print(f"[{name}] {reason}", file=sys.stderr)
@@ -228,7 +240,7 @@ def provision_one(name: str, *, force: bool = False) -> bool:
         print("huggingface_hub is required for provisioning: pip install -U huggingface_hub", file=sys.stderr)
         return False
     try:
-        revision = resolve_full_revision(hf, spec)
+        revision = resolved_revision or resolve_full_revision(hf, spec, token=token)
     except RuntimeError as exc:
         print(f"[{name}] {exc}", file=sys.stderr)
         return False
@@ -241,6 +253,7 @@ def provision_one(name: str, *, force: bool = False) -> bool:
             repo_id=spec["hf_id"],
             revision=revision,
             local_dir=str(staging),
+            token=token,
         )
         manifest = build_manifest(name, spec, staging, revision)
         (staging / "provenance.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -263,6 +276,13 @@ def provision_one(name: str, *, force: bool = False) -> bool:
     return verify_one(name, require_revision=revision)
 
 
+def read_token_from_stdin() -> str:
+    token = sys.stdin.readline().strip()
+    if not token:
+        raise RuntimeError("--hf-token-stdin was requested but stdin did not contain a token")
+    return token
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Provision Private Librarian specialist models")
     parser.add_argument("--list", action="store_true")
@@ -274,6 +294,9 @@ def main() -> int:
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--force", action="store_true",
                         help="redownload a verified checkpoint and preserve the old directory")
+    parser.add_argument(
+        "--hf-token-stdin", action="store_true",
+        help="read one Hugging Face token line from stdin; never places it in argv or the environment")
     args = parser.parse_args()
 
     global MODELS_ROOT
@@ -303,11 +326,57 @@ def main() -> int:
         names.append(name)
     if args.profile == "quality" and not args.verify_only:
         print("Quality adds LFM2.5-VL-3B; models above the 11.50 GB Mac ceiling are not offered.", file=sys.stderr)
+
+    token: str | None = None
+    if args.hf_token_stdin:
+        try:
+            token = read_token_from_stdin()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     MODELS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # Resolve every checkpoint that actually needs provisioning before the
+    # first multi-gigabyte download starts. This makes a missing DINOv3 gated
+    # approval fail in seconds instead of after SigLIP has already downloaded.
+    resolved: dict[str, str] = {}
+    if not args.verify_only:
+        pending: list[str] = []
+        for name in names:
+            dest = MODELS_ROOT / name
+            ready = not args.force and dest.exists() and _verify_snapshot(name, dest)
+            if not ready:
+                pending.append(name)
+        if pending:
+            try:
+                import huggingface_hub as hf
+            except ImportError:
+                print("huggingface_hub is required for provisioning: pip install -U huggingface_hub", file=sys.stderr)
+                return 1
+            for name in pending:
+                try:
+                    resolved[name] = resolve_full_revision(hf, MODELS[name], token=token)
+                except RuntimeError as exc:
+                    print(f"[{name}] preflight failed: {exc}", file=sys.stderr)
+                    return 1
+
     ok = True
     for name in names:
-        result = verify_one(name) if args.verify_only else provision_one(name, force=args.force)
+        result = (
+            verify_one(name)
+            if args.verify_only
+            else provision_one(
+                name,
+                force=args.force,
+                token=token,
+                resolved_revision=resolved.get(name),
+            )
+        )
         ok = result and ok
+
+    # Drop our final Python reference to a stdin credential before process exit.
+    token = None
     return 0 if ok else 1
 
 

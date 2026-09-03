@@ -58,12 +58,12 @@ Environment:
   LIBRARIAN_MODELS_DIR        default model root override
   LIBRARIAN_SPECIALIST_MODELS_DIR specialist model root override
   LIBRARIAN_MODEL_RUNTIME_DIR default runtime directory override
-  HF_TOKEN                    optional Hugging Face token for Terminal/CI usage
+  HF_TOKEN                    optional Hugging Face token for Terminal usage
 
 Security:
-  --hf-token-stdin keeps the token out of argv and shell history. The value is
-  scoped to the actual Hugging Face provisioning subprocesses and is never
-  written to model provenance or setup logs.
+  --hf-token-stdin keeps the token out of argv, shell history, generated files,
+  and child-process environment variables. The specialist provisioner reads it
+  from stdin and supplies it to huggingface_hub from process memory only.
 EOF
 }
 
@@ -229,10 +229,19 @@ else
     [ -x "$PYTHON" ] || { echo "Model Python is not executable: $PYTHON" >&2; exit 1; }
 fi
 
-run_provisioner() {
+run_public_provisioner() {
+    "$PYTHON" "$@"
+}
+
+run_specialist_provisioner() {
     if [ -n "$HF_TOKEN_VALUE" ]; then
-        HF_TOKEN="$HF_TOKEN_VALUE" "$PYTHON" "$@"
+        # The credential crosses into Python only on stdin. Do not export it:
+        # environment variables are observable process metadata on many hosts.
+        printf '%s\n' "$HF_TOKEN_VALUE" \
+            | "$PYTHON" "$@" --hf-token-stdin
     else
+        # Terminal users may rely on the normal Hugging Face CLI token/cache or
+        # an externally supplied HF_TOKEN. The app path always uses stdin.
         "$PYTHON" "$@"
     fi
 }
@@ -243,7 +252,7 @@ if [ "$DOWNLOAD_MODELS" -eq 1 ]; then
     if [ "$FORCE" -eq 1 ]; then
         args+=(--force)
     fi
-    LIBRARIAN_MODELS_DIR="$MODELS_DIR" run_provisioner "${args[@]}"
+    LIBRARIAN_MODELS_DIR="$MODELS_DIR" run_public_provisioner "${args[@]}"
 fi
 
 if [ "$DOWNLOAD_SPECIALISTS" -eq 1 ]; then
@@ -252,7 +261,7 @@ if [ "$DOWNLOAD_SPECIALISTS" -eq 1 ]; then
     if [ "$FORCE" -eq 1 ]; then
         specialist_args+=(--force)
     fi
-    LIBRARIAN_SPECIALIST_MODELS_DIR="$SPECIALIST_MODELS_DIR" run_provisioner "${specialist_args[@]}"
+    LIBRARIAN_SPECIALIST_MODELS_DIR="$SPECIALIST_MODELS_DIR" run_specialist_provisioner "${specialist_args[@]}"
 fi
 
 # Do not retain a stdin-supplied credential any longer than this process needs.
