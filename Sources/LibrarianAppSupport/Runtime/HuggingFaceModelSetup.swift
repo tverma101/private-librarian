@@ -140,6 +140,20 @@ public enum AppModelSetup {
         return nil
     }
 
+    /// Use Foundation's Application Support result instead of constructing a
+    /// `~/Library/Containers/...` path manually. Inside App Sandbox, HOME is
+    /// already the container home; appending another Containers path creates a
+    /// bogus nested directory and makes freshly installed models invisible to
+    /// the runtime.
+    public static func applicationSupportURL() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("PrivateLibrarian", isDirectory: true)
+    }
+
+    public static func modelsURL() -> URL {
+        applicationSupportURL().appendingPathComponent("Models", isDirectory: true)
+    }
+
     public static func run(profile: LocalModelProfile, token: String?) async -> ModelSetupResult {
         guard let script = setupScriptURL() else {
             return ModelSetupResult(
@@ -156,14 +170,25 @@ public enum AppModelSetup {
         case .quality: profileName = "quality"
         }
         let trimmedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let appSupport = applicationSupportURL()
 
         return await Task.detached(priority: .utility) {
-            runBlocking(script: script, profile: profileName, token: trimmedToken)
+            runBlocking(script: script, profile: profileName, token: trimmedToken, appSupport: appSupport)
         }.value
     }
 
-    private static func runBlocking(script: URL, profile: String, token: String?) -> ModelSetupResult {
+    private static func runBlocking(script: URL, profile: String, token: String?, appSupport: URL) -> ModelSetupResult {
         let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        } catch {
+            return ModelSetupResult(
+                succeeded: false,
+                status: 73,
+                message: "Could not create Private Librarian Application Support: \(error.localizedDescription)",
+                output: "")
+        }
+
         let logURL = fm.temporaryDirectory
             .appendingPathComponent("private-librarian-model-setup-\(UUID().uuidString).log")
         guard fm.createFile(atPath: logURL.path, contents: nil),
@@ -189,6 +214,20 @@ public enum AppModelSetup {
         process.standardOutput = logHandle
         process.standardError = logHandle
 
+        // A sandboxed app's HOME is the container home. Force every helper to
+        // the exact same Foundation-resolved directories used by the runtime so
+        // Terminal setup, packaged setup, readiness checks, and the Models
+        // folder UI cannot drift to different trees.
+        var environment = ProcessInfo.processInfo.environment
+        let models = appSupport.appendingPathComponent("Models", isDirectory: true)
+        environment["LIBRARIAN_APP_SUPPORT_DIR"] = appSupport.path
+        environment["LIBRARIAN_MODELS_DIR"] = models.path
+        environment["LIBRARIAN_SPECIALIST_MODELS_DIR"] = models
+            .appendingPathComponent("specialists", isDirectory: true).path
+        environment["LIBRARIAN_MODEL_RUNTIME_DIR"] = appSupport
+            .appendingPathComponent("model-runtime", isDirectory: true).path
+        process.environment = environment
+
         let input = Pipe()
         process.standardInput = input
 
@@ -204,8 +243,7 @@ public enum AppModelSetup {
         }
 
         if let token, !token.isEmpty {
-            // Stdin avoids putting the secret in shell history, argv, or a
-            // persistent environment file.
+            // Stdin avoids putting the secret in shell history or argv.
             try? input.fileHandleForWriting.write(contentsOf: Data((token + "\n").utf8))
         }
         try? input.fileHandleForWriting.close()
@@ -214,8 +252,6 @@ public enum AppModelSetup {
 
         let data = (try? Data(contentsOf: logURL)) ?? Data()
         var output = String(data: data, encoding: .utf8) ?? ""
-        // Setup output is useful for troubleshooting but should not let one
-        // noisy package manager log occupy unbounded UI memory.
         if output.count > 48_000 {
             output = "… earlier setup output omitted …\n" + String(output.suffix(48_000))
         }

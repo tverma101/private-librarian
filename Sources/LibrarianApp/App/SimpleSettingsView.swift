@@ -431,15 +431,9 @@ struct SimpleSettingsView: View {
         let env = ProcessInfo.processInfo.environment
         let folder: URL
         if let override = env["LIBRARIAN_MODELS_DIR"], !override.isEmpty {
-            folder = URL(fileURLWithPath: override)
-        } else if let appSupport = env["LIBRARIAN_APP_SUPPORT_DIR"], !appSupport.isEmpty {
-            folder = URL(fileURLWithPath: appSupport, isDirectory: true)
-                .appendingPathComponent("Models", isDirectory: true)
+            folder = URL(fileURLWithPath: override, isDirectory: true)
         } else {
-            let home = env["HOME"] ?? NSHomeDirectory()
-            folder = URL(fileURLWithPath: home, isDirectory: true)
-                .appendingPathComponent("Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian", isDirectory: true)
-                .appendingPathComponent("Models", isDirectory: true)
+            folder = AppModelSetup.modelsURL()
         }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         NSWorkspace.shared.open(folder)
