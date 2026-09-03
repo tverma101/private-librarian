@@ -3,8 +3,8 @@ import LibrarianCore
 
 /// The default product surface: one cleanup action, a small amount of state,
 /// and progressive disclosure into the advanced catalog when the user asks.
-/// The source filesystem remains read-only; this view only drives the existing
-/// bounded indexing/catalog pipeline.
+/// Analysis is read-only; Finder changes happen only through the separately
+/// reviewed and journaled Apply workflow.
 struct CleanerHomeView: View {
     @EnvironmentObject private var model: LibrarianModel
     @Environment(\.openWindow) private var openWindow
@@ -12,22 +12,21 @@ struct CleanerHomeView: View {
     @State private var confirmCatalogReset = false
     @State private var confirmStartFresh = false
     @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
+    @State private var showModelSetup = false
+    @State private var resumeAnalysisAfterSetup = false
     @FocusState private var searchFocused: Bool
 
     private var eligibleSources: [LibrarianModel.SourceFolder] {
         model.sources.filter { !model.isPaused($0) && !model.needsReauthorization($0) }
     }
 
-    /// Why the Analyze button is disabled, in the user's words. Nil when it
-    /// is enabled.
+    /// Why the primary Analyze/setup action is unavailable. Model setup is not
+    /// a disabled state: if it is needed, the same button starts it.
     private var analyzeDisabledReason: String? {
         if !model.catalogReady { return "The encrypted catalog is not open — see the message below." }
         if model.sources.isEmpty { return "Choose a folder first — Private Librarian only looks at folders you hand it." }
         if eligibleSources.isEmpty {
             return "All folders are paused or need permission — resume or re-authorize one to analyze."
-        }
-        if !selectedProfileReady {
-            return "Balanced and Quality need the downloaded local models — use Set Up above, or switch to Fast."
         }
         return nil
     }
@@ -60,6 +59,14 @@ struct CleanerHomeView: View {
         case .quality:
             return "Quality uses the full downloaded local stack for harder images and documents."
         }
+    }
+
+    private var primaryAnalyzeTitle: String {
+        selectedProfileReady ? "Analyze Folder" : "Set Up & Analyze"
+    }
+
+    private var primaryAnalyzeIcon: String {
+        selectedProfileReady ? "sparkles" : "arrow.down.circle"
     }
 
     var body: some View {
@@ -111,6 +118,26 @@ struct CleanerHomeView: View {
                !eligibleSources.contains(where: { $0.id == selectedSourceID }) {
                 self.selectedSourceID = nil
             }
+        }
+        .sheet(isPresented: $showModelSetup) {
+            ModelSetupView(
+                profile: model.localModelProfile,
+                onReady: {
+                    let shouldResume = resumeAnalysisAfterSetup
+                    resumeAnalysisAfterSetup = false
+                    if shouldResume {
+                        DispatchQueue.main.async { startCleanup() }
+                    }
+                },
+                onUseFast: {
+                    model.localModelProfile = .fast
+                    let shouldResume = resumeAnalysisAfterSetup
+                    resumeAnalysisAfterSetup = false
+                    if shouldResume {
+                        DispatchQueue.main.async { startCleanup() }
+                    }
+                })
+                .environmentObject(model)
         }
         .confirmationDialog(
             "Remove “\(sourcePendingRemoval.map { ($0.path as NSString).lastPathComponent } ?? "")”?",
@@ -184,18 +211,21 @@ struct CleanerHomeView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     if model.localModelProfile != .fast, !model.isTier2Provisioned {
-                        HStack(alignment: .top, spacing: 8) {
+                        HStack(alignment: .center, spacing: 8) {
                             Image(systemName: "arrow.down.circle")
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("Download the selected local models first")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("One-time local setup needed")
                                     .font(.caption.weight(.medium))
-                                Text("Analysis is disabled for this quality mode until its local models are ready.")
+                                Text("The main button will set it up and continue automatically.")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            SettingsLink { Text("Set Up") }
-                                .font(.caption)
+                            Button("Set Up") {
+                                resumeAnalysisAfterSetup = false
+                                showModelSetup = true
+                            }
+                            .font(.caption)
                         }
                         .foregroundStyle(.orange)
                     }
@@ -207,7 +237,7 @@ struct CleanerHomeView: View {
                 Button {
                     model.addSourceFolder()
                 } label: {
-                    Label("Choose Folders", systemImage: "folder.badge.plus")
+                    Label("Choose a Folder", systemImage: "folder.badge.plus")
                         .frame(minWidth: 180)
                 }
                 .buttonStyle(.borderedProminent)
@@ -246,17 +276,19 @@ struct CleanerHomeView: View {
                         .frame(maxWidth: 360)
                 } else {
                     Button {
-                        startCleanup()
+                        handlePrimaryAnalyzeAction()
                     } label: {
-                        Label("Analyze Folder", systemImage: "sparkles")
+                        Label(primaryAnalyzeTitle, systemImage: primaryAnalyzeIcon)
                             .font(.headline)
                             .frame(minWidth: 180)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(!model.catalogReady || eligibleSources.isEmpty || !selectedProfileReady)
-                    .help(analyzeDisabledReason ?? "Read and understand files without moving them")
+                    .disabled(!model.catalogReady || eligibleSources.isEmpty)
+                    .help(analyzeDisabledReason ?? (selectedProfileReady
+                        ? "Read and understand files without moving them"
+                        : "Complete one-time local model setup, then analyze automatically"))
                 }
                 if !model.isIndexing, !model.isReconciling, let reason = analyzeDisabledReason,
                    !model.sources.isEmpty || !model.catalogReady {
@@ -659,6 +691,15 @@ struct CleanerHomeView: View {
             .padding(16)
             .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
+    }
+
+    private func handlePrimaryAnalyzeAction() {
+        guard selectedProfileReady else {
+            resumeAnalysisAfterSetup = true
+            showModelSetup = true
+            return
+        }
+        startCleanup()
     }
 
     private func startCleanup() {
