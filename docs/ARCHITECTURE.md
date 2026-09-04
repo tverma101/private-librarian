@@ -65,9 +65,9 @@ LibrarianCore + LibrarianAppSupport → LibrarianTests
 | `Catalog` | SQLCipher/FTS5 authority for files, text, categories, screenshots, hashes, errors, learned rules, similarity, scan generations, access backoff, project summaries, and Apply journals. |
 | `CatalogKeychain` | Stable app-owned generic-password Keychain service for the catalog key. |
 | `EmbeddingProvider` | Provider-neutral image/text embedding contract. Unavailable providers fail closed rather than silently switching vector spaces. |
-| `LocalModelRouter` / `SpecialistModelBridge` | Cheap-first specialist routing. SigLIP2 uses semantic image/text space; DINOv3 uses a separate visual space; VLMs are transient and unloaded according to the target-Mac memory contract. Production inference uses local/offline loading. |
-| `HuggingFaceTokenStore` | App-only Keychain service for a user-supplied Hugging Face token. It is not stored in UserDefaults or model provenance. |
-| `AppModelSetup` | Explicit Settings-triggered model provisioning. Resolves the packaged setup helper and Foundation Application Support paths, passes the Keychain token via stdin, captures bounded logs, and never runs as an indexing side effect. |
+| `LocalModelRouter` / `SpecialistModelBridge` | Cheap-first specialist routing. SigLIP2 uses semantic image/text space. Native Vision remains the zero-download visual baseline. Optional DINOv3 uses a separate visual space only when explicitly provisioned. VLMs are transient and unloaded according to the target-Mac memory contract. Production inference uses local/offline loading. |
+| `HuggingFaceTokenStore` | Optional advanced Keychain service for a user-supplied credential used by explicitly selected gated models. Normal Fast/Balanced/Quality setup does not depend on it. |
+| `AppModelSetup` | Explicit user-triggered model provisioning from the Analyze flow or Settings. Resolves the packaged setup helper and Foundation Application Support paths, captures bounded logs, and never runs as an indexing side effect. Normal profiles pass no credential. |
 | `OrganizationGraphBuilder` | Builds virtual relationships/groups in the encrypted catalog. It never mutates Finder. |
 | `ReviewInbox` | Low-confidence review and catalog-only corrections. |
 | `Indexer` | Per-file processing authority: identity → extraction → classification/providers → commit. Changed-during-index generations are discarded. |
@@ -103,35 +103,63 @@ The user reviews a move plan in the app. Only then does `OrganizationApplier` us
 
 ## Model provisioning and runtime networking
 
-Normal model inference is local/offline. The packaged app nevertheless needs outbound `network.client` permission because **Install Selected Models** is an explicit in-app operation.
+Normal model inference is local/offline. The packaged app nevertheless needs outbound `network.client` permission because **Set Up & Analyze** and explicit Settings setup may download a pinned runtime and pinned model snapshots.
 
-Provisioning flow:
+### Consumer provisioning flow
+
+The product profiles are account-free by contract:
 
 ```text
-Settings
-  ↓ explicit user click
-HuggingFaceTokenStore (Keychain)
-  ↓ stdin
+Choose Balanced / Quality
+  ↓
+Set Up & Analyze
+  ↓
 AppModelSetup → setup_models.sh
-  ↓ stdin
+  ↓
+app-private pinned Python runtime (when needed)
+  ↓
 provision_specialist_models.py
-  ↓ token passed in memory
+  ↓
+public profile checkpoints only
+  ↓
+pinned staged snapshots + SHA-256 provenance
+  ↓
+refresh readiness → resume requested analysis
+```
+
+`embeddings`, `balanced`, and `quality` explicitly exclude registry entries marked `gated`. Therefore a normal quality choice cannot turn into an external account/token/license-approval workflow.
+
+On Apple-silicon macOS, `setup_models.sh` can bootstrap its own app-private CPython runtime when no compatible runtime exists. It uses one dated `python-build-standalone` asset, verifies the repository-pinned SHA-256 before extraction/use, and keeps the runtime under Private Librarian's Application Support tree. Homebrew, Xcode, and a global Python are not consumer prerequisites.
+
+### Optional gated specialist flow
+
+DINOv3 remains a supported optional advanced visual-similarity specialist. If a user deliberately provisions it, the credential flow is separate from the normal profiles:
+
+```text
+explicit optional DINOv3 install
+  ↓
+HuggingFaceTokenStore / operator credential
+  ↓ stdin
+setup_models.sh / provision_specialist_models.py
+  ↓ token passed only in memory
 huggingface_hub
   ↓
-pinned staged checkpoint + SHA-256 provenance
+pinned DINOv3 snapshot + SHA-256 provenance
 ```
+
+The router uses DINOv3 opportunistically when available. Its absence never blocks Fast, Balanced, Quality, or Analyze.
 
 Important constraints:
 
 - no network-server/listener entitlement;
 - no inference telemetry/cloud fallback implied by client permission;
 - normal workers force local/offline model loading;
-- gated Hub approval is preflighted before multi-GB transfers begin;
-- app-supplied token does not enter argv, shell history, UserDefaults, child environment variables, or model manifests;
+- consumer profile selection contains no gated checkpoints;
+- an optional gated model is preflighted before its large transfer;
+- an app-supplied optional token does not enter argv, shell history, UserDefaults, child environment variables, or model manifests;
 - model snapshots are pinned to immutable revisions and verified before activation;
+- the clean-Mac Python bootstrap is pinned and checksum-verified before execution;
 - specialist workers are serialized/unloaded under the current target-Mac memory ceiling.
-
-The current default package still needs a usable bootstrap Python to create the isolated Python model runtime unless a compatible runtime was included in packaging. That is a distribution boundary, not something indexing silently installs around.
 
 ## Large-tree indexing
 
@@ -166,7 +194,7 @@ Safety properties:
 
 ## Search memory shape
 
-Exact FTS/search filters remain catalog queries. Semantic and visual vector scoring read vector rows in fixed SQL batches and retain only top-K candidates in memory. SigLIP/CLIP semantic space and DINO/Vision structural space remain distinct; vectors from different model spaces are never compared as if interchangeable.
+Exact FTS/search filters remain catalog queries. Semantic and visual vector scoring read vector rows in fixed SQL batches and retain only top-K candidates in memory. SigLIP semantic space, optional DINO structural space, and native Vision feature evidence remain distinct; vectors from different model spaces are never compared as if interchangeable.
 
 ## Path spelling contract
 
@@ -186,12 +214,12 @@ Security fixtures must make containment failures directly observable. For exampl
 
 ## Acceptance boundaries
 
-Hosted CI can verify the code paths, package entitlements, synthetic bookmark failure handling, source immutability, Apply containment, auth plumbing, and offline-worker settings.
+Hosted CI can verify code paths, package entitlements, synthetic bookmark failure handling, source immutability, Apply containment, public-profile selection, optional auth plumbing, the pinned bootstrap contract, and offline-worker settings.
 
-It cannot manufacture:
+It cannot manufacture or economically repeat on every commit:
 
 - a genuine `NSOpenPanel` App Sandbox extension token and prove it after a real quit/relaunch;
-- the user's private gated Hugging Face approval;
-- a self-contained Python bootstrap on a pristine Mac when no runtime is bundled.
+- a complete multi-gigabyte public model setup inside a pristine packaged consumer sandbox;
+- a private upstream approval for an optional gated DINOv3 install.
 
-Those remain explicit host/account acceptance tests and should not be converted into claims based on unrelated green CI.
+Before a daily-use release, the host smoke therefore needs a clean Apple-silicon account, Fast analysis, account-free Balanced setup with automatic resume, Apply/Undo, bookmark restoration after relaunch, FSEvent refresh, and pause/remove/reauthorization. The optional DINOv3 account smoke is separate and is not a daily-use blocker.
