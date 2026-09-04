@@ -10,13 +10,13 @@ extension LibrarianModel {
             return true
         case .balanced:
             let required = [
-                LocalModelStack.siglip2.id,
+                LocalModelStack.siglip2Base.id,
                 LocalModelStack.miniCPM.id,
             ]
             return isTier2Provisioned && required.allSatisfy(specialistProvisionedIDs.contains)
         case .quality:
             let required = [
-                LocalModelStack.siglip2.id,
+                LocalModelStack.siglip2So400m.id,
                 LocalModelStack.miniCPM.id,
                 LocalModelStack.lfm.id,
             ]

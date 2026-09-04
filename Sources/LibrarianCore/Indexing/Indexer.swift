@@ -165,6 +165,7 @@ public final class Indexer: @unchecked Sendable {
         } else {
             self.embeddingProvider = LocalEmbeddingProviderSelection.make(
                 enabled: options.enableLocalEmbeddings,
+                profile: options.localModelProfile,
                 requestedProviderKind: options.embeddingProviderKind,
                 specialistBridge: specialistBridge)
         }
@@ -195,7 +196,7 @@ public final class Indexer: @unchecked Sendable {
     /// Embedding-space version — derived from pinned HF SHAs + pipeline
     /// contract (processor revision, dim, poisoning prevention). Bump when any
     /// checkpoint SHA or embedding pipeline changes.
-    public static let embeddingSpaceVersion = "emb-v3:mclip-s0|siglip2-cc24074:1152|dinov3-5931719:768|minilm-1110a243:384"
+    public static let embeddingSpaceVersion = "emb-v4:mclip-s0|siglip2-base-b53b807:768|siglip2-so400m-cc24074:1152|dinov3-5931719:768|minilm-1110a243:384"
     /// Full identity of the processing pipeline used for incremental invalidation.
     /// Includes embedding-space identity when Tier 2 is enabled so a model change
     /// forces at least one re-index of every file that carries an embedding.

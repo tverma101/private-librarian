@@ -67,6 +67,7 @@ MAX_TEXT_CHARS = 16_000
 MAX_OUTPUT_CHARS = 8_192
 
 MODEL_SPECS = {
+    "siglip2-base-naflex": ("google/siglip2-base-patch16-naflex", "b53b807"),
     "siglip2-so400m-naflex": ("google/siglip2-so400m-patch16-naflex", "cc24074"),
     "dinov3-vitb16-lvd1689m": ("facebook/dinov3-vitb16-pretrain-lvd1689m", "5931719"),
     "paddleocr-vl-1.6": ("PaddlePaddle/PaddleOCR-VL-1.6", "cdc88f5"),
@@ -75,6 +76,7 @@ MODEL_SPECS = {
 }
 
 RUNTIME_MODULES = {
+    "siglip2-base-naflex": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
     "siglip2-so400m-naflex": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
     "dinov3-vitb16-lvd1689m": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
     "paddleocr-vl-1.6": ("PIL", "paddle", "paddleocr"),
@@ -96,10 +98,11 @@ _TRUSTED_ROOTS: dict[str, Path] = {}
 
 # Keep only the cheap image encoders warm. OCR/reasoners/VLMs are transient and
 # must never overlap each other or the warm encoder set on a memory-constrained Mac.
-WARM_MODELS = {
+SIGLIP_MODELS = {
+    "siglip2-base-naflex",
     "siglip2-so400m-naflex",
-    "dinov3-vitb16-lvd1689m",
 }
+WARM_MODELS = SIGLIP_MODELS | {"dinov3-vitb16-lvd1689m"}
 TRANSIENT_MODELS = {
     "paddleocr-vl-1.6",
     "minicpm-v-4.6",
@@ -176,10 +179,15 @@ def _prepare_for_model(model_id: str) -> None:
         # SigLIP/DINO/Paddle/LLMs/VLMs never stack during an escalation batch.
         _drop_cached_models()
         return
-    # Warm embedding models may coexist with one another, but never with a leaked transient model.
-    leaked = set(_CACHE) - WARM_MODELS
-    if leaked:
-        _drop_cached_models(keep=set(_CACHE) & WARM_MODELS)
+
+    keep = set(_CACHE) & WARM_MODELS
+    if model_id in SIGLIP_MODELS:
+        # Base and So400m produce incompatible semantic spaces. Keep DINO plus
+        # this exact semantic encoder, but evict the alternate SigLIP before
+        # loading so a 16-GB Mac never stacks both checkpoints.
+        keep -= SIGLIP_MODELS - {model_id}
+    if set(_CACHE) != keep:
+        _drop_cached_models(keep=keep)
 
 
 def _warm_encoder_target(torch_module, platform: str | None = None):
@@ -258,18 +266,30 @@ def _large_model_load_kwargs(model_id: str) -> dict:
 
 
 def _memory_policy_self_test() -> None:
-    # Dependency-free invariant test used by CI. Dummy objects prove transient escalation evicts
-    # warm encoders, while warm-to-warm transitions are allowed to retain both encoders.
+    # Dependency-free invariant test used by CI. Transient escalation evicts
+    # every warm encoder, DINO may coexist with one semantic encoder, and the
+    # two incompatible SigLIP variants are mutually exclusive.
     _CACHE.clear()
-    _CACHE["siglip2-so400m-naflex"] = object()
+    _CACHE["siglip2-base-naflex"] = object()
     _CACHE["dinov3-vitb16-lvd1689m"] = object()
     _prepare_for_model("minicpm-v-4.6")
     if _CACHE:
         raise RuntimeError("transient model did not evict warm model cache")
-    _CACHE["siglip2-so400m-naflex"] = object()
+
+    _CACHE["siglip2-base-naflex"] = object()
     _prepare_for_model("dinov3-vitb16-lvd1689m")
-    if set(_CACHE) != {"siglip2-so400m-naflex"}:
-        raise RuntimeError("warm model policy evicted compatible encoder")
+    if set(_CACHE) != {"siglip2-base-naflex"}:
+        raise RuntimeError("DINO preparation evicted compatible semantic encoder")
+
+    _CACHE["dinov3-vitb16-lvd1689m"] = object()
+    _prepare_for_model("siglip2-so400m-naflex")
+    if set(_CACHE) != {"dinov3-vitb16-lvd1689m"}:
+        raise RuntimeError("So400m preparation did not evict Base")
+
+    _CACHE["siglip2-so400m-naflex"] = object()
+    _prepare_for_model("siglip2-base-naflex")
+    if _CACHE:
+        raise RuntimeError("Base preparation did not evict So400m")
     _CACHE.clear()
 
 
@@ -446,8 +466,9 @@ def _normalize_tensor(vector) -> list[float]:
     return [float(v) for v in values]
 
 
-def _load_siglip():
-    key = "siglip2-so400m-naflex"
+def _load_siglip(key: str):
+    if key not in SIGLIP_MODELS:
+        raise ValueError(f"model is not a configured SigLIP encoder: {key!r}")
     if key in _CACHE:
         return _CACHE[key]
     if not _verify_snapshot(key):
@@ -467,9 +488,9 @@ def _load_siglip():
     return model, processor
 
 
-def _siglip_image(image) -> dict:
+def _siglip_image(image, model_id: str) -> dict:
     import torch
-    model, processor = _load_siglip()
+    model, processor = _load_siglip(model_id)
     with torch.inference_mode():
         inputs = _move_encoder_inputs(
             processor(images=image, return_tensors="pt"), model, torch)
@@ -483,12 +504,12 @@ def _siglip_image(image) -> dict:
             if vector is None:
                 raise RuntimeError("SigLIP2 runtime exposed no image embedding")
     values = _normalize_tensor(vector)
-    return {"model": "siglip2-so400m-naflex", "space": "siglip2-joint", "dim": len(values), "vector": values}
+    return {"model": model_id, "space": f"{model_id}-joint", "dim": len(values), "vector": values}
 
 
-def _siglip_text(text: str) -> dict:
+def _siglip_text(text: str, model_id: str) -> dict:
     import torch
-    model, processor = _load_siglip()
+    model, processor = _load_siglip(model_id)
     with torch.inference_mode():
         inputs = _move_encoder_inputs(
             processor(text=[text[:MAX_TEXT_CHARS]], padding="max_length", return_tensors="pt"),
@@ -503,7 +524,7 @@ def _siglip_text(text: str) -> dict:
             if vector is None:
                 raise RuntimeError("SigLIP2 runtime exposed no text embedding")
     values = _normalize_tensor(vector)
-    return {"model": "siglip2-so400m-naflex", "space": "siglip2-joint", "dim": len(values), "vector": values}
+    return {"model": model_id, "space": f"{model_id}-joint", "dim": len(values), "vector": values}
 
 
 def _load_dino():
@@ -704,10 +725,16 @@ def _handle(request: dict) -> dict:
         model_id = request.get("model")
         return _release(str(model_id) if model_id else None)
     if op == "siglip_image":
+        model_id = str(request.get("model", "siglip2-so400m-naflex"))
+        if model_id not in SIGLIP_MODELS:
+            raise ValueError("model is not a configured SigLIP encoder")
         _, image = _decode_image(str(request.get("data_b64", "")))
-        return _siglip_image(image)
+        return _siglip_image(image, model_id)
     if op == "siglip_text":
-        return _siglip_text(str(request.get("text", ""))[:MAX_TEXT_CHARS])
+        model_id = str(request.get("model", "siglip2-so400m-naflex"))
+        if model_id not in SIGLIP_MODELS:
+            raise ValueError("model is not a configured SigLIP encoder")
+        return _siglip_text(str(request.get("text", ""))[:MAX_TEXT_CHARS], model_id)
     if op == "dino_image":
         _, image = _decode_image(str(request.get("data_b64", "")))
         return _dino_image(image)
@@ -739,6 +766,7 @@ def main() -> int:
             "models": sorted(MODEL_SPECS),
             "memory_policy": "11.50-GB-ceiling; warm-encoders-only; transient-exclusive; MPS-fp16",
             "warm_encoder_backend": "mps-fp16-when-available; cpu-fp32-fallback",
+            "semantic_encoder_policy": "profile-exclusive-base-or-so400m",
         }))
         return 0
     if args.runtime_check:

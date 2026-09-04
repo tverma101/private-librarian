@@ -25,6 +25,7 @@ public struct SearchService: Sendable {
         } else {
             self.embeddingProvider = LocalEmbeddingProviderSelection.make(
                 enabled: enabled,
+                profile: localModelProfile,
                 requestedProviderKind: embeddingProviderKind)
         }
     }

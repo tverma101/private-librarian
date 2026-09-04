@@ -260,16 +260,16 @@ struct SimpleSettingsView: View {
     private var selectedModels: [LocalModelDescriptor] {
         switch model.localModelProfile {
         case .fast:
-            return [LocalModelStack.siglip2]
+            return []
         case .balanced:
             return [
-                LocalModelStack.siglip2,
+                LocalModelStack.siglip2Base,
                 LocalModelStack.paddleOCR,
                 LocalModelStack.miniCPM,
             ]
         case .quality:
             return [
-                LocalModelStack.siglip2,
+                LocalModelStack.siglip2So400m,
                 LocalModelStack.paddleOCR,
                 LocalModelStack.miniCPM,
                 LocalModelStack.lfm,
@@ -374,7 +374,8 @@ struct SimpleSettingsView: View {
 
     private func modelDisplayName(_ descriptor: LocalModelDescriptor) -> String {
         switch descriptor.id {
-        case LocalModelStack.siglip2.id: return "SigLIP2"
+        case LocalModelStack.siglip2Base.id: return "SigLIP2 Base NaFlex"
+        case LocalModelStack.siglip2So400m.id: return "SigLIP2 So400m NaFlex"
         case LocalModelStack.dinov3.id: return "DINOv3"
         case LocalModelStack.paddleOCR.id: return "PaddleOCR-VL"
         case LocalModelStack.miniCPM.id: return "MiniCPM-V"

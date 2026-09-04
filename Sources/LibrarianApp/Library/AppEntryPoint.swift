@@ -379,8 +379,11 @@ final class LibrarianModel: ObservableObject {
             self.isTier2Provisioned = readiness.coreML
                 || readiness.legacyRuntime
                 || !readiness.specialistRuntimeIDs.isEmpty
-            if readiness.specialistRuntimeIDs.contains(LocalModelStack.siglip2.id) {
-                self.tier2Status = "Tier-2 ready — local SigLIP2 specialist"
+            if let semantic = LocalModelStack.semanticModel(for: self.localModelProfile),
+               readiness.specialistRuntimeIDs.contains(semantic.id) {
+                self.tier2Status = semantic.id == LocalModelStack.siglip2Base.id
+                    ? "Tier-2 ready — SigLIP2 Base NaFlex"
+                    : "Tier-2 ready — SigLIP2 So400m NaFlex"
             } else if readiness.coreML {
                 self.tier2Status = "Tier-2 ready — Core ML MobileCLIP"
             } else if readiness.legacyRuntime {

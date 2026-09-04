@@ -152,9 +152,9 @@ struct ModelSetupView: View {
         case .fast:
             return "Optional public local encoders can be installed, but Fast itself works without them."
         case .balanced:
-            return "Downloads the public local models used for better image meaning and bounded ambiguity handling."
+            return "Downloads SigLIP2 Base NaFlex for fast screenshot meaning plus bounded ambiguity handling."
         case .quality:
-            return "Downloads the Balanced stack plus the larger public Quality fallback for difficult images."
+            return "Downloads the larger SigLIP2 So400m semantic encoder plus the bounded Quality fallback for difficult images."
         }
     }
 

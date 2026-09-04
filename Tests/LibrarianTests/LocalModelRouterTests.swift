@@ -23,8 +23,7 @@ final class LocalModelRouterTests: XCTestCase {
                                             nativeOCRSucceeded: false,
                                             isDocumentLikeImage: true),
             availableModelIDs: available)
-        XCTAssertEqual(route.map(\.id), [LocalModelStack.siglip2.id, LocalModelStack.dinov3.id])
-        XCTAssertTrue(route.allSatisfy { $0.capability == .imageSemantic || $0.capability == .visualSimilarity })
+        XCTAssertTrue(route.isEmpty, "Fast must remain the zero-download/no-Python profile")
     }
 
     func testBalancedUsesCheapEmbeddingsThenOnlyNeededSpecialists() {
@@ -37,7 +36,7 @@ final class LocalModelRouterTests: XCTestCase {
                                             isDocumentLikeImage: true),
             availableModelIDs: available)
         XCTAssertEqual(ambiguous.map(\.id), [
-            LocalModelStack.siglip2.id,
+            LocalModelStack.siglip2Base.id,
             LocalModelStack.dinov3.id,
             LocalModelStack.paddleOCR.id,
             LocalModelStack.miniCPM.id,
@@ -49,7 +48,7 @@ final class LocalModelRouterTests: XCTestCase {
                                             nativeOCRSucceeded: true,
                                             isDocumentLikeImage: false),
             availableModelIDs: available)
-        XCTAssertEqual(clear.map(\.id), [LocalModelStack.siglip2.id, LocalModelStack.dinov3.id])
+        XCTAssertEqual(clear.map(\.id), [LocalModelStack.siglip2Base.id, LocalModelStack.dinov3.id])
     }
 
     func testQualityHeavyFallbacksOnlyAppearForAmbiguity() {
@@ -62,6 +61,8 @@ final class LocalModelRouterTests: XCTestCase {
                                             isDocumentLikeImage: false),
             availableModelIDs: available)
         XCTAssertFalse(clear.contains { $0.cost == .heavy })
+        XCTAssertTrue(clear.contains { $0.id == LocalModelStack.siglip2So400m.id })
+        XCTAssertFalse(clear.contains { $0.id == LocalModelStack.siglip2Base.id })
 
         let ambiguous = router.route(
             context: LocalModelRouteContext(kind: .image, confidence: 0.1,
@@ -104,10 +105,20 @@ final class LocalModelRouterTests: XCTestCase {
         XCTAssertFalse(route.contains { $0.capability == .visionFallback })
     }
 
-    func testSigLIPAndDINOUseDifferentSpacesAndDimensions() {
-        XCTAssertNotEqual(SpecialistModelBridge.siglipSpaceID, SpecialistModelBridge.dinoSpaceID)
-        XCTAssertNotEqual(SpecialistModelBridge.siglipDimension, SpecialistModelBridge.dinoDimension)
-        XCTAssertEqual(SpecialistModelBridge.siglipDimension, 1152)
+    func testProfileSelectsExactlyOneSemanticEncoder() {
+        XCTAssertNil(LocalModelStack.semanticModel(for: .fast))
+        XCTAssertEqual(LocalModelStack.semanticModel(for: .balanced)?.id, LocalModelStack.siglip2Base.id)
+        XCTAssertEqual(LocalModelStack.semanticModel(for: .quality)?.id, LocalModelStack.siglip2So400m.id)
+    }
+
+    func testSigLIPVariantsAndDINOUseExplicitSpacesAndDimensions() {
+        let baseSpace = SpecialistModelBridge.siglipSpaceID(for: LocalModelStack.siglip2Base)
+        let qualitySpace = SpecialistModelBridge.siglipSpaceID(for: LocalModelStack.siglip2So400m)
+        XCTAssertNotEqual(baseSpace, qualitySpace)
+        XCTAssertNotEqual(baseSpace, SpecialistModelBridge.dinoSpaceID)
+        XCTAssertNotEqual(qualitySpace, SpecialistModelBridge.dinoSpaceID)
+        XCTAssertEqual(SpecialistModelBridge.siglipDimension(for: LocalModelStack.siglip2Base), 768)
+        XCTAssertEqual(SpecialistModelBridge.siglipDimension(for: LocalModelStack.siglip2So400m), 1152)
         XCTAssertEqual(SpecialistModelBridge.dinoDimension, 768)
     }
 }

@@ -65,6 +65,10 @@ class SpecialistContractTests(unittest.TestCase):
             provisioner.selected_for_profile("quality"),
         )
         self.assertTrue(provisioner.MODELS["dinov3-vitb16-lvd1689m"].get("gated"))
+        self.assertIn("siglip2-base-naflex", provisioner.selected_for_profile("balanced"))
+        self.assertNotIn("siglip2-so400m-naflex", provisioner.selected_for_profile("balanced"))
+        self.assertIn("siglip2-so400m-naflex", provisioner.selected_for_profile("quality"))
+        self.assertNotIn("siglip2-base-naflex", provisioner.selected_for_profile("quality"))
 
     def test_warm_encoders_use_mps_fp16_on_apple_silicon_hosts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
