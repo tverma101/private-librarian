@@ -4,7 +4,7 @@ Private Librarian is not judged against a tidy demo folder. The release target i
 
 ## Product invariants
 
-- Originals remain untouched. Organization is virtual.
+- Analysis leaves originals untouched. Organization is virtual until the user separately reviews and confirms an Apply to Finder plan; Apply is journaled, root-contained, and undoable.
 - Smart Groups stay small (default maximum: 18).
 - A repeated arbitrary/model-generated label does not become a polished group just because it appears twice.
 - Raw Vision labels remain evidence unless they map to the curated taxonomy.
@@ -37,7 +37,7 @@ The expected output is a bounded, diverse set of useful virtual groups rather th
 
 ## Real-library acceptance
 
-Before calling the product polished, run it read-only against a genuinely messy library and record:
+Before calling the product polished, run the analysis path against a genuinely messy library and record:
 
 1. number of cataloged files;
 2. number of promoted Smart Groups;
@@ -48,6 +48,14 @@ Before calling the product polished, run it read-only against a genuinely messy 
 7. Review Inbox rate;
 8. unorganized files that should obviously have been grouped;
 9. memory/CPU during initial indexing and an unchanged second pass;
-10. source immutability snapshot before/after.
+10. source immutability snapshot before/after analysis.
 
-Synthetic tests are a guardrail, not a substitute for this final messy-library smoke.
+Then separately exercise the mutation boundary with a small disposable folder:
+
+1. review an Apply to Finder plan before confirming it;
+2. confirm every move stays inside the user-authorized root;
+3. verify the move journal is recorded;
+4. run Undo Last Apply and verify the original paths are restored;
+5. relaunch and confirm the security-scoped permission still works.
+
+Synthetic tests are a guardrail, not a substitute for these final messy-library and packaged Apply/Undo smokes.

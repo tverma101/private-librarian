@@ -47,7 +47,9 @@ body:
         - Similarity / duplicates
         - Media / transcription
         - Local model provider
+        - Model setup / gated access
         - Folder permissions / live indexing
+        - Apply / Undo Finder changes
         - Catalog / encryption
         - Build / CI
         - Other

@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Describe the user problem first. Private Librarian keeps source files read-only, stays local/offline, and stores organization in the encrypted catalog. Feature ideas should preserve those boundaries unless the issue is explicitly about changing them.
+        Describe the user problem first. Private Librarian keeps analysis read-only and organization virtual by default. Real Finder changes exist only behind the explicit, reviewed, journaled Apply/Undo workflow. Normal indexing/inference stays local/offline; outbound networking is reserved for explicit model provisioning and ordinary system-browser links.
 
   - type: textarea
     id: problem
@@ -41,9 +41,9 @@ body:
     attributes:
       label: Project boundaries
       options:
-        - label: This can keep original source files read-only.
+        - label: Analysis can remain read-only; any Finder mutation can stay inside the explicit Apply/Undo boundary rather than becoming automatic.
           required: true
-        - label: This can work without adding runtime network access or telemetry.
+        - label: Normal indexing/inference can remain offline; any network use can stay limited to explicit model provisioning or a system-browser action, with no telemetry, cloud inference, or listener.
           required: true
         - label: Any example data in this issue is synthetic or sanitized.
           required: true

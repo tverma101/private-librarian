@@ -15,8 +15,10 @@ List the commands and focused tests you ran.
 
 ## Safety and privacy check
 
-- [ ] This does not add a source-file write, move, rename, delete, tag, permission-change, or xattr path.
-- [ ] This does not add runtime network access, telemetry, or cloud inference.
+- [ ] Analysis still opens original source files through the read-only `SourceBroker` boundary. If this PR touches Finder mutation, it stays inside the explicit, reviewed, journaled, undoable `OrganizationApplier` Apply/Undo path.
+- [ ] This does not add hidden or automatic source-file writes, moves, renames, deletes, tags, permission changes, or xattrs.
+- [ ] Normal indexing/inference stays offline. Any network-capable change is limited to an explicit model-provisioning or system-browser action and does not add telemetry, cloud inference, or a network listener.
+- [ ] Optional gated-model credentials stay out of argv, UserDefaults, manifests, and logs; use the Keychain/stdin/in-memory credential path.
 - [ ] Models/decoders receive broker-owned bytes, derived text, feature data, or PCM rather than source filesystem authority.
 - [ ] Unchanged files still avoid unnecessary expensive work.
 - [ ] Tests and docs contain only synthetic or sanitized data; no secrets, private files, or personal machine paths are included.
