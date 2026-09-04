@@ -1,0 +1,140 @@
+name: One-shot quality profile contract repair
+
+on:
+  push:
+    branches:
+      - fix/app-does-not-work-as-intended
+    paths:
+      - .github/workflows/one-shot-fix-profile-contract.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/app-does-not-work-as-intended
+
+      - name: Make quality profile the single local-AI switch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          app = Path('Sources/LibrarianApp/Library/AppEntryPoint.swift')
+          text = app.read_text()
+
+          replacements = {
+              '''/// no listening socket. Sources are added via the system folder picker with
+/// read-only security-scoped bookmarks; the catalog is SQLCipher-encrypted
+''': '''/// no listening socket. Sources are added via the system folder picker with
+/// security-scoped bookmarks; the catalog is SQLCipher-encrypted
+''',
+              '''    @Published var localModelProfile: LocalModelProfile {
+        didSet {
+            UserDefaults.standard.set(localModelProfile.rawValue, forKey: "local-model-profile-v1")
+            restartLiveCoordinator()
+            refreshDashboard()
+        }
+    }
+''': '''    @Published var localModelProfile: LocalModelProfile {
+        didSet {
+            UserDefaults.standard.set(localModelProfile.rawValue, forKey: "local-model-profile-v1")
+            // Quality is the consumer-facing source of truth. Fast means the
+            // zero-download path; Balanced/Quality mean their downloaded local
+            // stack is actually enabled. Do not let an old hidden Tier-2 toggle
+            // silently make the selected quality level lie to the user.
+            let shouldEnable = localModelProfile != .fast
+            if localEmbeddingsEnabled != shouldEnable {
+                localEmbeddingsEnabled = shouldEnable
+            } else {
+                restartLiveCoordinator()
+                refreshDashboard()
+            }
+        }
+    }
+''',
+              '''        self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
+        self.localModelProfile = LocalModelProfile(
+            rawValue: UserDefaults.standard.string(forKey: "local-model-profile-v1") ?? "fast") ?? .fast
+''': '''        let storedProfile = LocalModelProfile(
+            rawValue: UserDefaults.standard.string(forKey: "local-model-profile-v1") ?? "fast") ?? .fast
+        // Migrate older builds that persisted an independent Tier-2 toggle.
+        // The visible quality choice now owns this behavior deterministically.
+        self.localEmbeddingsEnabled = storedProfile != .fast
+        self.localModelProfile = storedProfile
+        UserDefaults.standard.set(storedProfile != .fast, forKey: "tier2-enabled-v1")
+''',
+              '''    // MARK: - Read-only source access via security-scoped bookmarks
+''': '''    // MARK: - Security-scoped source access
+''',
+              '''                    self.log("could not persist read-only bookmark: \\(url.path)")
+''': '''                    self.log("could not persist folder permission: \\(url.path)")
+''',
+              '''        panel.allowsMultipleSelection = false
+            panel.message = "Choose the replacement folder. Indexing stays read-only; files move only when you apply a plan."
+''': '''        panel.allowsMultipleSelection = false
+        panel.message = "Choose the replacement folder. Analysis reads only; files move only when you apply a plan."
+''',
+              '''    /// Resolve a stored read-only security-scoped bookmark and run `body`
+''': '''    /// Resolve a stored security-scoped bookmark and run `body`
+''',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'AppEntryPoint replacement marker missing:\n{old[:120]}')
+              text = text.replace(old, new, 1)
+          app.write_text(text)
+
+          settings = Path('Sources/LibrarianApp/App/SimpleSettingsView.swift')
+          text = settings.read_text()
+          old = '''                        Toggle("Use downloaded local embeddings", isOn: $model.localEmbeddingsEnabled)
+'''
+          new = '''                        Label(
+                            model.localModelProfile == .fast
+                                ? "Downloaded local AI is off in Fast mode"
+                                : "Downloaded local AI follows the selected quality level",
+                            systemImage: model.localModelProfile == .fast ? "bolt" : "checkmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+'''
+          if old not in text:
+              raise SystemExit('advanced local-embeddings toggle marker missing')
+          settings.write_text(text.replace(old, new, 1))
+
+          home = Path('Sources/LibrarianApp/Library/CleanerHomeView.swift')
+          text = home.read_text()
+          old = '''        case .balanced:
+            return "Balanced uses downloaded local models when available and keeps uncertain files for review."
+        case .quality:
+            return "Quality uses the full downloaded local stack for harder images and documents."
+'''
+          new = '''        case .balanced:
+            return "Balanced uses SigLIP2 Base and local fallbacks, then keeps uncertain files for review."
+        case .quality:
+            return "Quality uses SigLIP2 So400m and the stronger local fallback stack for harder images and documents."
+'''
+          if old not in text:
+              raise SystemExit('home profile-description marker missing')
+          home.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Guard the repaired contract
+        run: |
+          grep -F 'let shouldEnable = localModelProfile != .fast' Sources/LibrarianApp/Library/AppEntryPoint.swift
+          grep -F 'self.localEmbeddingsEnabled = storedProfile != .fast' Sources/LibrarianApp/Library/AppEntryPoint.swift
+          ! grep -F 'Toggle("Use downloaded local embeddings"' Sources/LibrarianApp/App/SimpleSettingsView.swift
+          grep -F 'Downloaded local AI follows the selected quality level' Sources/LibrarianApp/App/SimpleSettingsView.swift
+
+      - name: Commit repair
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Sources/LibrarianApp/Library/AppEntryPoint.swift \
+                  Sources/LibrarianApp/App/SimpleSettingsView.swift \
+                  Sources/LibrarianApp/Library/CleanerHomeView.swift
+          git diff --cached --quiet && exit 0
+          git commit -m 'Make quality profile control local AI'
+          git push origin HEAD:fix/app-does-not-work-as-intended
