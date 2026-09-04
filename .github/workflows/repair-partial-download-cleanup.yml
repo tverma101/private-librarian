@@ -1,0 +1,65 @@
+name: Repair failed download cleanup
+
+on:
+  push:
+    branches:
+      - fix/app-does-not-work-as-intended
+    paths:
+      - .github/workflows/repair-partial-download-cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/app-does-not-work-as-intended
+
+      - name: Patch failed download cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one patch target, found {count}")
+              target.write_text(text.replace(old, new, 1))
+
+          image = "scripts/provision_image_models.py"
+          replace_once(
+              image,
+              '''    except (OSError, ProvisioningError) as exc:\n        print(f"[{name}] failed: {exc}", file=sys.stderr)\n        if partial.exists():\n            print(f"  partial download preserved for inspection: {partial}", file=sys.stderr)\n        return False\n''',
+              '''    except Exception as exc:\n        # Hub/network exceptions are not OSError/ProvisioningError. Treat every\n        # ordinary provisioning exception as a clean failure instead of leaking\n        # a traceback and an unresumable multi-GB .partial-* directory. A new\n        # invocation always creates a fresh staging directory, so retaining the\n        # old one cannot resume the transfer. KeyboardInterrupt/SystemExit still\n        # escape because they are BaseException subclasses.\n        print(f"[{name}] failed: {exc}", file=sys.stderr)\n        if partial.exists() or partial.is_symlink():\n            if partial.is_dir() and not partial.is_symlink():\n                shutil.rmtree(partial, ignore_errors=True)\n            else:\n                try:\n                    partial.unlink()\n                except OSError:\n                    pass\n            print("  removed incomplete staged download; retry starts cleanly", file=sys.stderr)\n        return False\n''')
+
+          tests = "scripts/test_specialist_contract.py"
+          anchor = '''    def test_warm_encoders_use_mps_fp16_on_apple_silicon_hosts(self) -> None:\n'''
+          insert = '''    def test_legacy_download_failure_removes_unresumable_partial(self) -> None:\n        module = load_module(IMAGE_PROVISIONER, "private_librarian_image_failure_cleanup_test")\n\n        class FakeHub:\n            @staticmethod\n            def snapshot_download(**_kwargs):\n                raise RuntimeError("simulated network failure")\n\n        with tempfile.TemporaryDirectory() as directory:\n            root = Path(directory)\n            original_ensure_hf = module.ensure_hf\n            original_expected_lfs = module.expected_lfs_files\n            module.ensure_hf = lambda: FakeHub()\n            module.expected_lfs_files = lambda _hf, _spec: {}\n            try:\n                self.assertFalse(module.download_one("clip-vit-base-patch32", root))\n            finally:\n                module.ensure_hf = original_ensure_hf\n                module.expected_lfs_files = original_expected_lfs\n\n            self.assertEqual(list(root.glob(".clip-vit-base-patch32.partial-*")), [])\n\n    def test_warm_encoders_use_mps_fp16_on_apple_silicon_hosts(self) -> None:\n'''
+          replace_once(tests, anchor, insert)
+          PY
+
+      - name: Verify repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/provision_image_models.py scripts/test_specialist_contract.py
+          python3 scripts/test_specialist_contract.py
+          git diff --check
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/provision_image_models.py scripts/test_specialist_contract.py
+          git diff --cached --quiet && exit 0
+          git commit -m "Clean failed model download staging"
+          git push origin HEAD:fix/app-does-not-work-as-intended
