@@ -34,4 +34,20 @@ final class HuggingFaceModelSetupTests: XCTestCase {
             XCTAssertEqual(error as? HuggingFaceTokenStore.TokenError, .emptyToken)
         }
     }
+
+    func testInstallerStageProtocolParsesOnlyWellFormedRecords() {
+        XCTAssertEqual(
+            AppModelSetup.progress(from: "__LIBRARIAN_SETUP_STAGE__|models|Downloading and verifying models…"),
+            ModelSetupProgress(phase: "models", message: "Downloading and verifying models…"))
+        XCTAssertNil(AppModelSetup.progress(from: "pip install something"))
+        XCTAssertNil(AppModelSetup.progress(from: "__LIBRARIAN_SETUP_STAGE__|models|   "))
+        XCTAssertNil(AppModelSetup.progress(from: "__LIBRARIAN_SETUP_STAGE__||missing phase"))
+    }
+
+    func testSetupOperationCanBeCancelledBeforeLaunch() {
+        let operation = ModelSetupOperation()
+        XCTAssertFalse(operation.isCancellationRequested)
+        operation.cancel()
+        XCTAssertTrue(operation.isCancellationRequested)
+    }
 }
