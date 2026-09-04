@@ -88,17 +88,80 @@ public enum HuggingFaceTokenStore {
     }
 }
 
+public struct ModelSetupProgress: Sendable, Equatable {
+    public let phase: String
+    public let message: String
+
+    public init(phase: String, message: String) {
+        self.phase = phase
+        self.message = message
+    }
+}
+
+/// Cancellation handle for one explicit setup run. Access is lock-protected
+/// because the SwiftUI main actor requests cancellation while the provisioning
+/// process itself is owned by a detached utility task.
+public final class ModelSetupOperation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancellationRequested = false
+
+    public init() {}
+
+    public var isCancellationRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested
+    }
+
+    public func cancel() {
+        let runningProcess: Process?
+        lock.lock()
+        cancellationRequested = true
+        runningProcess = process
+        lock.unlock()
+
+        if runningProcess?.isRunning == true {
+            runningProcess?.terminate()
+        }
+    }
+
+    fileprivate func attach(_ process: Process) -> Bool {
+        lock.lock()
+        self.process = process
+        let alreadyCancelled = cancellationRequested
+        lock.unlock()
+        return !alreadyCancelled
+    }
+
+    fileprivate func detach(_ process: Process) {
+        lock.lock()
+        if self.process === process {
+            self.process = nil
+        }
+        lock.unlock()
+    }
+}
+
 public struct ModelSetupResult: Sendable, Equatable {
     public let succeeded: Bool
     public let status: Int32
     public let message: String
     public let output: String
+    public let cancelled: Bool
 
-    public init(succeeded: Bool, status: Int32, message: String, output: String) {
+    public init(
+        succeeded: Bool,
+        status: Int32,
+        message: String,
+        output: String,
+        cancelled: Bool = false
+    ) {
         self.succeeded = succeeded
         self.status = status
         self.message = message
         self.output = output
+        self.cancelled = cancelled
     }
 }
 
@@ -109,6 +172,7 @@ public struct ModelSetupResult: Sendable, Equatable {
 public enum AppModelSetup {
     public static let huggingFaceAccountURL = URL(string: "https://huggingface.co/settings/tokens")!
     public static let dinov3AgreementURL = URL(string: "https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m")!
+    static let progressPrefix = "__LIBRARIAN_SETUP_STAGE__|"
 
     public static func setupScriptURL() -> URL? {
         let fm = FileManager.default
@@ -175,13 +239,22 @@ public enum AppModelSetup {
         applicationSupportURL().appendingPathComponent("Models", isDirectory: true)
     }
 
-    public static func run(profile: LocalModelProfile, token: String?) async -> ModelSetupResult {
+    public static func run(
+        profile: LocalModelProfile,
+        token: String?,
+        operation: ModelSetupOperation = ModelSetupOperation(),
+        onProgress: (@Sendable (ModelSetupProgress) -> Void)? = nil
+    ) async -> ModelSetupResult {
         guard let script = setupScriptURL() else {
             return ModelSetupResult(
                 succeeded: false,
                 status: 127,
                 message: "The packaged model setup helper is missing. Reinstall Private Librarian.",
                 output: "")
+        }
+
+        if operation.isCancellationRequested {
+            return cancelledResult(output: "")
         }
 
         let profileName: String
@@ -194,11 +267,35 @@ public enum AppModelSetup {
         let appSupport = applicationSupportURL()
 
         return await Task.detached(priority: .utility) {
-            runBlocking(script: script, profile: profileName, token: trimmedToken, appSupport: appSupport)
+            runBlocking(
+                script: script,
+                profile: profileName,
+                token: trimmedToken,
+                appSupport: appSupport,
+                operation: operation,
+                onProgress: onProgress)
         }.value
     }
 
-    private static func runBlocking(script: URL, profile: String, token: String?, appSupport: URL) -> ModelSetupResult {
+    static func progress(from line: String) -> ModelSetupProgress? {
+        guard line.hasPrefix(progressPrefix) else { return nil }
+        let payload = line.dropFirst(progressPrefix.count)
+        guard let separator = payload.firstIndex(of: "|") else { return nil }
+        let phase = String(payload[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = String(payload[payload.index(after: separator)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !phase.isEmpty, !message.isEmpty else { return nil }
+        return ModelSetupProgress(phase: phase, message: message)
+    }
+
+    private static func runBlocking(
+        script: URL,
+        profile: String,
+        token: String?,
+        appSupport: URL,
+        operation: ModelSetupOperation,
+        onProgress: (@Sendable (ModelSetupProgress) -> Void)?
+    ) -> ModelSetupResult {
         let fm = FileManager.default
         do {
             try fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
@@ -213,7 +310,8 @@ public enum AppModelSetup {
         let logURL = fm.temporaryDirectory
             .appendingPathComponent("private-librarian-model-setup-\(UUID().uuidString).log")
         guard fm.createFile(atPath: logURL.path, contents: nil),
-              let logHandle = try? FileHandle(forWritingTo: logURL) else {
+              let logHandle = try? FileHandle(forWritingTo: logURL),
+              let readHandle = try? FileHandle(forReadingFrom: logURL) else {
             return ModelSetupResult(
                 succeeded: false,
                 status: 74,
@@ -221,6 +319,7 @@ public enum AppModelSetup {
                 output: "")
         }
         defer {
+            try? readHandle.close()
             try? logHandle.close()
             try? fm.removeItem(at: logURL)
         }
@@ -252,6 +351,12 @@ public enum AppModelSetup {
         let input = Pipe()
         process.standardInput = input
 
+        guard operation.attach(process) else {
+            try? input.fileHandleForWriting.close()
+            return cancelledResult(output: "")
+        }
+        defer { operation.detach(process) }
+
         do {
             try process.run()
         } catch {
@@ -263,13 +368,37 @@ public enum AppModelSetup {
                 output: "")
         }
 
+        if operation.isCancellationRequested, process.isRunning {
+            process.terminate()
+        }
+
         if let token, !token.isEmpty {
             // Stdin avoids putting the secret in shell history or argv.
             try? input.fileHandleForWriting.write(contentsOf: Data((token + "\n").utf8))
         }
         try? input.fileHandleForWriting.close()
+
+        var readOffset: UInt64 = 0
+        var pending = Data()
+        while process.isRunning {
+            drainProgress(
+                logURL: logURL,
+                readHandle: readHandle,
+                readOffset: &readOffset,
+                pending: &pending,
+                final: false,
+                onProgress: onProgress)
+            Thread.sleep(forTimeInterval: 0.15)
+        }
         process.waitUntilExit()
         try? logHandle.synchronize()
+        drainProgress(
+            logURL: logURL,
+            readHandle: readHandle,
+            readOffset: &readOffset,
+            pending: &pending,
+            final: true,
+            onProgress: onProgress)
 
         let data = (try? Data(contentsOf: logURL)) ?? Data()
         var output = String(data: data, encoding: .utf8) ?? ""
@@ -285,6 +414,9 @@ public enum AppModelSetup {
                 message: "Selected local models are installed and verified.",
                 output: output)
         }
+        if operation.isCancellationRequested {
+            return cancelledResult(output: output, status: status)
+        }
         let lastUsefulLine = output
             .split(separator: "\n")
             .map(String.init)
@@ -294,5 +426,58 @@ public enum AppModelSetup {
             status: status,
             message: lastUsefulLine ?? "Model setup failed with exit status \(status).",
             output: output)
+    }
+
+    private static func drainProgress(
+        logURL: URL,
+        readHandle: FileHandle,
+        readOffset: inout UInt64,
+        pending: inout Data,
+        final: Bool,
+        onProgress: (@Sendable (ModelSetupProgress) -> Void)?
+    ) {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: logURL.path)
+        let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+        if size > readOffset {
+            do {
+                try readHandle.seek(toOffset: readOffset)
+                if let chunk = try readHandle.read(upToCount: Int(size - readOffset)), !chunk.isEmpty {
+                    readOffset += UInt64(chunk.count)
+                    pending.append(chunk)
+                }
+            } catch {
+                // Progress is best-effort UI. The final setup result still comes
+                // from the process exit status and complete bounded log below.
+            }
+        }
+
+        while let newline = pending.firstIndex(of: 0x0A) {
+            let lineData = pending[..<newline]
+            pending.removeSubrange(...newline)
+            emitProgress(lineData: Data(lineData), onProgress: onProgress)
+        }
+        if final, !pending.isEmpty {
+            emitProgress(lineData: pending, onProgress: onProgress)
+            pending.removeAll(keepingCapacity: false)
+        }
+    }
+
+    private static func emitProgress(
+        lineData: Data,
+        onProgress: (@Sendable (ModelSetupProgress) -> Void)?
+    ) {
+        guard let line = String(data: lineData, encoding: .utf8)?
+            .trimmingCharacters(in: .newlines),
+              let progress = progress(from: line) else { return }
+        onProgress?(progress)
+    }
+
+    private static func cancelledResult(output: String, status: Int32 = 130) -> ModelSetupResult {
+        ModelSetupResult(
+            succeeded: false,
+            status: status,
+            message: "Model setup was stopped. Verified models were kept; unfinished staged downloads can be retried safely.",
+            output: output,
+            cancelled: true)
     }
 }
