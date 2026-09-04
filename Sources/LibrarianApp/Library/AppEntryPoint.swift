@@ -348,7 +348,7 @@ final class LibrarianModel: ObservableObject {
         openCatalogIfNeeded()
         refreshDashboard()
         if catalogReady {
-            reconcileAuthorizedSources()
+            log("library ready · live changes monitored · missing checks are manual")
         }
         if reprobeObserver == nil {
             reprobeObserver = NotificationCenter.default.addObserver(
@@ -851,7 +851,7 @@ final class LibrarianModel: ObservableObject {
         guard !authorized.isEmpty else { return }
 
         isReconciling = true
-        log("checking known files against authorized folders…")
+        log("checking known catalog paths under authorized folders…")
         Task.detached(priority: .utility) { [weak self, catalog, authorized] in
             let broker = SourceBroker()
             let rows = (try? catalog.allFiles(statuses: ["indexed"])) ?? []
@@ -887,8 +887,8 @@ final class LibrarianModel: ObservableObject {
                 guard let self else { return }
                 self.isReconciling = false
                 self.log(missingSnapshot == 0 && skippedSnapshot == 0
-                         ? "folder check complete · known files are current"
-                         : "folder check complete · \(missingSnapshot) file(s) moved or deleted"
+                         ? "missing check complete · known paths are current"
+                         : "missing check complete · \(missingSnapshot) known path(s) moved or deleted"
                            + (skippedSnapshot == 0 ? "" : " · \(skippedSnapshot) unreadable, kept as-is"))
                 self.refreshDashboard()
             }

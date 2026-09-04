@@ -151,7 +151,7 @@ struct MagicContentView: View {
         case .duplicates:
             return "Duplicate candidates only; nothing is deleted automatically."
         case .missing:
-            return "Catalog records whose originals are no longer available."
+            return "Known catalog paths; launch does not scan folders automatically."
         }
     }
 
@@ -477,7 +477,7 @@ struct MagicContentView: View {
         case .duplicates:
             FileExplorerView(title: "Duplicate candidates", subtitle: "Report-only results. Nothing is deleted.", files: model.sectionFiles)
         case .missing:
-            FileExplorerView(title: "Missing originals", subtitle: "Catalog records remain; originals are never reconstructed.", files: model.sectionFiles)
+            MissingFilesView()
         }
     }
 }
@@ -647,6 +647,51 @@ private struct FileExplorerView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+private struct MissingFilesView: View {
+    @EnvironmentObject private var model: LibrarianModel
+
+    private var hasCheckableSource: Bool {
+        model.sources.contains {
+            !model.pausedPaths.contains($0.path)
+                && !model.sourcesNeedingReauthorization.contains($0.path)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Check only when you need it")
+                        .font(.headline)
+                    Text("This checks the catalog's known paths under authorized folders. It does not discover new files or recursively analyze folders.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                if model.isReconciling {
+                    ProgressView("Checking known paths…")
+                        .controlSize(.small)
+                        .font(.caption)
+                } else {
+                    Button("Check known paths") {
+                        model.reconcileAuthorizedSources()
+                    }
+                    .disabled(model.isIndexing || !hasCheckableSource)
+                    .help("Check only catalog entries already known under the currently authorized folders")
+                }
+            }
+            .padding(12)
+            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            FileExplorerView(
+                title: "Missing originals",
+                subtitle: "Catalog records remain; originals are never reconstructed.",
+                files: model.sectionFiles)
         }
     }
 }

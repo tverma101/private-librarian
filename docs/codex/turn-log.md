@@ -1,5 +1,17 @@
 # Codex turn log
 
+## 2026-09-04 — make missing-file checks explicit
+
+- `scope`: respond to the Missing view's automatic “folder check complete” behavior without enumerating or opening user folders.
+- `finding`: startup called `reconcileAuthorizedSources()`. That pass did not discover new files or run extraction, but it still performed a filesystem identity check for every indexed catalog row under each authorized root, making launch feel like a whole-folder scan.
+- `implementation`: removed the automatic startup reconciliation; launch now starts the live change monitor and states that missing checks are manual. Added a Missing view action, `Check known paths`, with copy that limits it to existing catalog paths and distinguishes it from discovery/analysis. Renamed status messages from “folder check” to “missing check.”
+- `changed_files`: `Sources/LibrarianApp/Library/AppEntryPoint.swift`, `Sources/LibrarianApp/Library/LibraryViews.swift`, and this turn log.
+- `validation`: strict Swift 6 warnings-as-errors build passed; full Swift suite passed 225 tests with 0 failures; local E2E passed all ten checks; Xcode package/install passed; installed entitlements, deep signature, universal `x86_64 arm64`, and DMG verification passed; Computer Use confirmed the installed Library/Smart Groups tree and the new `library ready · live changes monitored · missing checks are manual` status. The Missing-view AX read hit two bounded native-pipe failures, so no live Missing-screen claim is made.
+- `evidence_state`: implementation=yes; tested=yes; packaged=yes; installed=yes; live launch/log check=yes; Library/Smart Groups AX=yes; Missing AX=no because the native pipe closed; folder-by-folder inspection=no; user-confirmed=no.
+- `residual_gap`: the explicit check still validates known rows when the user requests it; it does not discover new files. Full discovery remains the separate Analyze action.
+- `memory_decision`: existing Private Librarian memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-09-04.
+
 ## 2026-09-04 — repair the library workspace UI
 
 - `scope`: inspect the installed Advanced Library screen through native accessibility/source review, without enumerating or opening user folders, then repair the concrete UI defects visible in the supplied state.
