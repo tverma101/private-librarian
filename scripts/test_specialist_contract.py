@@ -66,6 +66,31 @@ class SpecialistContractTests(unittest.TestCase):
         )
         self.assertTrue(provisioner.MODELS["dinov3-vitb16-lvd1689m"].get("gated"))
 
+    def test_warm_encoders_use_mps_fp16_on_apple_silicon_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = load_worker(Path(directory))
+            fp16_marker = object()
+
+            class FakeMPS:
+                @staticmethod
+                def is_available() -> bool:
+                    return True
+
+            class FakeBackends:
+                mps = FakeMPS()
+
+            class FakeTorch:
+                backends = FakeBackends()
+                float16 = fp16_marker
+
+            target, dtype = module._warm_encoder_target(FakeTorch(), platform="darwin")
+            self.assertEqual(target, "mps")
+            self.assertIs(dtype, fp16_marker)
+
+            target, dtype = module._warm_encoder_target(FakeTorch(), platform="linux")
+            self.assertEqual(target, "cpu")
+            self.assertIsNone(dtype)
+
     def test_transformers_pooling_output_is_unwrapped_before_normalization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             module = load_worker(Path(directory))
