@@ -13,14 +13,14 @@ extension LibrarianModel {
                 LocalModelStack.siglip2Base.id,
                 LocalModelStack.miniCPM.id,
             ]
-            return isTier2Provisioned && required.allSatisfy(specialistProvisionedIDs.contains)
+            return isTier2Provisioned && required.allSatisfy(specialistReadyIDs.contains)
         case .quality:
             let required = [
                 LocalModelStack.siglip2So400m.id,
                 LocalModelStack.miniCPM.id,
                 LocalModelStack.lfm.id,
             ]
-            return isTier2Provisioned && required.allSatisfy(specialistProvisionedIDs.contains)
+            return isTier2Provisioned && required.allSatisfy(specialistReadyIDs.contains)
         }
     }
 }

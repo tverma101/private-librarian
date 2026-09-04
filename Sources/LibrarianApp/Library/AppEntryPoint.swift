@@ -193,7 +193,7 @@ final class LibrarianModel: ObservableObject {
     @Published private(set) var catalogReady = false
     @Published private(set) var catalogError: String?
     @Published private(set) var isTier2Provisioned = false
-    @Published private(set) var specialistProvisionedIDs: Set<String> = []
+    @Published private(set) var specialistReadyIDs: Set<String> = []
     @Published private(set) var tier2Status = "Checking local model readiness…"
     @Published private(set) var isSearching = false
     @Published private(set) var searchFoundNothing = false
@@ -388,7 +388,9 @@ final class LibrarianModel: ObservableObject {
         modelStatusTask = Task { @MainActor [weak self] in
             let readiness = await work.value
             guard let self, self.modelStatusGeneration == generation else { return }
-            self.specialistProvisionedIDs = readiness.specialistIDs
+            // A downloaded checkpoint is not enough: the selected profile is
+            // Ready only when its actual offline runtime preflight succeeds.
+            self.specialistReadyIDs = readiness.specialistRuntimeIDs
             self.isTier2Provisioned = readiness.coreML
                 || readiness.legacyRuntime
                 || !readiness.specialistRuntimeIDs.isEmpty

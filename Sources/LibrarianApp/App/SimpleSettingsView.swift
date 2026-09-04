@@ -186,7 +186,7 @@ struct SimpleSettingsView: View {
                             ForEach(selectedModels) { descriptor in
                                 modelRow(descriptor)
                             }
-                            if !model.specialistProvisionedIDs.contains(LocalModelStack.dinov3.id) {
+                            if !model.specialistReadyIDs.contains(LocalModelStack.dinov3.id) {
                                 Text("Optional gated DINOv3 visual clustering is not required for this quality level.")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
@@ -285,16 +285,16 @@ struct SimpleSettingsView: View {
 
     @ViewBuilder
     private func modelRow(_ descriptor: LocalModelDescriptor) -> some View {
-        let provisioned = model.specialistProvisionedIDs.contains(descriptor.id)
+        let ready = model.specialistReadyIDs.contains(descriptor.id)
         HStack(alignment: .top, spacing: 9) {
-            Image(systemName: provisioned ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(provisioned ? .green : .secondary)
+            Image(systemName: ready ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(ready ? .green : .secondary)
                 .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(modelDisplayName(descriptor))
                     .font(.caption.weight(.medium))
-                Text(modelStatusText(descriptor, provisioned: provisioned))
+                Text(modelStatusText(descriptor, ready: ready))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -390,15 +390,15 @@ struct SimpleSettingsView: View {
         }
     }
 
-    private func modelStatusText(_ descriptor: LocalModelDescriptor, provisioned: Bool) -> String {
+    private func modelStatusText(_ descriptor: LocalModelDescriptor, ready: Bool) -> String {
         #if os(macOS)
         if descriptor.id == LocalModelStack.paddleOCR.id {
             return "Native macOS Vision OCR is used instead on this platform"
         }
         #endif
-        if provisioned { return "Installed" }
+        if ready { return "Ready" }
         if descriptor.gated { return "Optional · Hugging Face approval required" }
-        return "Not installed"
+        return "Needs setup"
     }
 
     private func shellQuote(_ value: String) -> String {
