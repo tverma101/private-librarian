@@ -22,8 +22,10 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import platform
+import select
 import statistics
 import subprocess
 import sys
@@ -54,11 +56,24 @@ def repository_revision() -> str:
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
+    """Nearest-rank percentile so small samples never hide the slowest call."""
     if not values:
         return None
     ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, int(len(ordered) * fraction) - 1))
+    index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * fraction) - 1))
     return round(ordered[index], 3)
+
+
+def latency_summary(values: list[float]) -> dict[str, float | None]:
+    if not values:
+        return {"mean": None, "p50": None, "p95": None, "min": None, "max": None}
+    return {
+        "mean": round(statistics.fmean(values), 3),
+        "p50": percentile(values, 0.50),
+        "p95": percentile(values, 0.95),
+        "min": round(min(values), 3),
+        "max": round(max(values), 3),
+    }
 
 
 def process_rss_mb(pid: int) -> float | None:
@@ -102,11 +117,20 @@ def screenshot_png(variant: int = 0) -> bytes:
 def request(proc: subprocess.Popen[str], payload: dict, timeout: float = 180.0) -> tuple[dict, float]:
     if proc.stdin is None or proc.stdout is None:
         raise RuntimeError("worker pipes are unavailable")
+    if proc.poll() is not None:
+        stderr = proc.stderr.read() if proc.stderr is not None else ""
+        raise RuntimeError(f"specialist worker already exited: {stderr[-1000:]}")
+
     started = time.perf_counter()
     proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
     proc.stdin.flush()
-    # The production worker is request/response serial. readline therefore
-    # measures preprocessing + MPS/CPU execution + copy-back + JSON encoding.
+
+    # The worker is request/response serial. Use select on POSIX so a bad MPS
+    # shape/OOM cannot leave the benchmark blocked forever on readline().
+    ready, _, _ = select.select([proc.stdout], [], [], max(0.001, timeout))
+    if not ready:
+        raise TimeoutError(f"specialist worker did not respond within {timeout:.1f}s")
+
     line = proc.stdout.readline()
     elapsed_ms = (time.perf_counter() - started) * 1000
     if not line:
@@ -168,13 +192,16 @@ def main() -> int:
     parser.add_argument("--models-dir", type=Path,
                         help="specialist model root; defaults to LIBRARIAN_SPECIALIST_MODELS_DIR or repo Models/specialists")
     parser.add_argument("--samples", type=int, default=5,
-                        help="warm repetitions per sequential/batch measurement")
+                        help="measured warm repetitions per sequential/batch shape")
     parser.add_argument("--batch-sizes",
                         help="comma-separated bounded batch sizes; defaults are profile-specific")
+    parser.add_argument("--timeout", type=float, default=180.0,
+                        help="maximum seconds for any one worker request")
     parser.add_argument("--output", type=Path, help="optional JSON output path")
     args = parser.parse_args()
 
     samples = max(1, min(50, args.samples))
+    timeout = max(1.0, min(600.0, args.timeout))
     model_id, expected_dim = PROFILE_MODELS[args.profile]
     batch_sizes = parse_batch_sizes(args.batch_sizes, args.profile)
     models_dir = (
@@ -188,7 +215,7 @@ def main() -> int:
     provenance = model_root / "provenance.json"
     if not provenance.is_file():
         payload = {
-            "schema": 1,
+            "schema": 2,
             "status": "unavailable",
             "profile": args.profile,
             "model": model_id,
@@ -196,6 +223,7 @@ def main() -> int:
         }
         encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
         if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(encoded)
         print(encoded, end="")
         return 2
@@ -227,12 +255,14 @@ def main() -> int:
             "model": model_id,
             "data_b64": encoded_fixtures[0],
         }
-        cold, cold_ms = request(proc, single_payload)
+        cold, cold_ms = request(proc, single_payload, timeout=timeout)
         validate_single(cold, model_id, expected_dim)
         rss_after_load = process_rss_mb(proc.pid)
 
+        # The cold call above loads the model and warms the batch-1 graph. These
+        # sequential calls therefore represent steady-state single-image work.
         for _ in range(samples):
-            result, elapsed = request(proc, single_payload)
+            result, elapsed = request(proc, single_payload, timeout=timeout)
             validate_single(result, model_id, expected_dim)
             sequential_latencies.append(elapsed)
         sequential_total_s = sum(sequential_latencies) / 1000
@@ -248,22 +278,26 @@ def main() -> int:
                     for index, item_id in enumerate(ids)
                 ],
             }
+
+            # MPS/Transformers may compile/cache a new graph for each tensor
+            # shape. Warm this exact batch shape once and exclude that cost from
+            # steady-state throughput so the first call cannot poison the mean.
+            warm_result, shape_warmup_ms = request(proc, payload, timeout=timeout)
+            validate_batch(warm_result, model_id, expected_dim, ids)
+
             latencies: list[float] = []
             for _ in range(samples):
-                result, elapsed = request(proc, payload)
+                result, elapsed = request(proc, payload, timeout=timeout)
                 validate_batch(result, model_id, expected_dim, ids)
                 latencies.append(elapsed)
             total_seconds = sum(latencies) / 1000
             throughput = (samples * size) / total_seconds if total_seconds > 0 else 0.0
             batch_results.append({
                 "batch_size": size,
+                "shape_warmup_latency_ms": round(shape_warmup_ms, 3),
                 "calls": samples,
                 "images": samples * size,
-                "latency_ms": {
-                    "mean": round(statistics.fmean(latencies), 3),
-                    "p50": percentile(latencies, 0.50),
-                    "p95": percentile(latencies, 0.95),
-                },
+                "latency_ms": latency_summary(latencies),
                 "images_per_second": round(throughput, 3),
                 "throughput_vs_sequential": round(
                     throughput / sequential_throughput, 3
@@ -272,7 +306,7 @@ def main() -> int:
             })
 
         payload = {
-            "schema": 1,
+            "schema": 2,
             "status": "measured",
             "identity": {
                 "commit": repository_revision(),
@@ -296,16 +330,14 @@ def main() -> int:
             "rss_after_model_load_mb": rss_after_load,
             "sequential": {
                 "calls": samples,
-                "latency_ms": {
-                    "mean": round(statistics.fmean(sequential_latencies), 3),
-                    "p50": percentile(sequential_latencies, 0.50),
-                    "p95": percentile(sequential_latencies, 0.95),
-                },
+                "latency_ms": latency_summary(sequential_latencies),
                 "images_per_second": round(sequential_throughput, 3),
             },
             "batches": batch_results,
             "notes": [
-                "All timings include JSONL IPC, base64 decode, image preprocessing, model execution, copy-back, and JSON serialization.",
+                "All measured timings include JSONL IPC, base64 decode, image preprocessing, model execution, copy-back, and JSON serialization.",
+                "Each batch shape is warmed once before measured calls; shape_warmup_latency_ms is reported separately.",
+                "p95 uses nearest-rank semantics so small sample sets do not hide the slowest observed request.",
                 "process_rss_mb is a best-effort process RSS snapshot, not a guarantee of total unified/MPS memory.",
                 "Batch results are benchmark evidence only; production indexing remains sequential until target-Mac results justify a batch size.",
             ],
