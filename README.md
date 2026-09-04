@@ -23,7 +23,7 @@ Private Librarian is a native macOS app that indexes folders you choose, underst
 - Learns inspectable, reversible deterministic rules from repeated corrections.
 - Watches authorized folders with FSEvents and incrementally refreshes changed files while retaining their security-scoped access leases.
 - Offers opt-in local Whisper transcription when a local executable/model passes preflight.
-- Can explicitly provision pinned local Hugging Face models from Settings, including gated repositories after the user saves an approved Hugging Face token in macOS Keychain.
+- Can explicitly provision pinned local Hugging Face models from the main Analyze flow or Settings, including gated repositories after the user saves an approved Hugging Face token in macOS Keychain.
 - Presents search, Smart Groups, screenshots, school, projects, documents, media, similarity, duplicates, review items, and missing files in a native SwiftUI app.
 
 ## Smart Groups: deliberately not 4,902 AI folders
@@ -53,7 +53,7 @@ The main rule is:
 2. Models/parsers receive broker-owned bytes, derived text, feature data, or decoded PCM rather than source filesystem authority.
 3. Writable index/search state belongs in the encrypted catalog.
 4. Organization is virtual until the user confirms **Apply to Finder**. `OrganizationApplier` is the narrow mutation boundary; it validates destinations against the active security-scoped root, journals moves, and provides Undo.
-5. The packaged app has **outbound network-client permission only so an explicit Settings model-install action can reach package/model hosts**. It has no network-server/listener entitlement. Normal indexing and inference force local/offline model loading.
+5. The packaged app has **outbound network-client permission only so an explicit model-setup action can reach the pinned runtime/model hosts**. It has no network-server/listener entitlement. Normal indexing and inference force local/offline model loading.
 6. Hugging Face credentials supplied in the app are stored in macOS Keychain and passed to the provisioning path over stdin/in-memory rather than argv, shell history, UserDefaults, manifests, or setup logs.
 7. Saved folder access fails closed when a security-scoped bookmark cannot be restored. The UI marks that source as needing reauthorization instead of silently falling back to a raw path.
 
@@ -61,19 +61,19 @@ See [`docs/SECURITY.md`](docs/SECURITY.md) and [`docs/ARCHITECTURE.md`](docs/ARC
 
 ## Requirements
 
-The tested development target is:
+The tested target is:
 
 - macOS 14 or newer;
-- Apple silicon;
-- Xcode 16 / Swift Package Manager for development builds.
+- Apple silicon for the self-contained local-AI bootstrap path;
+- Xcode 16 / Swift Package Manager only for development builds.
 
-The default app works without downloaded AI model weights by using Apple Vision and deterministic/local-native paths. Optional Python-backed embedding/VLM models require a compatible Python bootstrap/runtime.
+The default Fast mode works without downloaded AI model weights by using Apple Vision and deterministic/local-native paths. It does not require Python, Homebrew, Xcode, or a Hugging Face account.
 
-### Current clean-Mac installer limitation
+When the user explicitly selects Balanced or Quality and the required models are not installed, **Set Up & Analyze** opens one setup sheet. On Apple-silicon Macs the setup helper can prepare its own app-private Python runtime from a pinned `python-build-standalone` release, verifies the archive SHA-256 before extraction, installs the isolated dependencies, provisions the selected pinned checkpoints, refreshes readiness, and then continues the requested analysis automatically.
 
-The in-app model installer is real, but the current package **does not yet bundle its own Python distribution by default**. It looks for a usable Python installation to create the isolated model runtime. A pristine consumer Mac without a usable Python may therefore show a setup failure until a compatible runtime is installed or the app is packaged with `--include-runtime`.
+DINOv3 is upstream-gated, so its first installation still requires the user to approve the model terms on Hugging Face and provide a read token. The app stores that token in macOS Keychain. If the gated checkpoint is already installed, subsequent setup does not require the token merely to install remaining public checkpoints.
 
-Do not describe model provisioning as completely self-contained until a pinned, distributable bootstrap runtime is shipped and verified.
+Automatic Python bootstrap is currently supported only on Apple-silicon macOS. An Intel Mac must provide a compatible Python 3.10+ through `LIBRARIAN_BOOTSTRAP_PYTHON` or use a package that already includes a compatible runtime.
 
 ## Quick start
 
@@ -129,6 +129,7 @@ CI additionally checks:
 - OCR, screenshots, similarity, media/transcripts, learning, and Smart Group anti-spam behavior;
 - SQL-side bounded catalog views and batched top-K vector scoring;
 - Hugging Face stdin-only app credential plumbing and secret scans;
+- the clean-Mac runtime bootstrap's exact Python version/release/SHA-256 plus a no-curl-pipe-shell invariant;
 - offline-only production inference worker settings;
 - packaged read/write bookmark + network-client entitlements while rejecting network-server capability;
 - Golden Library quality checks.
@@ -143,15 +144,19 @@ Apple Vision provides the zero-download OCR/image-analysis layer.
 
 ### In the app
 
-Open **Settings → Hugging Face access**:
+The normal path is deliberately short:
 
-1. create or paste a Hugging Face access token;
-2. accept/request access for gated repositories such as DINOv3 on Hugging Face;
-3. save the token in macOS Keychain;
-4. choose Fast, Balanced, or Quality;
-5. click **Install Selected Models**.
+1. choose a folder;
+2. choose **Fast**, **Balanced**, or **Quality**;
+3. press **Analyze Folder** when that level is ready, or **Set Up & Analyze** when its local models are missing;
+4. for a first DINOv3 install, follow the sheet's Hugging Face approval/token links once;
+5. press **Install & Continue**; setup refreshes model readiness and resumes the analysis automatically.
+
+**Use Fast Instead** is always available before setup starts and gives an immediate zero-download path. Provider IDs, token replacement, model folders, and the Terminal fallback are kept under **Settings → Advanced local AI details** rather than being part of the normal cleanup workflow.
 
 The installer preflights every checkpoint that actually needs downloading before starting large transfers. This means an unapproved gated model fails early rather than after several public models have already downloaded. Downloaded snapshots are pinned to immutable revisions, staged before activation, and recorded with SHA-256 provenance manifests. Normal inference remains local-files-only.
+
+The Apple-silicon runtime bootstrap is also pinned. `setup_models.sh` downloads one exact `python-build-standalone` archive from the dated upstream release, verifies its repository-pinned SHA-256 with `/usr/bin/shasum`, and only then extracts/uses it. CI rejects a move to an unpinned `latest` URL or curl-pipe-shell pattern.
 
 ### Terminal fallback
 
@@ -177,20 +182,21 @@ Local transcription is opt-in in the app. It only becomes available when the con
 
 ## Remaining host-only release validation
 
-Hosted CI cannot manufacture a genuine App Sandbox extension token created by a human selecting a folder in `NSOpenPanel`, nor can it use the owner's private Hugging Face account approval.
+Hosted CI cannot manufacture a genuine App Sandbox extension token created by a human selecting a folder in `NSOpenPanel`, nor can it use the owner's private Hugging Face account approval. It also does not perform multi-gigabyte consumer model provisioning in the packaged sandbox on every run.
 
 Before calling the app daily-use ready, perform a packaged-app smoke that:
 
-1. selects a real folder through the system picker;
-2. indexes it and confirms analysis does not mutate files;
-3. reviews and confirms one Apply operation and then Undo;
-4. quits and relaunches the packaged app;
-5. confirms the saved folder can still be read and remains writable only through explicit Apply;
-6. creates/changes a file and confirms a later FSEvent reindexes it;
-7. pauses/removes/reauthorizes the folder and confirms old access is released/replaced;
-8. saves an approved Hugging Face token in Settings and performs one real gated DINOv3 provisioning smoke.
+1. launches on a clean Apple-silicon user account without relying on Homebrew/global Python;
+2. selects a real folder through the system picker;
+3. indexes it in Fast mode and confirms analysis does not mutate files;
+4. switches to Balanced, completes the in-app pinned runtime/model setup with an approved gated account, and confirms analysis resumes automatically;
+5. reviews and confirms one Apply operation and then Undo;
+6. quits and relaunches the packaged app;
+7. confirms the saved folder can still be read and remains writable only through explicit Apply;
+8. creates/changes a file and confirms a later FSEvent reindexes it;
+9. pauses/removes/reauthorizes the folder and confirms old access is released/replaced.
 
-That is an OS/account acceptance boundary, not something synthetic CI can honestly substitute for.
+That is an OS/account/distribution acceptance boundary, not something synthetic CI can honestly substitute for.
 
 ## Repository map
 
