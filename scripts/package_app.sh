@@ -366,9 +366,14 @@ cleanup_dmg_source() {
 trap cleanup_dmg_source EXIT
 
 # `dist/` is a release-output directory, not a second installation location.
-# Move any old app with this bundle identifier from the old packager to an
-# ignored, recoverable archive before creating the new DMG. Names are not a
-# safe discriminator because Finder copies and older scripts used variants.
+# Move any old app with this bundle identifier from the old packager to a
+# recoverable archive outside the repository before creating the new DMG.
+# Keeping an archived .app under .build still makes Computer Use/Launch
+# Services discover it as a second install, even though it is ignored by Git.
+# The archive therefore receives a non-`.app` suffix as well as living outside
+# the repository.
+# Names are not a safe discriminator because Finder copies and older scripts
+# used variants.
 LEGACY_ARCHIVE_DIR=""
 while IFS= read -r -d '' stale_app; do
     [ "$stale_app" = "$APP_BUNDLE" ] && continue
@@ -376,12 +381,25 @@ while IFS= read -r -d '' stale_app; do
         "$stale_app/Contents/Info.plist" 2>/dev/null || true)"
     if [ "$bundle_id" = "$BUNDLE_IDENTIFIER" ]; then
         if [ -z "$LEGACY_ARCHIVE_DIR" ]; then
-            LEGACY_ARCHIVE_DIR="$(mktemp -d "$ROOT_DIR/.build/private-librarian-legacy-dist.XXXXXX")"
+            LEGACY_ARCHIVE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/private-librarian-legacy-dist.XXXXXX")"
         fi
-        mv "$stale_app" "$LEGACY_ARCHIVE_DIR/"
-        echo "moved stale generated bundle to: $LEGACY_ARCHIVE_DIR/$(basename "$stale_app")"
+        archive_name="$(basename "$stale_app").archive"
+        mv "$stale_app" "$LEGACY_ARCHIVE_DIR/$archive_name"
+        echo "moved stale generated bundle to: $LEGACY_ARCHIVE_DIR/$archive_name"
     fi
 done < <(find "$OUT_DIR" -maxdepth 1 \( -type d -o -type l \) -name '*.app' -print0)
+
+# Migrate archives produced by earlier versions of this script as well. This
+# is recoverable housekeeping and prevents an otherwise correct package from
+# continuing to appear as a duplicate app in native app discovery.
+while IFS= read -r -d '' archived_app; do
+    if [ -z "$LEGACY_ARCHIVE_DIR" ]; then
+        LEGACY_ARCHIVE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/private-librarian-legacy-dist.XXXXXX")"
+    fi
+    archive_name="$(basename "$archived_app").archive"
+    mv "$archived_app" "$LEGACY_ARCHIVE_DIR/$archive_name"
+    echo "moved old in-repository app archive to: $LEGACY_ARCHIVE_DIR/$archive_name"
+done < <(find "$ROOT_DIR/.build" -type d -path '*/private-librarian-legacy-dist.*/PrivateLibrarian.app' -print0 2>/dev/null)
 
 MODEL_PYTHON=""
 SPECIALIST_MODELS=()

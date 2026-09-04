@@ -29,8 +29,12 @@ traditional Keychain service instead.
 The normal package path also stages the app under ignored `.build/` output,
 leaves only `PrivateLibrarian-VERSION.dmg` in `dist/`, and installs one
 canonical `/Applications/PrivateLibrarian.app`. Old generated app bundles are
-moved to a recoverable ignored archive instead of being left as duplicate
-launch targets.
+moved to a recoverable temporary archive outside the repository instead of
+being left under `.build/` as duplicate native app-discovery targets. The
+archived bundle is renamed with a non-`.app` suffix so Computer Use and
+Launch Services do not treat the recovery copy as an installed application.
+The packager also migrates archives created by older versions of the script out of
+`.build/` on the next package run.
 
 The packager also compiles the checked-in `AppIcon` asset catalog into
 `Assets.car` and `AppIcon.icns`, and verifies both resources before signing.

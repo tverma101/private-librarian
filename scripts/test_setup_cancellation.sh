@@ -25,10 +25,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-FAKE_PYTHON="$TEMP_DIR/fake-python"
+SPACE_ROOT="$TEMP_DIR/path with spaces"
+FAKE_RUNTIME="$SPACE_ROOT/runtime"
+FAKE_PYTHON="$FAKE_RUNTIME/bin/python3"
 CHILD_PID_FILE="$TEMP_DIR/child.pid"
 LOG_FILE="$TEMP_DIR/setup.log"
 
+mkdir -p "$(dirname "$FAKE_PYTHON")"
 cat > "$FAKE_PYTHON" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -49,11 +52,11 @@ exec /bin/sleep 30
 EOF
 chmod +x "$FAKE_PYTHON"
 
-export LIBRARIAN_MODEL_PYTHON="$FAKE_PYTHON"
-export LIBRARIAN_APP_SUPPORT_DIR="$TEMP_DIR/app-support"
-export LIBRARIAN_MODELS_DIR="$TEMP_DIR/models"
-export LIBRARIAN_SPECIALIST_MODELS_DIR="$TEMP_DIR/models/specialists"
-export LIBRARIAN_MODEL_RUNTIME_DIR="$TEMP_DIR/runtime"
+unset LIBRARIAN_MODEL_PYTHON
+export LIBRARIAN_APP_SUPPORT_DIR="$SPACE_ROOT/app-support"
+export LIBRARIAN_MODELS_DIR="$SPACE_ROOT/models"
+export LIBRARIAN_SPECIALIST_MODELS_DIR="$SPACE_ROOT/models/specialists"
+export LIBRARIAN_MODEL_RUNTIME_DIR="$FAKE_RUNTIME"
 export FAKE_CHILD_PID_FILE="$CHILD_PID_FILE"
 
 /bin/bash "$ROOT_DIR/scripts/setup_models.sh" --models-only --all >"$LOG_FILE" 2>&1 &

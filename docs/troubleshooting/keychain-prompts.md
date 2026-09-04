@@ -20,6 +20,14 @@ There were two separate causes:
 Repeated SwiftUI/AppKit initialization could also retry a failed lookup. The
 runtime now caches one success or failure per process.
 
+The optional Hugging Face token was a third prompt source: opening Settings
+automatically read the token even though DINOv3 setup had not been requested.
+Settings now displays an inert status until the user explicitly starts the
+optional gated-model install. The token is read from Keychain only on that
+button action. Normal app-owned catalog reads also set a non-interactive
+authentication context, so a stale ACL returns a visible recovery state rather
+than presenting a login-keychain sheet during startup or view refresh.
+
 ## Recovery
 
 `scripts/package_app.sh` now archives the app through Xcode and automatically
@@ -63,8 +71,9 @@ copy launches from `/Applications/PrivateLibrarian.app`. The Swift suite and
 strict-concurrency warnings-as-errors build cover the catalog-keychain call
 path and the package remains sandboxed. The old login-keychain ACL was
 inspected and confirmed to reference the removed CLI identity; startup itself
-does not prompt, and post-migration prompt-free operation still requires the
-user to approve the one explicit migration action.
+does not prompt, and opening Settings does not read the optional token. A
+post-migration prompt-free operation still requires the user to approve the one
+explicit legacy migration action.
 
 ## Residual boundary
 

@@ -17,6 +17,7 @@ from unittest.mock import patch
 SCRIPT = Path(__file__).with_name("specialist.py")
 PROVISIONER = Path(__file__).with_name("provision_specialist_models.py")
 IMAGE_PROVISIONER = Path(__file__).with_name("provision_image_models.py")
+EMBED = Path(__file__).with_name("embed.py")
 MODEL = "siglip2-so400m-naflex"
 
 
@@ -73,6 +74,14 @@ class SpecialistContractTests(unittest.TestCase):
         self.assertNotIn("siglip2-so400m-naflex", provisioner.selected_for_profile("balanced"))
         self.assertIn("siglip2-so400m-naflex", provisioner.selected_for_profile("quality"))
         self.assertNotIn("siglip2-base-naflex", provisioner.selected_for_profile("quality"))
+
+    def test_lfm_runtime_contract_declares_its_image_processor_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = load_worker(Path(directory))
+            self.assertIn("torchvision", module.RUNTIME_MODULES["lfm2.5-vl-3b"])
+            requirements = SCRIPT.with_name("model-requirements.txt").read_text(encoding="utf-8")
+            self.assertIn("torchvision==0.28.0", requirements)
+            module._CACHE.clear()
 
     def test_specialist_activation_restores_previous_on_final_rename_failure(self) -> None:
         module = load_module(PROVISIONER, "private_librarian_specialist_activation_test")
@@ -137,6 +146,28 @@ class SpecialistContractTests(unittest.TestCase):
             self.assertEqual(destination.joinpath("marker").read_text(), "old")
             self.assertTrue(partial.is_dir())
             self.assertEqual(list(root.glob(".model.previous-*")), [])
+
+    def test_legacy_download_failure_removes_unresumable_partial(self) -> None:
+        module = load_module(IMAGE_PROVISIONER, "private_librarian_image_failure_cleanup_test")
+
+        class FakeHub:
+            @staticmethod
+            def snapshot_download(**_kwargs):
+                raise RuntimeError("simulated network failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original_ensure_hf = module.ensure_hf
+            original_expected_lfs = module.expected_lfs_files
+            module.ensure_hf = lambda: FakeHub()
+            module.expected_lfs_files = lambda _hf, _spec: {}
+            try:
+                self.assertFalse(module.download_one("clip-vit-base-patch32", root))
+            finally:
+                module.ensure_hf = original_ensure_hf
+                module.expected_lfs_files = original_expected_lfs
+
+            self.assertEqual(list(root.glob(".clip-vit-base-patch32.partial-*")), [])
 
     def test_warm_encoders_use_mps_fp16_on_apple_silicon_hosts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -220,6 +251,54 @@ class SpecialistContractTests(unittest.TestCase):
                 pooler_output = object()
 
             self.assertIs(module._embedding_tensor(FullSiglipOutput()), marker)
+
+    def test_offline_workers_do_not_write_bytecode_into_readonly_bundle(self) -> None:
+        specialist = load_module(SCRIPT, "private_librarian_bytecode_specialist_test")
+        embed = load_module(EMBED, "private_librarian_bytecode_embed_test")
+        self.assertTrue(specialist.sys.dont_write_bytecode)
+        self.assertTrue(embed.sys.dont_write_bytecode)
+
+    def test_runtime_imports_retry_mac_eintr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            specialist = load_worker(Path(directory))
+            state = {"first": True}
+
+            def flaky_specialist_operation():
+                if state.pop("first", False):
+                    raise InterruptedError(4, "interrupted system call")
+                return "ok"
+
+            result = specialist._retry_interrupted(flaky_specialist_operation)
+            self.assertEqual(result, "ok")
+
+            embed = load_module(EMBED, "private_librarian_eintr_embed_test")
+            state = {"first": True}
+
+            def flaky_embed_operation():
+                if state.pop("first", False):
+                    raise InterruptedError(4, "interrupted system call")
+                return "ok"
+
+            result = embed._retry_interrupted(flaky_embed_operation)
+            self.assertEqual(result, "ok")
+
+    def test_runtime_check_retries_mac_eintr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            specialist = load_worker(Path(directory))
+            calls = []
+
+            def flaky_import(name: str):
+                calls.append(name)
+                if len(calls) == 1:
+                    raise InterruptedError(4, "interrupted system call")
+                return object()
+
+            with patch.object(specialist.importlib, "import_module", side_effect=flaky_import):
+                ready, message = specialist.runtime_check("siglip2-base-naflex")
+
+            self.assertTrue(ready, message)
+            self.assertEqual(calls[0], "PIL")
+            self.assertEqual(calls.count("PIL"), 2)
 
     def test_full_verification_detects_mutation_after_status_probe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

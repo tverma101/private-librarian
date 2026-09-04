@@ -409,7 +409,7 @@ fi
     exit 1
 }
 
-PY_VERSION="$($PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
+PY_VERSION="$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
 echo "Using model Python $PY_VERSION: $PYTHON"
 
 if [ "$INSTALL_RUNTIME" -eq 1 ]; then

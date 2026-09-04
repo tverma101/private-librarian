@@ -25,6 +25,9 @@ from pathlib import Path
 
 import os
 ROOT = Path(__file__).resolve().parent.parent
+# The packaged helper is read-only. Avoid import-time .pyc writes into either
+# the app bundle or the isolated runtime while loading Transformers modules.
+sys.dont_write_bytecode = True
 MODELS_DIR = Path(os.environ.get(
     "LIBRARIAN_MODELS_DIR",
     str(Path.home() / "Library/Containers/com.tejas.private-librarian/Data/Library/Application Support/PrivateLibrarian/Models"),
@@ -58,6 +61,25 @@ MODEL_PROVENANCE = {
 _clip_model = None
 _minilm_model = None
 _trusted_models = set()
+
+
+def _retry_interrupted(operation, *, attempts: int = 4):
+    """Retry Transformers imports when macOS reports an EINTR directory scan."""
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except InterruptedError:
+            if attempt + 1 >= attempts:
+                raise
+    raise AssertionError("unreachable retry loop")
+
+
+def _runtime_classes(module_name: str, *names: str):
+    def load():
+        module = __import__(module_name, fromlist=list(names))
+        return tuple(getattr(module, name) for name in names)
+
+    return _retry_interrupted(load)
 
 
 def _sha256_file(path: Path) -> str:
@@ -165,7 +187,7 @@ def _load_clip():
     global _clip_model
     if _clip_model is not None:
         return _clip_model
-    from transformers import CLIPModel, CLIPTokenizer
+    CLIPModel, CLIPTokenizer = _runtime_classes("transformers", "CLIPModel", "CLIPTokenizer")
 
     _clip_model = CLIPModel.from_pretrained(
         str(MODELS_DIR / "clip-vit-base-patch32"), local_files_only=True
@@ -218,7 +240,7 @@ def _load_minilm():
     global _minilm_model
     if _minilm_model is not None:
         return _minilm_model
-    from sentence_transformers import SentenceTransformer
+    (SentenceTransformer,) = _runtime_classes("sentence_transformers", "SentenceTransformer")
 
     _minilm_model = SentenceTransformer(
         str(MODELS_DIR / "all-MiniLM-L6-v2"), device="cpu", trust_remote_code=False
@@ -306,7 +328,7 @@ def _embed_clip_text_bytes(data: bytes):
         clip_model = _load_clip()
         tok = getattr(clip_model, "_clip_tokenizer", None)
         if tok is None:
-            from transformers import CLIPTokenizer
+            (CLIPTokenizer,) = _runtime_classes("transformers", "CLIPTokenizer")
             tok = CLIPTokenizer.from_pretrained(str(dest), local_files_only=True)
             clip_model._clip_tokenizer = tok  # type: ignore[attr-defined]
         with torch.no_grad():

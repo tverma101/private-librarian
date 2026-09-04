@@ -23,6 +23,24 @@ helper without changing the checkpoint. In Transformers 5, SigLIP2's
 raw `.float()` call on that wrapper is a runtime failure even though the
 snapshot and Python dependencies are valid.
 
+On macOS, the same Transformers import can occasionally be interrupted while
+its model-package discovery walks the filesystem, producing
+`[Errno 4] Interrupted system call`. The packaged specialist and legacy
+embedding workers now disable bytecode writes (their bundle is read-only) and
+retry only that bounded `InterruptedError` at both readiness and lazy import
+boundaries. A persistent import failure still reaches the worker's JSON error
+boundary; it is not reported as a false-ready model.
+
+The LFM2.5-VL processor additionally uses the pinned `torchvision` runtime
+package. `scripts/model-requirements.txt` declares the version paired with the
+pinned Torch build; omitting it makes readiness look successful while a real
+`classify_image` call fails during image preprocessing.
+
+The setup shell path is also quoted end to end. This matters for the real
+container path under `Application Support`, which contains spaces; the
+runtime probe and models-only path must invoke the configured Python
+executable rather than split it into multiple shell words.
+
 PaddleOCR-VL is a separate platform case: its upstream runtime currently does
 not cover the target macOS Apple-silicon path, so the app reports it as
 unsupported and continues with native Vision OCR. macOS provisioning and
@@ -120,3 +138,9 @@ A final packaged-app clean-user smoke is still required for the real public
 runtime/model download path. A separate private-account smoke is needed only if
 the optional DINOv3 path is being advertised as supported; it is not a normal
 consumer release blocker.
+
+The current local installation has the pinned Balanced and Quality stacks and
+their isolated runtime provisioned and verified: SigLIP2 Base NaFlex, So400m,
+MiniCPM-V 4.6, and LFM2.5-VL. The runtime also has the pinned `torchvision`
+processor dependency. Gated DINOv3 remains an explicit setup choice; its
+absence is reported as gated rather than silently treated as ready.

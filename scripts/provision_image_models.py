@@ -37,6 +37,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -402,10 +403,24 @@ def download_one(name: str, models_dir: Path, *, force: bool = False) -> bool:
             print(f"  preserved previous directory at {archived}")
         print(f"[{name}] installed: {destination}")
         return True
-    except (OSError, ProvisioningError) as exc:
+    except Exception as exc:
+        # Hugging Face/network failures are not limited to OSError and
+        # ProvisioningError. Treat every ordinary provisioning exception as a
+        # clean failure instead of leaking a traceback and leaving an
+        # unresumable multi-gigabyte staging directory behind. A new invocation
+        # always creates a fresh staging directory, so retaining the old one
+        # cannot resume the transfer. KeyboardInterrupt/SystemExit still escape
+        # because they are BaseException subclasses.
         print(f"[{name}] failed: {exc}", file=sys.stderr)
-        if partial.exists():
-            print(f"  partial download preserved for inspection: {partial}", file=sys.stderr)
+        if partial.exists() or partial.is_symlink():
+            if partial.is_dir() and not partial.is_symlink():
+                shutil.rmtree(partial, ignore_errors=True)
+            else:
+                try:
+                    partial.unlink()
+                except OSError:
+                    pass
+            print("  removed incomplete staged download; retry starts cleanly", file=sys.stderr)
         return False
 
 

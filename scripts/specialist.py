@@ -35,8 +35,45 @@ os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("DO_NOT_TRACK", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Packaged scripts live in a read-only app bundle, and Transformers can attempt
+# to create bytecode caches while importing model-specific modules. Disabling
+# those writes keeps the offline worker deterministic and avoids unwritable
+# __pycache__ operations on macOS.
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _retry_interrupted(operation, *, attempts: int = 4):
+    """Retry filesystem-backed imports when macOS reports EINTR.
+
+    Transformers 5 dynamically scans its model package during import. On macOS
+    that scan can raise ``InterruptedError`` after thousands of directory
+    entries, leaving the worker with a false model-unavailable result. The
+    import machinery removes a failed top-level module from ``sys.modules``,
+    so retrying the class lookup is safe and does not duplicate a loaded model.
+    Keep the retry bounded so a persistent OS/runtime fault still reaches the
+    JSON error boundary.
+    """
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except InterruptedError:
+            if attempt + 1 >= attempts:
+                raise
+    raise AssertionError("unreachable retry loop")
+
+
+def _transformers_classes(*names: str):
+    def load():
+        module = importlib.import_module("transformers")
+        return tuple(getattr(module, name) for name in names)
+
+    return _retry_interrupted(load)
+
+
+def _import_runtime_module(name: str):
+    return _retry_interrupted(lambda: importlib.import_module(name))
 
 
 def _model_roots() -> list[Path]:
@@ -86,7 +123,7 @@ RUNTIME_MODULES = {
     "dinov3-vitb16-lvd1689m": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
     "paddleocr-vl-1.6": ("PIL", "paddle", "paddleocr"),
     "minicpm-v-4.6": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
-    "lfm2.5-vl-3b": ("PIL", "torch", "transformers", "accelerate", "safetensors"),
+    "lfm2.5-vl-3b": ("PIL", "torch", "torchvision", "transformers", "accelerate", "safetensors"),
 }
 
 ALLOWED_CATEGORIES = {
@@ -138,7 +175,7 @@ def runtime_check(model_id: str) -> tuple[bool, str]:
         return False, f"unknown specialist model {model_id!r}"
     for module in modules:
         try:
-            importlib.import_module(module)
+            _import_runtime_module(module)
         except Exception as exc:
             return False, f"missing or unusable Python module {module}: {exc}"
     return True, "required specialist runtime modules are available"
@@ -496,7 +533,7 @@ def _load_siglip(key: str):
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
     _prepare_for_model(key)
     import torch
-    from transformers import AutoModel, AutoProcessor
+    AutoModel, AutoProcessor = _transformers_classes("AutoModel", "AutoProcessor")
     path = str(_model_dir(key))
     processor = AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
     target, load_kwargs = _warm_encoder_load_kwargs(torch)
@@ -601,7 +638,7 @@ def _load_dino():
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
     _prepare_for_model(key)
     import torch
-    from transformers import AutoImageProcessor, AutoModel
+    AutoImageProcessor, AutoModel = _transformers_classes("AutoImageProcessor", "AutoModel")
     path = str(_model_dir(key))
     processor = AutoImageProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
     target, load_kwargs = _warm_encoder_load_kwargs(torch)
@@ -727,7 +764,7 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
     prompt = _classification_prompt(existing)
     path = str(_model_dir(model_id))
     if model_id == "minicpm-v-4.6":
-        from transformers import AutoModel, AutoTokenizer
+        AutoModel, AutoTokenizer = _transformers_classes("AutoModel", "AutoTokenizer")
         cached = _CACHE.get(model_id)
         if cached is None:
             tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=True)
@@ -741,7 +778,8 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
         response = model.chat(image=image, msgs=[{"role": "user", "content": prompt}], tokenizer=tokenizer,
                               sampling=False, temperature=0)
         return _extract_json(response[0] if isinstance(response, tuple) else str(response))
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    AutoModelForImageTextToText, AutoProcessor = _transformers_classes(
+        "AutoModelForImageTextToText", "AutoProcessor")
     cached = _CACHE.get(model_id)
     if cached is None:
         trust = model_id == "lfm2.5-vl-3b"

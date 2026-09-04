@@ -12,7 +12,7 @@ struct SimpleSettingsView: View {
     @State private var showAdvancedModelDetails = false
     @State private var huggingFaceToken = ""
     @State private var hasHuggingFaceToken = false
-    @State private var huggingFaceStatus = "Checking Keychain…"
+    @State private var huggingFaceStatus = "Not checked; only read when you install an optional gated model"
     @State private var copiedCommand = false
     @State private var installingGatedModel = false
     @State private var gatedModelOperation: ModelSetupOperation?
@@ -191,7 +191,7 @@ struct SimpleSettingsView: View {
                                 HStack(spacing: 8) {
                                     Button(gatedInstallButtonTitle) { installDINOv3() }
                                         .buttonStyle(.borderedProminent)
-                                        .disabled(installingGatedModel || (!hasHuggingFaceToken && huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                                        .disabled(installingGatedModel)
                                     if installingGatedModel {
                                         ProgressView().controlSize(.small)
                                         Text(gatedModelProgress?.message ?? "Preparing DINOv3…")
@@ -277,7 +277,6 @@ struct SimpleSettingsView: View {
         .frame(width: 620, height: 650)
         .padding(4)
         .onAppear {
-            refreshHuggingFaceTokenState()
             model.refreshModelStatus()
         }
         .sheet(isPresented: $showModelSetup) {
@@ -383,18 +382,6 @@ struct SimpleSettingsView: View {
         }
     }
 
-    private func refreshHuggingFaceTokenState() {
-        do {
-            hasHuggingFaceToken = try HuggingFaceTokenStore.load() != nil
-            huggingFaceStatus = hasHuggingFaceToken
-                ? "Optional access token stored in macOS Keychain"
-                : "No optional access token saved"
-        } catch {
-            hasHuggingFaceToken = false
-            huggingFaceStatus = error.localizedDescription
-        }
-    }
-
     private var gatedInstallButtonTitle: String {
         if installingGatedModel { return "Installing DINOv3…" }
         if !huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -408,15 +395,24 @@ struct SimpleSettingsView: View {
         guard !installingGatedModel else { return }
         do {
             let entered = huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            let token: String
             if !entered.isEmpty {
                 try HuggingFaceTokenStore.save(entered)
                 huggingFaceToken = ""
                 hasHuggingFaceToken = true
                 huggingFaceStatus = "Optional access token stored in macOS Keychain"
-            }
-            guard let token = try HuggingFaceTokenStore.load(), !token.isEmpty else {
-                gatedModelStatus = "Save a Hugging Face read token after accepting DINOv3 access first."
-                return
+                token = entered
+            } else {
+                // This is the only normal UI path that reads the optional
+                // token. Browsing Settings must never touch Keychain because
+                // an old ACL could otherwise produce a prompt on every visit.
+                guard let stored = try HuggingFaceTokenStore.load(), !stored.isEmpty else {
+                    gatedModelStatus = "Enter a Hugging Face read token, or save one first, after accepting DINOv3 access."
+                    return
+                }
+                hasHuggingFaceToken = true
+                huggingFaceStatus = "Optional access token found in macOS Keychain"
+                token = stored
             }
 
             let operation = ModelSetupOperation()

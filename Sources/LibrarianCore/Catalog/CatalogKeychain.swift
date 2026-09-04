@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 /// Stores the SQLCipher catalog key in an app-owned macOS Keychain item. The
@@ -146,7 +147,11 @@ public enum CatalogKeychain {
     }
 
     public static func load() throws -> Data? {
-        try load(service: service)
+        // Startup must never present an authentication sheet. If an old ACL
+        // does not trust this signed bundle, return the error to the visible
+        // recovery UI and cache it for this process instead of prompting on
+        // every SwiftUI lifecycle callback.
+        try load(service: service, allowsInteraction: false)
     }
 
     private static func loadLegacy() throws -> Data? {
@@ -154,17 +159,22 @@ public enum CatalogKeychain {
         // immediately copied to the app-owned Keychain namespace; a
         // denial is cached by loadOrCreate() for the rest of this process so
         // SwiftUI lifecycle callbacks cannot show a prompt loop.
-        try load(service: legacyService)
+        try load(service: legacyService, allowsInteraction: true)
     }
 
-    private static func load(service: String) throws -> Data? {
-        let query: [String: Any] = [
+    private static func load(service: String, allowsInteraction: Bool) throws -> Data? {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
+        if !allowsInteraction {
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            query[kSecUseAuthenticationContext as String] = context
+        }
         var out: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &out)
         if status == errSecItemNotFound { return nil }
@@ -218,11 +228,14 @@ public enum CatalogKeychain {
     /// move it aside before this unless the library is intentionally abandoned.
     /// The legacy login-keychain item is never touched here.
     public static func destroyAppOwned() throws {
-        let query: [String: Any] = [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        query[kSecUseAuthenticationContext as String] = context
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeyError.osStatus(status)

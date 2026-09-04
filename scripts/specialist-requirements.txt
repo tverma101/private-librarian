@@ -1,5 +1,6 @@
 # Shared isolated runtime for the optional specialist stack.
-# The base model-requirements file supplies torch, transformers, Pillow, NumPy,
+# The base model-requirements file supplies torch, torchvision, transformers,
+# Pillow, NumPy,
 # and huggingface_hub; these additions cover Transformers loading/offload APIs.
 -r model-requirements.txt
 accelerate==1.12.0
