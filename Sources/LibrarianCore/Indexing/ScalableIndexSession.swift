@@ -161,6 +161,50 @@ public final class ScalableIndexSession: @unchecked Sendable {
             return LocalModelBridge.PersistentWorker()
         }()
         defer { worker?.close() }
+
+        // SigLIP batching is an optional scan-time optimization. We verify the
+        // same provider preflight once per root scan; when runtime/model setup
+        // is unavailable, the ordinary Indexer path remains untouched.
+        let batchPrefetchProvider: (any PrefetchingBatchImageEmbeddingProvider)? = {
+            guard let provider = indexer.embeddingProvider
+                as? any PrefetchingBatchImageEmbeddingProvider,
+                  provider.preflight.available else { return nil }
+            return provider
+        }()
+        defer { batchPrefetchProvider?.clearPrefetchedImages() }
+
+        /// Build a bounded, path-free batch item only when the current source
+        /// generation actually needs semantic image work. Unchanged files that
+        /// already carry this provider's vector remain zero-inference rescans.
+        func prefetchItem(
+            for discovered: DiscoveredItem,
+            provider: any PrefetchingBatchImageEmbeddingProvider
+        ) -> SpecialistImageEmbeddingBatchItem? {
+            guard cancellation?.isCancelled != true,
+                  let identity = try? broker.identity(at: discovered.path),
+                  identity.kind == .image, !identity.isSymlink,
+                  identity.size > 0,
+                  identity.size <= Int64(SpecialistModelBridge.maxImageBytes),
+                  !EvidenceExtractor.isCloudPlaceholder(at: discovered.path) else { return nil }
+
+            let fileID = FileID.make(identity: identity)
+            if let stored = try? catalog.storedState(forPath: discovered.path),
+               stored.status == "indexed",
+               stored.size == identity.size,
+               stored.mtime == identity.mtime.timeIntervalSince1970,
+               (try? catalog.hasEmbedding(fileID: fileID, model: provider.imageModelID)) == true {
+                return nil
+            }
+
+            guard let bytes = try? broker.completeSnapshot(
+                discovered.path,
+                maxBytes: Int64(SpecialistModelBridge.maxImageBytes)),
+                  !bytes.isEmpty else { return nil }
+            // FileID is a SHA-256-derived opaque identifier; the raw source
+            // path never crosses the specialist JSONL boundary.
+            return SpecialistImageEmbeddingBatchItem(id: fileID, bytes: bytes)
+        }
+
         let sessionCatalog = catalog
         // Similarity invalidation is batched across the whole scan: the
         // rebuild loads the entire node+edge graph, so running it once per
@@ -194,29 +238,66 @@ public final class ScalableIndexSession: @unchecked Sendable {
             var seenPaths: [String] = []
             seenPaths.reserveCapacity(batch.count)
 
-            for item in batch {
+            // Keep the prefetch cache bounded to one measured micro-batch and
+            // consume it immediately through the normal Indexer authority. On
+            // image-dense libraries this gives Base groups of 4 and So400m
+            // groups of 2; mixed windows simply fall back for singleton images.
+            let windowSize = min(
+                SpecialistModelBridge.maxBatchImages,
+                max(1, batchPrefetchProvider?.preferredBatchSize ?? 1))
+            var windowStart = 0
+            while windowStart < batch.count {
                 guard cancellation?.isCancelled != true else { break }
-                scanned += 1
-                seenPaths.append(item.path)
-                do {
-                    let didProcess = try indexer.indexOneForScan(
-                        path: item.path, worker: worker, updateSimilarity: false)
-                    if didProcess {
-                        processed += 1
-                        if let current = try? broker.identity(at: item.path) {
-                            changedIDs.insert(FileID.make(identity: current))
+                let windowEnd = min(batch.count, windowStart + windowSize)
+                let window = Array(batch[windowStart..<windowEnd])
+
+                if let provider = batchPrefetchProvider {
+                    provider.clearPrefetchedImages()
+                    var prefetchedItems: [SpecialistImageEmbeddingBatchItem] = []
+                    prefetchedItems.reserveCapacity(window.count)
+                    var rawBytes = 0
+                    for item in window {
+                        guard cancellation?.isCancelled != true else { break }
+                        guard let candidate = prefetchItem(for: item, provider: provider),
+                              candidate.bytes.count <= SpecialistModelBridge.maxBatchRawBytes - rawBytes else {
+                            continue
                         }
+                        rawBytes += candidate.bytes.count
+                        prefetchedItems.append(candidate)
                     }
-                } catch {
-                    try? catalog.recordError(
-                        opaqueRef: FileID.workerError(scanned), stage: "index",
-                        message: String(describing: error).prefix(200).description)
+                    // Batch size 1 has no throughput upside and would only add
+                    // a cache round trip; leave singleton work to Indexer.
+                    if prefetchedItems.count >= 2 {
+                        _ = provider.primeImageBatch(prefetchedItems, timeout: 60)
+                    }
                 }
-                let isPaused = cancellation?.reason == .paused
-                onProgress?(Progress(rootPath: root.path, scanned: scanned, processed: processed,
-                                     lastPath: (item.path as NSString).lastPathComponent,
-                                     cancelled: cancellation?.isCancelled == true,
-                                     paused: isPaused))
+
+                for item in window {
+                    guard cancellation?.isCancelled != true else { break }
+                    scanned += 1
+                    seenPaths.append(item.path)
+                    do {
+                        let didProcess = try indexer.indexOneForScan(
+                            path: item.path, worker: worker, updateSimilarity: false)
+                        if didProcess {
+                            processed += 1
+                            if let current = try? broker.identity(at: item.path) {
+                                changedIDs.insert(FileID.make(identity: current))
+                            }
+                        }
+                    } catch {
+                        try? catalog.recordError(
+                            opaqueRef: FileID.workerError(scanned), stage: "index",
+                            message: String(describing: error).prefix(200).description)
+                    }
+                    let isPaused = cancellation?.reason == .paused
+                    onProgress?(Progress(rootPath: root.path, scanned: scanned, processed: processed,
+                                         lastPath: (item.path as NSString).lastPathComponent,
+                                         cancelled: cancellation?.isCancelled == true,
+                                         paused: isPaused))
+                }
+                batchPrefetchProvider?.clearPrefetchedImages()
+                windowStart = windowEnd
             }
 
             // Every discovered path is marked on disk, including unchanged
