@@ -65,6 +65,11 @@ MAX_IMAGE_PIXELS = 50_000_000
 MAX_IMAGE_EDGE = 16_384
 MAX_TEXT_CHARS = 16_000
 MAX_OUTPUT_CHARS = 8_192
+# Batch inference is benchmark-only for now. Keep both the count and aggregate
+# decoded byte budget bounded so a benchmark request cannot turn into an
+# accidental unified-memory stress test before we have target-Mac measurements.
+MAX_BATCH_IMAGES = 8
+MAX_BATCH_RAW_BYTES = 64 * 1024 * 1024
 
 MODEL_SPECS = {
     "siglip2-base-naflex": ("google/siglip2-base-patch16-naflex", "b53b807"),
@@ -427,9 +432,9 @@ def _embedding_tensor(value):
     """Extract a tensor from the output variants used by Transformers.
 
     Transformers 5 changed SigLIP's ``get_*_features`` helpers to return
-    ``BaseModelOutputWithPooling`` instead of a raw tensor.  Older releases
-    and the full ``SiglipOutput`` use different field names, so keep the
-    compatibility handling in one place before normalisation.
+    ``BaseModelOutputWithPooling`` instead of a raw tensor. Older releases and
+    the full ``SiglipOutput`` use different field names, so keep compatibility
+    handling in one place before normalization.
     """
     for attribute in ("image_embeds", "text_embeds", "pooler_output"):
         candidate = getattr(value, attribute, None)
@@ -450,20 +455,36 @@ def _embedding_tensor(value):
     return value
 
 
-def _normalize_tensor(vector) -> list[float]:
+def _normalize_tensor_rows(vector) -> list[list[float]]:
+    """L2-normalize one or more embedding rows without collapsing the batch."""
     vector = _embedding_tensor(vector)
     if hasattr(vector, "detach"):
         vector = vector.detach()
-    if getattr(vector, "ndim", 1) > 1:
-        vector = vector[0]
-    vector = vector.float().cpu()
-    norm = float(vector.norm(p=2))
-    if not math.isfinite(norm) or norm <= 0:
+    ndim = getattr(vector, "ndim", 1)
+    if ndim == 1:
+        vector = vector.unsqueeze(0)
+    elif ndim != 2:
+        raise ValueError("embedding output must be rank 1 or 2")
+    vector = vector.float()
+    norms = vector.norm(p=2, dim=-1, keepdim=True)
+    norm_values = norms.detach().float().cpu().reshape(-1).tolist()
+    if not norm_values or any(not math.isfinite(float(value)) or float(value) <= 0 for value in norm_values):
         raise ValueError("non-finite/zero embedding")
-    values = (vector / norm).tolist()
-    if not values or any(not math.isfinite(float(v)) for v in values):
-        raise ValueError("invalid embedding values")
-    return [float(v) for v in values]
+    rows = (vector / norms).cpu().tolist()
+    normalized: list[list[float]] = []
+    for row in rows:
+        values = [float(value) for value in row]
+        if not values or any(not math.isfinite(value) for value in values):
+            raise ValueError("invalid embedding values")
+        normalized.append(values)
+    return normalized
+
+
+def _normalize_tensor(vector) -> list[float]:
+    rows = _normalize_tensor_rows(vector)
+    if len(rows) != 1:
+        raise ValueError("single embedding operation returned multiple rows")
+    return rows[0]
 
 
 def _load_siglip(key: str):
@@ -488,12 +509,14 @@ def _load_siglip(key: str):
     return model, processor
 
 
-def _siglip_image(image, model_id: str) -> dict:
+def _siglip_images(images, model_id: str) -> list[list[float]]:
+    if not images or len(images) > MAX_BATCH_IMAGES:
+        raise ValueError(f"SigLIP batch must contain 1..{MAX_BATCH_IMAGES} images")
     import torch
     model, processor = _load_siglip(model_id)
     with torch.inference_mode():
         inputs = _move_encoder_inputs(
-            processor(images=image, return_tensors="pt"), model, torch)
+            processor(images=images, return_tensors="pt"), model, torch)
         if hasattr(model, "get_image_features"):
             vector = model.get_image_features(**inputs)
         else:
@@ -503,7 +526,14 @@ def _siglip_image(image, model_id: str) -> dict:
                 vector = getattr(output, "pooler_output", None)
             if vector is None:
                 raise RuntimeError("SigLIP2 runtime exposed no image embedding")
-    values = _normalize_tensor(vector)
+    rows = _normalize_tensor_rows(vector)
+    if len(rows) != len(images):
+        raise RuntimeError("SigLIP2 batch output count did not match input count")
+    return rows
+
+
+def _siglip_image(image, model_id: str) -> dict:
+    values = _siglip_images([image], model_id)[0]
     return {"model": model_id, "space": f"{model_id}-joint", "dim": len(values), "vector": values}
 
 
@@ -525,6 +555,42 @@ def _siglip_text(text: str, model_id: str) -> dict:
                 raise RuntimeError("SigLIP2 runtime exposed no text embedding")
     values = _normalize_tensor(vector)
     return {"model": model_id, "space": f"{model_id}-joint", "dim": len(values), "vector": values}
+
+
+def _siglip_image_batch(request: dict, model_id: str) -> dict:
+    raw_items = request.get("items")
+    if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= MAX_BATCH_IMAGES:
+        raise ValueError(f"items must contain 1..{MAX_BATCH_IMAGES} batch entries")
+    ids: list[str] = []
+    images = []
+    total_raw_bytes = 0
+    seen_ids: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise ValueError("each batch entry must be an object")
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id or len(item_id) > 128:
+            raise ValueError("batch ids must be non-empty strings up to 128 characters")
+        if item_id in seen_ids:
+            raise ValueError("batch ids must be unique")
+        seen_ids.add(item_id)
+        raw, image = _decode_image(str(item.get("data_b64", "")))
+        total_raw_bytes += len(raw)
+        if total_raw_bytes > MAX_BATCH_RAW_BYTES:
+            raise ValueError("batch decoded image bytes exceed the 64 MiB aggregate ceiling")
+        ids.append(item_id)
+        images.append(image)
+
+    rows = _siglip_images(images, model_id)
+    return {
+        "model": model_id,
+        "space": f"{model_id}-joint",
+        "count": len(rows),
+        "items": [
+            {"id": item_id, "dim": len(values), "vector": values}
+            for item_id, values in zip(ids, rows)
+        ],
+    }
 
 
 def _load_dino():
@@ -730,6 +796,11 @@ def _handle(request: dict) -> dict:
             raise ValueError("model is not a configured SigLIP encoder")
         _, image = _decode_image(str(request.get("data_b64", "")))
         return _siglip_image(image, model_id)
+    if op == "siglip_image_batch":
+        model_id = str(request.get("model", "siglip2-so400m-naflex"))
+        if model_id not in SIGLIP_MODELS:
+            raise ValueError("model is not a configured SigLIP encoder")
+        return _siglip_image_batch(request, model_id)
     if op == "siglip_text":
         model_id = str(request.get("model", "siglip2-so400m-naflex"))
         if model_id not in SIGLIP_MODELS:
@@ -767,6 +838,8 @@ def main() -> int:
             "memory_policy": "11.50-GB-ceiling; warm-encoders-only; transient-exclusive; MPS-fp16",
             "warm_encoder_backend": "mps-fp16-when-available; cpu-fp32-fallback",
             "semantic_encoder_policy": "profile-exclusive-base-or-so400m",
+            "max_siglip_benchmark_batch": MAX_BATCH_IMAGES,
+            "max_siglip_benchmark_raw_bytes": MAX_BATCH_RAW_BYTES,
         }))
         return 0
     if args.runtime_check:
