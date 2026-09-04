@@ -77,11 +77,12 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
-      - name: Local specialist runtime, auth, and memory contract
+      - name: Local specialist runtime, auth, cancellation, and memory contract
         shell: bash
         run: |
           set -euo pipefail
           bash -n scripts/setup_models.sh
+          bash scripts/test_setup_cancellation.sh
           python3 -m py_compile scripts/specialist.py scripts/provision_specialist_models.py scripts/provision_image_models.py
           python3 scripts/test_specialist_contract.py
           python3 scripts/specialist.py --syntax-check | tee specialist-contract.json
