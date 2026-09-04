@@ -218,15 +218,15 @@ struct SimpleSettingsView: View {
     }
 
     private var qualityReady: Bool {
-        model.localModelProfile == .fast || model.isTier2Provisioned
+        model.isLocalModelProfileReady(model.localModelProfile)
     }
 
     private var qualityStatusText: String {
         if model.localModelProfile == .fast {
             return "Fast works immediately with built-in macOS analysis."
         }
-        if model.isTier2Provisioned {
-            return "Downloaded local AI is ready and normal analysis runs offline."
+        if qualityReady {
+            return "This quality level's downloaded local AI is ready and normal analysis runs offline."
         }
         return "Set it up here or let Set Up & Analyze handle it from the main window."
     }
