@@ -51,7 +51,10 @@ public struct SpecialistEvidence: Sendable, Equatable {
 /// Bounded bridge to `scripts/specialist.py`.
 /// The protocol accepts broker-owned bytes or derived text only; source paths are never sent.
 public final class SpecialistModelBridge: @unchecked Sendable {
-    public static let siglipDimension = 1152
+    public static let siglipBaseDimension = 768
+    public static let siglipSo400mDimension = 1152
+    /// Compatibility name for the original So400m-only bridge.
+    public static let siglipDimension = siglipSo400mDimension
     public static let dinoDimension = 768
     public static let maxImageBytes = 64 * 1024 * 1024
 
@@ -185,23 +188,42 @@ public final class SpecialistModelBridge: @unchecked Sendable {
             dependencies: [descriptor.runtime])
     }
 
-    public func embedSigLIPImage(_ bytes: Data, timeout: TimeInterval = 30) -> EmbeddingVector? {
-        guard bytes.count > 0, bytes.count <= Self.maxImageBytes,
-              Self.isProvisioned(LocalModelStack.siglip2), let worker else { return nil }
-        let request: [String: Any] = ["op": "siglip_image", "data_b64": bytes.base64EncodedString()]
-        guard let object = worker.call(request, timeout: timeout), object["error"] == nil,
-              let data = Self.vectorData(object, expectedDimension: Self.siglipDimension) else { return nil }
-        return EmbeddingVector(spaceID: Self.siglipSpaceID, dim: Self.siglipDimension, data: data)
+    public static func siglipDimension(for descriptor: LocalModelDescriptor) -> Int? {
+        switch descriptor.id {
+        case LocalModelStack.siglip2Base.id: return siglipBaseDimension
+        case LocalModelStack.siglip2So400m.id: return siglipSo400mDimension
+        default: return nil
+        }
     }
 
-    public func embedSigLIPText(_ text: String, timeout: TimeInterval = 20) -> EmbeddingVector? {
+    public func embedSigLIPImage(_ bytes: Data,
+                                 model: LocalModelDescriptor = LocalModelStack.siglip2So400m,
+                                 timeout: TimeInterval = 30) -> EmbeddingVector? {
+        guard model.capability == .imageSemantic,
+              let dimension = Self.siglipDimension(for: model),
+              bytes.count > 0, bytes.count <= Self.maxImageBytes,
+              Self.isProvisioned(model), let worker else { return nil }
+        let request: [String: Any] = [
+            "op": "siglip_image", "model": model.id,
+            "data_b64": bytes.base64EncodedString(),
+        ]
+        guard let object = worker.call(request, timeout: timeout), object["error"] == nil,
+              let data = Self.vectorData(object, expectedDimension: dimension) else { return nil }
+        return EmbeddingVector(spaceID: Self.siglipSpaceID(for: model), dim: dimension, data: data)
+    }
+
+    public func embedSigLIPText(_ text: String,
+                                model: LocalModelDescriptor = LocalModelStack.siglip2So400m,
+                                timeout: TimeInterval = 20) -> EmbeddingVector? {
         let clipped = String(text.prefix(16_000))
-        guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              Self.isProvisioned(LocalModelStack.siglip2), let worker else { return nil }
-        guard let object = worker.call(["op": "siglip_text", "text": clipped], timeout: timeout),
-              object["error"] == nil,
-              let data = Self.vectorData(object, expectedDimension: Self.siglipDimension) else { return nil }
-        return EmbeddingVector(spaceID: Self.siglipSpaceID, dim: Self.siglipDimension, data: data)
+        guard model.capability == .imageSemantic,
+              let dimension = Self.siglipDimension(for: model),
+              !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              Self.isProvisioned(model), let worker else { return nil }
+        let request: [String: Any] = ["op": "siglip_text", "model": model.id, "text": clipped]
+        guard let object = worker.call(request, timeout: timeout), object["error"] == nil,
+              let data = Self.vectorData(object, expectedDimension: dimension) else { return nil }
+        return EmbeddingVector(spaceID: Self.siglipSpaceID(for: model), dim: dimension, data: data)
     }
 
     public func embedDINOImage(_ bytes: Data, timeout: TimeInterval = 25) -> EmbeddingVector? {
@@ -254,8 +276,13 @@ public final class SpecialistModelBridge: @unchecked Sendable {
             modelID: model.id)
     }
 
+    public static func siglipSpaceID(for descriptor: LocalModelDescriptor) -> String {
+        "siglip2-joint:\(descriptor.id):\(descriptor.revisionPrefix):naflex-v1"
+    }
+
+    /// Compatibility identity for the original So400m-only provider.
     public static var siglipSpaceID: String {
-        "siglip2-joint:\(LocalModelStack.siglip2.revisionPrefix):naflex-v1"
+        siglipSpaceID(for: LocalModelStack.siglip2So400m)
     }
     public static var dinoSpaceID: String {
         "dinov3-visual:\(LocalModelStack.dinov3.revisionPrefix):vitb16-v1"
@@ -480,18 +507,31 @@ public final class SpecialistModelBridge: @unchecked Sendable {
 /// SigLIP2 semantic provider. DINOv3 is deliberately separate because its visual space is not
 /// cross-modal and must never be compared with SigLIP vectors.
 public final class SpecialistSigLIP2EmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
-    public let providerID = "specialist:siglip2-so400m-naflex@cc24074:naflex-v1"
+    public let providerID: String
+    public let model: LocalModelDescriptor
     private let bridge: SpecialistModelBridge
 
-    public init(bridge: SpecialistModelBridge = SpecialistModelBridge()) { self.bridge = bridge }
+    public init(model: LocalModelDescriptor = LocalModelStack.siglip2So400m,
+                bridge: SpecialistModelBridge = SpecialistModelBridge()) {
+        precondition(model.capability == .imageSemantic, "SigLIP provider requires an image-semantic model")
+        self.model = model
+        self.bridge = bridge
+        self.providerID = "specialist:\(model.id)@\(model.revisionPrefix):naflex-v1"
+    }
 
     public var preflight: EmbeddingProviderPreflight {
-        SpecialistModelBridge.preflight(LocalModelStack.siglip2)
+        SpecialistModelBridge.preflight(model)
     }
     public var imageModelID: String { "image:\(providerID)" }
     public var textModelID: String { "text:\(providerID)" }
 
-    public func embedText(_ text: String) -> EmbeddingVector? { bridge.embedSigLIPText(text) }
-    public func embedImageBytes(_ bytes: Data) -> EmbeddingVector? { bridge.embedSigLIPImage(bytes) }
-    public func embedJointText(_ text: String) -> EmbeddingVector? { bridge.embedSigLIPText(text) }
+    public func embedText(_ text: String) -> EmbeddingVector? {
+        bridge.embedSigLIPText(text, model: model)
+    }
+    public func embedImageBytes(_ bytes: Data) -> EmbeddingVector? {
+        bridge.embedSigLIPImage(bytes, model: model)
+    }
+    public func embedJointText(_ text: String) -> EmbeddingVector? {
+        bridge.embedSigLIPText(text, model: model)
+    }
 }
