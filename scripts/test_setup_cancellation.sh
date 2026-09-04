@@ -53,9 +53,9 @@ export FAKE_CHILD_PID_FILE="$CHILD_PID_FILE"
 /bin/bash "$ROOT_DIR/scripts/setup_models.sh" --models-only --all >"$LOG_FILE" 2>&1 &
 SETUP_PID=$!
 
-# Wait only long enough for the fake provisioner to start. If setup never gets
-# there, fail instead of sleeping for the fake command's full 30 seconds.
-for _ in $(seq 1 100); do
+# Wait only long enough for the fake provisioner to start. Use Bash arithmetic
+# rather than `seq` so this regression also runs on a pristine macOS install.
+for ((attempt = 0; attempt < 100; attempt++)); do
     if [ -s "$CHILD_PID_FILE" ]; then
         break
     fi
