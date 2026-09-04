@@ -110,7 +110,7 @@ struct ModelSetupView: View {
                     ProgressView()
                     Text("Preparing local AI and downloading the selected models…")
                         .font(.subheadline.weight(.medium))
-                    Text("No Homebrew, Xcode, or separate Python installation is required on Apple-silicon Macs.")
+                    Text("Large model downloads can take several minutes. Keep this setup window open; no Homebrew, Xcode, or separate Python installation is required on Apple-silicon Macs.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -171,11 +171,16 @@ struct ModelSetupView: View {
         }
         .padding(24)
         .frame(width: 560)
+        .interactiveDismissDisabled(installing)
         .onAppear { refreshTokenState() }
     }
 
     private var needsGatedAccessToken: Bool {
-        profile != .fast && !model.specialistProvisionedIDs.contains(LocalModelStack.dinov3.id)
+        // Every setup profile currently provisions the embeddings tier, which
+        // includes gated DINOv3. Fast itself never requires setup from the main
+        // flow, but an advanced "Run Setup Again" while Fast is selected still
+        // uses the embeddings profile and must not falsely claim no token is needed.
+        !model.specialistProvisionedIDs.contains(LocalModelStack.dinov3.id)
     }
 
     private var canInstall: Bool {
