@@ -4,11 +4,11 @@ This page describes how to verify the current repository and how to interpret de
 
 ## Source of truth
 
-For a current commit, a fresh GitHub Actions run plus any required host-only macOS/account smoke is the source of truth. Historical benchmark numbers are comparison data, not release guarantees.
+For a current commit, a fresh GitHub Actions run plus any required host-only macOS/distribution smoke is the source of truth. Historical benchmark numbers are comparison data, not release guarantees. A private account smoke is relevant only to an optional explicitly selected gated model such as DINOv3; it is not part of the normal Fast/Balanced/Quality acceptance path.
 
 The normal CI workflow has three jobs:
 
-- `test` — repository hygiene, debug build, Swift 6 warnings-as-errors build, the full Swift suite, large-tree regressions, Tier-2/provider contracts, Hugging Face auth/runtime checks, pinned clean-Mac runtime-bootstrap checks, and vendored SQLCipher provenance;
+- `test` — repository hygiene, debug build, Swift 6 warnings-as-errors build, the full Swift suite, large-tree regressions, Tier-2/provider contracts, public-profile and optional gated-auth contracts, pinned clean-Mac runtime-bootstrap checks, and vendored SQLCipher provenance;
 - `quality` — deterministic Golden Library metric/schema checks;
 - `entitlement-audit` — release build, local E2E verification, packaging, and signed packaged-app entitlement audit.
 
@@ -67,7 +67,7 @@ The suite includes coverage for:
 - cancellation/pause/remove/replacement outcomes;
 - project semantic summaries and bounded semantic fan-out;
 - SQL-side bounded views and batched top-K vector scoring;
-- model-setup Application Support path resolution and Keychain token validation.
+- model-setup Application Support path resolution and optional Keychain token validation.
 
 The real provisioned Whisper test is host-conditional. Hosted CI does not ship the user's local Whisper executable/model, so that integration cannot be promoted to a universal CI guarantee.
 
@@ -104,18 +104,37 @@ A blanket deny-network probe is therefore no longer an accurate packaged-app acc
 2. model-runtime CI proves production inference forces local/offline loading;
 3. source review keeps network-capable behavior isolated to explicit provisioning/system browser links.
 
-## Hugging Face provisioning verification
+## Consumer profile provisioning verification
 
-The app supports gated Hugging Face repositories without requiring the user to paste a token into a Terminal command.
+The normal `embeddings`, `balanced`, and `quality` setup profiles are deliberately **public-only**. A consumer must not need a Hugging Face account, access request, token, or license-approval detour merely to use the recommended local mode.
 
-The in-app credential contract is:
+`scripts/test_specialist_contract.py` imports the production provisioner and asserts that every normal profile excludes every registry entry marked `gated`. DINOv3 stays registered as a supported optional advanced model, but it is not selected by any normal profile and it is not part of Balanced/Quality readiness.
+
+Normal Terminal setup therefore needs no credential:
+
+```bash
+./scripts/setup_models.sh --specialist-profile embeddings
+./scripts/setup_models.sh --specialist-profile balanced
+./scripts/setup_models.sh --specialist-profile quality
+```
+
+The provisioner resolves the pinned revisions for all public checkpoints that actually need downloading before the first large transfer. Downloaded snapshots are staged before activation and recorded with SHA-256 provenance manifests.
+
+## Optional gated-model credential verification
+
+An explicitly selected gated model still uses the stricter credential path. For example, optional DINOv3 may be installed separately after the user has upstream approval:
+
+```bash
+printf '%s\n' "$HF_TOKEN" | ./scripts/setup_models.sh \
+  --specialist-model dinov3-vitb16-lvd1689m --hf-token-stdin
+```
+
+The optional in-app/advanced credential contract is:
 
 ```text
 macOS Keychain
-    ↓ explicit setup action
-Swift model setup
-    ↓ stdin
-setup_models.sh
+    ↓ explicit advanced install action
+Swift model setup / setup helper
     ↓ stdin
 provision_specialist_models.py
     ↓ in-memory token argument
@@ -125,14 +144,12 @@ huggingface_hub
 CI checks that:
 
 - `--hf-token-stdin` exists in both setup layers;
-- the app-supplied token is not re-exported as a child environment variable;
+- an app-supplied token is not re-exported as a child environment variable;
 - token-like secrets are not tracked in the repository;
 - provisioning code passes the in-memory token explicitly to Hub API/download calls;
 - inference workers retain `local_files_only=True` / offline Hub settings.
 
-The specialist provisioner resolves every checkpoint that actually requires download **before** the first large transfer. If DINOv3 access was not approved for the account, provisioning should fail at preflight rather than first downloading several gigabytes of public checkpoints.
-
-A real gated-model smoke still requires a private user token tied to an account with upstream DINOv3 access. Hosted CI cannot honestly provide that approval.
+A real optional DINOv3 smoke still requires a private user token tied to an account with upstream approval. Hosted CI cannot honestly provide that approval, but this is no longer a consumer-profile or daily-use release blocker.
 
 ## Model storage path verification
 
@@ -152,28 +169,15 @@ The model setup process receives exact `LIBRARIAN_APP_SUPPORT_DIR`, `LIBRARIAN_M
 
 Apple Vision is the zero-download baseline.
 
-Terminal specialist setup remains available:
+The consumer specialist stack is intentionally bounded for the target Mac. Normal profiles use public SigLIP2 plus the public bounded VLM fallbacks appropriate to the selected quality level. Native Apple Vision remains the supported OCR/visual baseline. Optional DINOv3 adds a separate visual-similarity representation only when explicitly provisioned.
 
-```bash
-# Use normal `hf auth login` state if desired:
-./scripts/setup_models.sh --specialist-profile embeddings
-
-# Or keep a token out of argv/history:
-printf '%s\n' "$HF_TOKEN" \
-  | ./scripts/setup_models.sh --specialist-profile embeddings --hf-token-stdin
-
-./scripts/setup_models.sh --specialist-profile balanced
-./scripts/setup_models.sh --specialist-profile quality
-python3 scripts/test_specialist_contract.py
-```
-
-The current production fp16 specialist registry is intentionally bounded for the target Mac. CI rejects known larger candidates from production routing until a separately tested quantized/MLX runtime exists. A checkpoint fitting on disk is not sufficient evidence that it is safe to expose in the current execution path.
+The production fp16 registry rejects known larger candidates from normal routing until a separately tested quantized/MLX runtime exists. A checkpoint fitting on disk is not sufficient evidence that it is safe to expose in the current execution path.
 
 PaddleOCR-VL is reported but skipped on the current macOS target path; Apple Vision OCR is the supported baseline there.
 
 ### Clean-Mac Python bootstrap
 
-On Apple-silicon macOS, model setup no longer depends on Homebrew, Xcode, or a preinstalled global Python. If the app-private model runtime is absent and no compatible host Python is available, `setup_models.sh` downloads one exact `python-build-standalone` archive into the app's Application Support tree.
+On Apple-silicon macOS, model setup does not depend on Homebrew, Xcode, or a preinstalled global Python. If the app-private model runtime is absent and no compatible host Python is available, `setup_models.sh` downloads one exact `python-build-standalone` archive into the app's Application Support tree.
 
 The bootstrap is deliberately narrow:
 
@@ -189,7 +193,7 @@ CI syntax-checks the helper and asserts the exact version, dated release, digest
 
 Automatic runtime bootstrap currently targets Apple-silicon macOS. Intel hosts must provide a compatible Python 3.10+ via `LIBRARIAN_BOOTSTRAP_PYTHON` or use a package containing an appropriate runtime.
 
-A real **packaged sandbox** clean-user-account smoke remains required before calling this distribution path release-proven: hosted CI verifies the supply-chain contract and package entitlements, but does not perform the full external runtime + multi-gigabyte model install inside a consumer App Sandbox on every run.
+A real **packaged sandbox** clean-user-account smoke remains required before calling this distribution path release-proven: hosted CI verifies the supply-chain contract and package entitlements, but does not perform the full external runtime + multi-gigabyte public-model install inside a consumer App Sandbox on every run.
 
 ## Large-tree verification
 
@@ -205,7 +209,7 @@ The current branch contains explicit scale controls rather than relying on a sma
 - SQL-side bounded file/similarity pages;
 - vector-table batches with only top-K retained in Swift memory.
 
-These tests prove the intended algorithmic memory shape. They are not a substitute for a completed 24-GB browser-checkout RSS benchmark on the target machine.
+These tests prove the intended algorithmic memory shape. They are not a substitute for a completed large real-library RSS benchmark on the target machine.
 
 ## Security-scoped bookmark verification
 
@@ -214,7 +218,7 @@ Synthetic tests can verify fail-closed bookmark resolution, lease ownership, can
 Before calling the permission lifecycle daily-use ready, perform a packaged-app smoke:
 
 1. select a real folder through the system picker;
-2. index it and verify analysis does not alter source bytes/metadata unexpectedly;
+2. analyze it and verify analysis does not alter source bytes/metadata unexpectedly;
 3. review and confirm one Apply operation;
 4. verify the move is inside the selected root and is journaled;
 5. Undo Last Apply and verify restoration;
@@ -224,6 +228,8 @@ Before calling the permission lifecycle daily-use ready, perform a packaged-app 
 9. pause/remove/reauthorize and verify old access leases are released/replaced.
 
 That smoke is the evidence needed for the OS-granted permission lifecycle. A green hosted CI run cannot substitute for it.
+
+For the complete daily-use acceptance path, also switch from Fast to Balanced on a clean Apple-silicon account and verify the **account-free** in-app pinned runtime/public-model setup completes and resumes the requested analysis automatically.
 
 ## SQLCipher provenance
 
@@ -236,8 +242,8 @@ A green current run means the code compiled, the synthetic/regression suite pass
 It does **not** by itself prove:
 
 - a genuine persisted `NSOpenPanel` security-scope token works after relaunch on the user's host;
-- the user's Hugging Face account has actually been approved for a gated repository;
-- the full pinned Python/dependency/model bootstrap has completed successfully inside a clean consumer packaged sandbox;
+- the full pinned Python/dependency/public-model bootstrap has completed successfully inside a clean consumer packaged sandbox;
+- an optional gated-model account has upstream approval;
 - public distribution is notarized/stapled unless the release process explicitly performed those steps;
 - large-tree performance meets an SLA that was never benchmarked on that exact commit/hardware.
 
