@@ -98,13 +98,14 @@ public struct ModelSetupProgress: Sendable, Equatable {
     }
 }
 
-/// Cancellation handle for one explicit setup run. Access is lock-protected
-/// because the SwiftUI main actor requests cancellation while the provisioning
-/// process itself is owned by a detached utility task.
+/// Thread-safe handle for one explicit setup run. SwiftUI reads progress and
+/// requests cancellation on the main actor while the provisioning process is
+/// owned by a detached utility task.
 public final class ModelSetupOperation: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
     private var cancellationRequested = false
+    private var latestProgress: ModelSetupProgress?
 
     public init() {}
 
@@ -112,6 +113,12 @@ public final class ModelSetupOperation: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return cancellationRequested
+    }
+
+    public var progress: ModelSetupProgress? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestProgress
     }
 
     public func cancel() {
@@ -124,6 +131,12 @@ public final class ModelSetupOperation: @unchecked Sendable {
         if runningProcess?.isRunning == true {
             runningProcess?.terminate()
         }
+    }
+
+    fileprivate func report(_ progress: ModelSetupProgress) {
+        lock.lock()
+        latestProgress = progress
+        lock.unlock()
     }
 
     fileprivate func attach(_ process: Process) -> Bool {
@@ -242,8 +255,7 @@ public enum AppModelSetup {
     public static func run(
         profile: LocalModelProfile,
         token: String?,
-        operation: ModelSetupOperation = ModelSetupOperation(),
-        onProgress: (@Sendable (ModelSetupProgress) -> Void)? = nil
+        operation: ModelSetupOperation = ModelSetupOperation()
     ) async -> ModelSetupResult {
         guard let script = setupScriptURL() else {
             return ModelSetupResult(
@@ -272,8 +284,7 @@ public enum AppModelSetup {
                 profile: profileName,
                 token: trimmedToken,
                 appSupport: appSupport,
-                operation: operation,
-                onProgress: onProgress)
+                operation: operation)
         }.value
     }
 
@@ -293,8 +304,7 @@ public enum AppModelSetup {
         profile: String,
         token: String?,
         appSupport: URL,
-        operation: ModelSetupOperation,
-        onProgress: (@Sendable (ModelSetupProgress) -> Void)?
+        operation: ModelSetupOperation
     ) -> ModelSetupResult {
         let fm = FileManager.default
         do {
@@ -387,7 +397,7 @@ public enum AppModelSetup {
                 readOffset: &readOffset,
                 pending: &pending,
                 final: false,
-                onProgress: onProgress)
+                operation: operation)
             Thread.sleep(forTimeInterval: 0.15)
         }
         process.waitUntilExit()
@@ -398,7 +408,7 @@ public enum AppModelSetup {
             readOffset: &readOffset,
             pending: &pending,
             final: true,
-            onProgress: onProgress)
+            operation: operation)
 
         let data = (try? Data(contentsOf: logURL)) ?? Data()
         var output = String(data: data, encoding: .utf8) ?? ""
@@ -434,7 +444,7 @@ public enum AppModelSetup {
         readOffset: inout UInt64,
         pending: inout Data,
         final: Bool,
-        onProgress: (@Sendable (ModelSetupProgress) -> Void)?
+        operation: ModelSetupOperation
     ) {
         let attributes = try? FileManager.default.attributesOfItem(atPath: logURL.path)
         let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
@@ -454,22 +464,19 @@ public enum AppModelSetup {
         while let newline = pending.firstIndex(of: 0x0A) {
             let lineData = pending[..<newline]
             pending.removeSubrange(...newline)
-            emitProgress(lineData: Data(lineData), onProgress: onProgress)
+            emitProgress(lineData: Data(lineData), operation: operation)
         }
         if final, !pending.isEmpty {
-            emitProgress(lineData: pending, onProgress: onProgress)
+            emitProgress(lineData: pending, operation: operation)
             pending.removeAll(keepingCapacity: false)
         }
     }
 
-    private static func emitProgress(
-        lineData: Data,
-        onProgress: (@Sendable (ModelSetupProgress) -> Void)?
-    ) {
+    private static func emitProgress(lineData: Data, operation: ModelSetupOperation) {
         guard let line = String(data: lineData, encoding: .utf8)?
             .trimmingCharacters(in: .newlines),
               let progress = progress(from: line) else { return }
-        onProgress?(progress)
+        operation.report(progress)
     }
 
     private static func cancelledResult(output: String, status: Int32 = 130) -> ModelSetupResult {
