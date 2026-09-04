@@ -23,102 +23,58 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          app = Path('Sources/LibrarianApp/Library/AppEntryPoint.swift')
-          text = app.read_text()
-
-          replacements = {
-              '''/// no listening socket. Sources are added via the system folder picker with
-/// read-only security-scoped bookmarks; the catalog is SQLCipher-encrypted
-''': '''/// no listening socket. Sources are added via the system folder picker with
-/// security-scoped bookmarks; the catalog is SQLCipher-encrypted
-''',
-              '''    @Published var localModelProfile: LocalModelProfile {
-        didSet {
-            UserDefaults.standard.set(localModelProfile.rawValue, forKey: "local-model-profile-v1")
-            restartLiveCoordinator()
-            refreshDashboard()
-        }
-    }
-''': '''    @Published var localModelProfile: LocalModelProfile {
-        didSet {
-            UserDefaults.standard.set(localModelProfile.rawValue, forKey: "local-model-profile-v1")
-            // Quality is the consumer-facing source of truth. Fast means the
-            // zero-download path; Balanced/Quality mean their downloaded local
-            // stack is actually enabled. Do not let an old hidden Tier-2 toggle
-            // silently make the selected quality level lie to the user.
-            let shouldEnable = localModelProfile != .fast
-            if localEmbeddingsEnabled != shouldEnable {
-                localEmbeddingsEnabled = shouldEnable
-            } else {
-                restartLiveCoordinator()
-                refreshDashboard()
-            }
-        }
-    }
-''',
-              '''        self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
-        self.localModelProfile = LocalModelProfile(
-            rawValue: UserDefaults.standard.string(forKey: "local-model-profile-v1") ?? "fast") ?? .fast
-''': '''        let storedProfile = LocalModelProfile(
-            rawValue: UserDefaults.standard.string(forKey: "local-model-profile-v1") ?? "fast") ?? .fast
-        // Migrate older builds that persisted an independent Tier-2 toggle.
-        // The visible quality choice now owns this behavior deterministically.
-        self.localEmbeddingsEnabled = storedProfile != .fast
-        self.localModelProfile = storedProfile
-        UserDefaults.standard.set(storedProfile != .fast, forKey: "tier2-enabled-v1")
-''',
-              '''    // MARK: - Read-only source access via security-scoped bookmarks
-''': '''    // MARK: - Security-scoped source access
-''',
-              '''                    self.log("could not persist read-only bookmark: \\(url.path)")
-''': '''                    self.log("could not persist folder permission: \\(url.path)")
-''',
-              '''        panel.allowsMultipleSelection = false
-            panel.message = "Choose the replacement folder. Indexing stays read-only; files move only when you apply a plan."
-''': '''        panel.allowsMultipleSelection = false
-        panel.message = "Choose the replacement folder. Analysis reads only; files move only when you apply a plan."
-''',
-              '''    /// Resolve a stored read-only security-scoped bookmark and run `body`
-''': '''    /// Resolve a stored security-scoped bookmark and run `body`
-''',
-          }
-          for old, new in replacements.items():
+          def replace_once(text, old, new, label):
               if old not in text:
-                  raise SystemExit(f'AppEntryPoint replacement marker missing:\n{old[:120]}')
-              text = text.replace(old, new, 1)
+                  raise SystemExit(f"replacement marker missing: {label}")
+              return text.replace(old, new, 1)
+
+          app = Path("Sources/LibrarianApp/Library/AppEntryPoint.swift")
+          text = app.read_text()
+          text = replace_once(text,
+              "/// no listening socket. Sources are added via the system folder picker with\n/// read-only security-scoped bookmarks; the catalog is SQLCipher-encrypted\n",
+              "/// no listening socket. Sources are added via the system folder picker with\n/// security-scoped bookmarks; the catalog is SQLCipher-encrypted\n",
+              "top bookmark wording")
+          text = replace_once(text,
+              "    @Published var localModelProfile: LocalModelProfile {\n        didSet {\n            UserDefaults.standard.set(localModelProfile.rawValue, forKey: \"local-model-profile-v1\")\n            restartLiveCoordinator()\n            refreshDashboard()\n        }\n    }\n",
+              "    @Published var localModelProfile: LocalModelProfile {\n        didSet {\n            UserDefaults.standard.set(localModelProfile.rawValue, forKey: \"local-model-profile-v1\")\n            // Quality is the consumer-facing source of truth. Fast means the\n            // zero-download path; Balanced/Quality mean their downloaded local\n            // stack is actually enabled. Do not let an old hidden Tier-2 toggle\n            // silently make the selected quality level lie to the user.\n            let shouldEnable = localModelProfile != .fast\n            if localEmbeddingsEnabled != shouldEnable {\n                localEmbeddingsEnabled = shouldEnable\n            } else {\n                restartLiveCoordinator()\n                refreshDashboard()\n            }\n        }\n    }\n",
+              "profile didSet")
+          text = replace_once(text,
+              "        self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: \"tier2-enabled-v1\")\n        self.localModelProfile = LocalModelProfile(\n            rawValue: UserDefaults.standard.string(forKey: \"local-model-profile-v1\") ?? \"fast\") ?? .fast\n",
+              "        let storedProfile = LocalModelProfile(\n            rawValue: UserDefaults.standard.string(forKey: \"local-model-profile-v1\") ?? \"fast\") ?? .fast\n        // Migrate older builds that persisted an independent Tier-2 toggle.\n        // The visible quality choice now owns this behavior deterministically.\n        self.localEmbeddingsEnabled = storedProfile != .fast\n        self.localModelProfile = storedProfile\n        UserDefaults.standard.set(storedProfile != .fast, forKey: \"tier2-enabled-v1\")\n",
+              "profile init migration")
+          text = replace_once(text,
+              "    // MARK: - Read-only source access via security-scoped bookmarks\n",
+              "    // MARK: - Security-scoped source access\n",
+              "bookmark section wording")
+          text = replace_once(text,
+              "                    self.log(\"could not persist read-only bookmark: \\(url.path)\")\n",
+              "                    self.log(\"could not persist folder permission: \\(url.path)\")\n",
+              "bookmark error wording")
+          text = replace_once(text,
+              "        panel.allowsMultipleSelection = false\n            panel.message = \"Choose the replacement folder. Indexing stays read-only; files move only when you apply a plan.\"\n",
+              "        panel.allowsMultipleSelection = false\n        panel.message = \"Choose the replacement folder. Analysis reads only; files move only when you apply a plan.\"\n",
+              "reauthorize copy")
+          text = replace_once(text,
+              "    /// Resolve a stored read-only security-scoped bookmark and run `body`\n",
+              "    /// Resolve a stored security-scoped bookmark and run `body`\n",
+              "bookmark resolver wording")
           app.write_text(text)
 
-          settings = Path('Sources/LibrarianApp/App/SimpleSettingsView.swift')
+          settings = Path("Sources/LibrarianApp/App/SimpleSettingsView.swift")
           text = settings.read_text()
-          old = '''                        Toggle("Use downloaded local embeddings", isOn: $model.localEmbeddingsEnabled)
-'''
-          new = '''                        Label(
-                            model.localModelProfile == .fast
-                                ? "Downloaded local AI is off in Fast mode"
-                                : "Downloaded local AI follows the selected quality level",
-                            systemImage: model.localModelProfile == .fast ? "bolt" : "checkmark.circle")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-'''
-          if old not in text:
-              raise SystemExit('advanced local-embeddings toggle marker missing')
-          settings.write_text(text.replace(old, new, 1))
+          text = replace_once(text,
+              "                        Toggle(\"Use downloaded local embeddings\", isOn: $model.localEmbeddingsEnabled)\n",
+              "                        Label(\n                            model.localModelProfile == .fast\n                                ? \"Downloaded local AI is off in Fast mode\"\n                                : \"Downloaded local AI follows the selected quality level\",\n                            systemImage: model.localModelProfile == .fast ? \"bolt\" : \"checkmark.circle\")\n                            .font(.caption)\n                            .foregroundStyle(.secondary)\n",
+              "advanced embeddings toggle")
+          settings.write_text(text)
 
-          home = Path('Sources/LibrarianApp/Library/CleanerHomeView.swift')
+          home = Path("Sources/LibrarianApp/Library/CleanerHomeView.swift")
           text = home.read_text()
-          old = '''        case .balanced:
-            return "Balanced uses downloaded local models when available and keeps uncertain files for review."
-        case .quality:
-            return "Quality uses the full downloaded local stack for harder images and documents."
-'''
-          new = '''        case .balanced:
-            return "Balanced uses SigLIP2 Base and local fallbacks, then keeps uncertain files for review."
-        case .quality:
-            return "Quality uses SigLIP2 So400m and the stronger local fallback stack for harder images and documents."
-'''
-          if old not in text:
-              raise SystemExit('home profile-description marker missing')
-          home.write_text(text.replace(old, new, 1))
+          text = replace_once(text,
+              "        case .balanced:\n            return \"Balanced uses downloaded local models when available and keeps uncertain files for review.\"\n        case .quality:\n            return \"Quality uses the full downloaded local stack for harder images and documents.\"\n",
+              "        case .balanced:\n            return \"Balanced uses SigLIP2 Base and local fallbacks, then keeps uncertain files for review.\"\n        case .quality:\n            return \"Quality uses SigLIP2 So400m and the stronger local fallback stack for harder images and documents.\"\n",
+              "home profile descriptions")
+          home.write_text(text)
           PY
 
       - name: Guard the repaired contract
