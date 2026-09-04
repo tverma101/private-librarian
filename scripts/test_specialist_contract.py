@@ -6,9 +6,12 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).with_name("specialist.py")
@@ -94,6 +97,48 @@ class SpecialistContractTests(unittest.TestCase):
             target, dtype = module._warm_encoder_target(FakeTorch(), platform="linux")
             self.assertEqual(target, "cpu")
             self.assertIsNone(dtype)
+
+    def test_mps_memory_protocol_reports_allocator_and_driver_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = load_worker(Path(directory))
+            fake_torch = types.ModuleType("torch")
+
+            class FakeBackendMPS:
+                @staticmethod
+                def is_available() -> bool:
+                    return True
+
+            class FakeMPS:
+                @staticmethod
+                def current_allocated_memory() -> int:
+                    return 750_000_000
+
+                @staticmethod
+                def driver_allocated_memory() -> int:
+                    return 1_100_000_000
+
+                @staticmethod
+                def recommended_max_memory() -> int:
+                    return 5_000_000_000
+
+            fake_torch.backends = types.SimpleNamespace(mps=FakeBackendMPS())
+            fake_torch.mps = FakeMPS()
+
+            module._CACHE["siglip2-base-naflex"] = object()
+            with patch.dict(sys.modules, {"torch": fake_torch}):
+                result = module._handle({"op": "memory"})
+
+            self.assertEqual(result["backend"], "mps")
+            self.assertTrue(result["mps_available"])
+            self.assertEqual(result["current_allocated_bytes"], 750_000_000)
+            self.assertEqual(result["driver_allocated_bytes"], 1_100_000_000)
+            self.assertEqual(result["recommended_max_bytes"], 5_000_000_000)
+            self.assertEqual(result["resident"], ["siglip2-base-naflex"])
+            # The protocol exposes independent measurements and never invents a
+            # summed "total" that would double-count unified-memory mappings.
+            self.assertNotIn("total_bytes", result)
+            self.assertNotIn("rss_plus_mps_bytes", result)
+            module._CACHE.clear()
 
     def test_transformers_pooling_output_is_unwrapped_before_normalization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
