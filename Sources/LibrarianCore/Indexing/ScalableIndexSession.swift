@@ -177,7 +177,7 @@ public final class ScalableIndexSession: @unchecked Sendable {
         /// generation actually needs semantic image work. Unchanged files that
         /// already carry this provider's vector remain zero-inference rescans.
         func prefetchItem(
-            for discovered: DiscoveredItem,
+            for discovered: SourceBroker.DiscoveredItem,
             provider: any PrefetchingBatchImageEmbeddingProvider
         ) -> SpecialistImageEmbeddingBatchItem? {
             guard cancellation?.isCancelled != true,
