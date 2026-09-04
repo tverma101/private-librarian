@@ -59,7 +59,10 @@ public enum LocalModelStack: Sendable {
         defaultEnabled: true,
         runtime: "transformers")
 
-    /// Separate visual representation. This must never be compared directly with SigLIP vectors.
+    /// Optional advanced visual representation. It remains routable whenever a
+    /// user explicitly provisions it, but upstream access is gated, so normal
+    /// Fast/Balanced/Quality setup never depends on it. DINO vectors must never
+    /// be compared directly with SigLIP vectors.
     public static let dinov3 = LocalModelDescriptor(
         id: "dinov3-vitb16-lvd1689m",
         capability: .visualSimilarity,
@@ -68,7 +71,7 @@ public enum LocalModelStack: Sendable {
         license: "DINOv3 License",
         cost: .small,
         gated: true,
-        defaultEnabled: true,
+        defaultEnabled: false,
         runtime: "transformers")
 
     public static let paddleOCR = LocalModelDescriptor(
@@ -100,8 +103,9 @@ public enum LocalModelStack: Sendable {
         cost: .heavy,
         runtime: "transformers-remote-code")
 
-    /// Product-supported stack for the target Mac. Models whose own execution
-    /// footprint cannot reliably remain below 11.50 GB are intentionally absent.
+    /// Product-supported registry for the target Mac. `all` includes optional
+    /// advanced specialists; `defaultEnabled` and the provisioner decide which
+    /// ones belong in a consumer profile.
     public static let all: [LocalModelDescriptor] = [
         siglip2, dinov3, paddleOCR, miniCPM, lfm
     ]
@@ -154,6 +158,9 @@ public struct LocalModelRouter: Sendable {
 
         if context.kind == .image {
             append(LocalModelStack.siglip2)
+            // Advanced DINOv3 is opportunistic: if the user installed it, use
+            // it for the separate visual-similarity space; otherwise the normal
+            // profile continues without an account-gated dependency.
             append(LocalModelStack.dinov3)
         }
 
