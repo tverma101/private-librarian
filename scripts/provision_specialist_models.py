@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Provision the final local specialist stack with immutable provenance.
+"""Provision the local specialist stack with immutable provenance.
 
 Downloads happen only after an explicit user/setup action. Normal inference is
-local-files-only. Gated Hub credentials may be supplied over stdin so an app
-Keychain token never needs to enter argv, shell history, or a child process
-environment.
+local-files-only. The normal Fast/Balanced/Quality profiles contain only public
+checkpoints so a consumer setup never requires a model-hosting account. Gated
+models remain available as explicit advanced ``--model`` installs; credentials
+for those may be supplied over stdin so a Keychain token never needs to enter
+argv, shell history, or a child-process environment.
 
 Examples:
   python3 scripts/provision_specialist_models.py --list
   python3 scripts/provision_specialist_models.py --profile embeddings
   python3 scripts/provision_specialist_models.py --profile balanced
-  printf '%s\n' "$HF_TOKEN" | python3 scripts/provision_specialist_models.py --profile embeddings --hf-token-stdin
+  python3 scripts/provision_specialist_models.py --profile quality
+  printf '%s\n' "$HF_TOKEN" | python3 scripts/provision_specialist_models.py \
+      --model dinov3-vitb16-lvd1689m --hf-token-stdin
   python3 scripts/provision_specialist_models.py --profile balanced --verify-only
 
-`quality` intentionally includes large models and must be explicitly requested.
+`quality` intentionally includes the largest normally supported public fallback
+and must be explicitly selected by the user.
 """
 from __future__ import annotations
 
@@ -40,13 +45,16 @@ MODELS = {
         "profile": "embeddings",
         "note": "semantic image/text joint space",
     },
+    # DINOv3 remains supported for an explicit advanced install, but it is
+    # deliberately excluded from consumer profiles because upstream access is
+    # gated. Apple Vision feature prints + SigLIP2 cover the normal local path.
     "dinov3-vitb16-lvd1689m": {
         "hf_id": "facebook/dinov3-vitb16-pretrain-lvd1689m",
         "revision_prefix": "5931719",
         "license": "DINOv3 License",
         "profile": "embeddings",
         "gated": True,
-        "note": "visual clustering / junk and near-similarity representation",
+        "note": "optional advanced visual clustering representation",
     },
     "paddleocr-vl-1.6": {
         "hf_id": "PaddlePaddle/PaddleOCR-VL-1.6",
@@ -98,8 +106,18 @@ def regular_files(root: Path) -> Iterable[Path]:
 
 
 def selected_for_profile(profile: str) -> list[str]:
+    """Return the public models in a consumer quality profile.
+
+    A profile is the one-click product path, so it must never suddenly require
+    an external account or license-approval workflow. Gated checkpoints remain
+    individually installable through ``--model`` for advanced users.
+    """
     ceiling = PROFILE_ORDER[profile]
-    return [name for name, spec in MODELS.items() if PROFILE_ORDER[spec["profile"]] <= ceiling]
+    return [
+        name
+        for name, spec in MODELS.items()
+        if PROFILE_ORDER[spec["profile"]] <= ceiling and not spec.get("gated", False)
+    ]
 
 
 def resolve_full_revision(hf, spec: dict, *, token: str | None = None) -> str:
@@ -107,7 +125,7 @@ def resolve_full_revision(hf, spec: dict, *, token: str | None = None) -> str:
         # Passing the in-memory token explicitly avoids exporting the app's
         # Keychain credential into the provisioning process environment. When
         # token is None, huggingface_hub may still use the operator's normal
-        # `hf auth login`/HF_TOKEN configuration for Terminal workflows.
+        # `hf auth login`/HF_TOKEN configuration for explicit Terminal use.
         info = hf.HfApi(token=token).model_info(spec["hf_id"], revision=spec["revision_prefix"])
     except Exception as exc:
         extra = " This model is gated; accept its terms and authenticate with Hugging Face first." if spec.get("gated") else ""
@@ -306,9 +324,9 @@ def main() -> int:
     if args.list:
         for name, spec in MODELS.items():
             present = " [present]" if (MODELS_ROOT / name / "provenance.json").is_file() else ""
-            gated = " gated" if spec.get("gated") else ""
+            gated = " gated/advanced" if spec.get("gated") else ""
             unsupported = f" [unsupported: {unsupported_reason(name)}]" if unsupported_reason(name) else ""
-            print(f"{name:28s} profile={spec['profile']:10s}{gated:7s} {spec['hf_id']} {spec['license']}{present}{unsupported}")
+            print(f"{name:28s} profile={spec['profile']:10s}{gated:17s} {spec['hf_id']} {spec['license']}{present}{unsupported}")
         return 0
 
     if bool(args.profile) == bool(args.model):
@@ -338,8 +356,9 @@ def main() -> int:
     MODELS_ROOT.mkdir(parents=True, exist_ok=True)
 
     # Resolve every checkpoint that actually needs provisioning before the
-    # first multi-gigabyte download starts. This makes a missing DINOv3 gated
-    # approval fail in seconds instead of after SigLIP has already downloaded.
+    # first multi-gigabyte transfer. Consumer profiles are public-only; an
+    # explicitly selected gated model still fails here before wasting a large
+    # download if its account approval is missing.
     resolved: dict[str, str] = {}
     if not args.verify_only:
         pending: list[str] = []
