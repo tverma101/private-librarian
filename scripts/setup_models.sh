@@ -22,6 +22,55 @@ LEGACY_SELECTION_EXPLICIT=0
 RUNTIME_ONLY=0
 HF_TOKEN_STDIN=0
 HF_TOKEN_VALUE=""
+CURRENT_CHILD_PID=""
+CANCEL_REQUESTED=0
+
+# Machine-readable stage records are deliberately also human-readable in the
+# setup log. The app parses only this prefix and never invents a percentage.
+emit_stage() {
+    printf '__LIBRARIAN_SETUP_STAGE__|%s|%s\n' "$1" "$2"
+}
+
+cancel_setup() {
+    CANCEL_REQUESTED=1
+    emit_stage "cancelling" "Stopping setup safely…"
+    if [ -n "$CURRENT_CHILD_PID" ]; then
+        kill -TERM "$CURRENT_CHILD_PID" 2>/dev/null || true
+    fi
+}
+trap cancel_setup TERM INT
+
+wait_for_child() {
+    local pid="$1"
+    local status
+    set +e
+    wait "$pid"
+    status=$?
+    if [ "$CANCEL_REQUESTED" -eq 1 ]; then
+        # A signal can interrupt wait before the child has fully exited. Wait a
+        # second time so no downloader/Python process is orphaned before the
+        # shell unwinds its normal cleanup traps.
+        wait "$pid" 2>/dev/null || true
+        status=130
+    fi
+    set -e
+    CURRENT_CHILD_PID=""
+    return "$status"
+}
+
+run_cancellable() {
+    "$@" &
+    CURRENT_CHILD_PID=$!
+    wait_for_child "$CURRENT_CHILD_PID"
+}
+
+run_cancellable_with_input() {
+    local input="$1"
+    shift
+    "$@" <<< "$input" &
+    CURRENT_CHILD_PID=$!
+    wait_for_child "$CURRENT_CHILD_PID"
+}
 
 # Clean Macs should not need Homebrew, Xcode, or a global Python install just to
 # use a desktop app. When no suitable Python is already available we install a
@@ -226,8 +275,9 @@ bootstrap_standalone_python() {
     }
     trap cleanup_python_bootstrap RETURN
 
+    emit_stage "runtime" "Downloading the verified local AI runtime…"
     echo "Preparing Private Librarian's local AI runtime…"
-    /usr/bin/curl \
+    run_cancellable /usr/bin/curl \
         --fail \
         --location \
         --proto '=https' \
@@ -237,6 +287,7 @@ bootstrap_standalone_python() {
         --output "$archive" \
         "$BOOTSTRAP_PYTHON_URL"
 
+    emit_stage "runtime" "Verifying the local AI runtime…"
     actual_sha="$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')"
     if [ "$actual_sha" != "$BOOTSTRAP_PYTHON_SHA256" ]; then
         echo "Pinned Python runtime checksum mismatch; refusing to execute it." >&2
@@ -245,7 +296,7 @@ bootstrap_standalone_python() {
         return 1
     fi
 
-    /usr/bin/tar -xzf "$archive" -C "$temp_dir"
+    run_cancellable /usr/bin/tar -xzf "$archive" -C "$temp_dir"
     extracted_python="$temp_dir/python/bin/python3"
     python_is_usable "$extracted_python" || {
         echo "Verified Python archive did not contain a usable python/bin/python3." >&2
@@ -262,6 +313,7 @@ bootstrap_standalone_python() {
     rm -rf "$temp_dir"
 }
 
+emit_stage "runtime" "Checking the local AI runtime…"
 PYTHON=""
 
 # Reuse a previously prepared app-private runtime before looking for any global
@@ -294,8 +346,9 @@ if [ -z "$PYTHON" ] && [ "$INSTALL_RUNTIME" -eq 1 ]; then
 
     if [ -n "$BASE_PYTHON" ]; then
         mkdir -p "$(dirname "$RUNTIME_DIR")"
+        emit_stage "runtime" "Creating Private Librarian's local AI runtime…"
         echo "Preparing Private Librarian's local AI runtime from Python: $BASE_PYTHON"
-        "$BASE_PYTHON" -m venv "$RUNTIME_DIR"
+        run_cancellable "$BASE_PYTHON" -m venv "$RUNTIME_DIR"
     else
         bootstrap_standalone_python
     fi
@@ -328,31 +381,32 @@ PY_VERSION="$($PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.vers
 echo "Using model Python $PY_VERSION: $PYTHON"
 
 if [ "$INSTALL_RUNTIME" -eq 1 ]; then
-    "$PYTHON" -m pip install --upgrade pip
-    "$PYTHON" -m pip install --requirement "$ROOT_DIR/scripts/model-requirements.txt"
+    emit_stage "dependencies" "Installing the local AI dependencies…"
+    run_cancellable "$PYTHON" -m pip install --upgrade pip
+    run_cancellable "$PYTHON" -m pip install --requirement "$ROOT_DIR/scripts/model-requirements.txt"
     if [ "$INSTALL_SPECIALIST_RUNTIME" -eq 1 ]; then
-        "$PYTHON" -m pip install --requirement "$ROOT_DIR/scripts/specialist-requirements.txt"
+        run_cancellable "$PYTHON" -m pip install --requirement "$ROOT_DIR/scripts/specialist-requirements.txt"
     fi
 fi
 
 run_public_provisioner() {
-    "$PYTHON" "$@"
+    run_cancellable "$PYTHON" "$@"
 }
 
 run_specialist_provisioner() {
     if [ -n "$HF_TOKEN_VALUE" ]; then
         # The credential crosses into Python only on stdin. Do not export it:
         # environment variables are observable process metadata on many hosts.
-        printf '%s\n' "$HF_TOKEN_VALUE" \
-            | "$PYTHON" "$@" --hf-token-stdin
+        run_cancellable_with_input "$HF_TOKEN_VALUE" "$PYTHON" "$@" --hf-token-stdin
     else
         # Terminal users may rely on the normal Hugging Face CLI token/cache or
         # an externally supplied HF_TOKEN. The app path always uses stdin.
-        "$PYTHON" "$@"
+        run_cancellable "$PYTHON" "$@"
     fi
 }
 
 if [ "$DOWNLOAD_MODELS" -eq 1 ]; then
+    emit_stage "models" "Downloading and verifying local image models…"
     mkdir -p "$MODELS_DIR"
     args=("$ROOT_DIR/scripts/provision_image_models.py" "${MODEL_ARGS[@]}" --models-dir "$MODELS_DIR")
     if [ "$FORCE" -eq 1 ]; then
@@ -362,6 +416,7 @@ if [ "$DOWNLOAD_MODELS" -eq 1 ]; then
 fi
 
 if [ "$DOWNLOAD_SPECIALISTS" -eq 1 ]; then
+    emit_stage "models" "Downloading and verifying the selected local AI models…"
     mkdir -p "$SPECIALIST_MODELS_DIR"
     specialist_args=("$ROOT_DIR/scripts/provision_specialist_models.py" "${SPECIALIST_ARGS[@]}" --models-dir "$SPECIALIST_MODELS_DIR")
     if [ "$FORCE" -eq 1 ]; then
@@ -374,8 +429,10 @@ fi
 HF_TOKEN_VALUE=""
 unset HF_TOKEN_VALUE
 
+emit_stage "verifying" "Finishing and checking the local installation…"
 echo "Model runtime: $PYTHON"
 echo "Model root: $MODELS_DIR"
 echo "Specialist model root: $SPECIALIST_MODELS_DIR"
 echo "Next check: LIBRARIAN_MODELS_DIR=$MODELS_DIR $PYTHON $ROOT_DIR/scripts/embed.py --check"
 echo "Specialist check: LIBRARIAN_SPECIALIST_MODELS_DIR=$SPECIALIST_MODELS_DIR $PYTHON $ROOT_DIR/scripts/specialist.py --check"
+emit_stage "complete" "Local AI setup is ready."
