@@ -182,6 +182,58 @@ def _prepare_for_model(model_id: str) -> None:
         _drop_cached_models(keep=set(_CACHE) & WARM_MODELS)
 
 
+def _warm_encoder_target(torch_module, platform: str | None = None):
+    """Choose the efficient warm-encoder backend without importing torch in CI.
+
+    The target Mac has one unified memory pool, so loading a large encoder in
+    FP32 on CPU wastes both bandwidth and RAM. On Apple silicon use MPS + FP16;
+    on unsupported hosts retain the conservative CPU/FP32 behavior.
+    """
+    platform = sys.platform if platform is None else platform
+    if platform == "darwin":
+        try:
+            if hasattr(torch_module.backends, "mps") and torch_module.backends.mps.is_available():
+                return "mps", torch_module.float16
+        except Exception:
+            pass
+    return "cpu", None
+
+
+def _warm_encoder_load_kwargs(torch_module) -> tuple[str, dict]:
+    target, dtype = _warm_encoder_target(torch_module)
+    kwargs = {"low_cpu_mem_usage": True}
+    if dtype is not None:
+        kwargs["torch_dtype"] = dtype
+    return target, kwargs
+
+
+def _move_encoder_inputs(inputs, model, torch_module):
+    """Move processor tensors to the encoder and match floating input dtype."""
+    try:
+        parameter = next(model.parameters())
+        device = parameter.device
+        dtype = parameter.dtype
+    except Exception:
+        device = getattr(model, "device", None)
+        dtype = None
+    if device is None:
+        return inputs
+
+    moved = {}
+    for key, value in inputs.items():
+        if not hasattr(value, "to"):
+            moved[key] = value
+            continue
+        try:
+            if dtype is not None and torch_module.is_floating_point(value):
+                moved[key] = value.to(device=device, dtype=dtype)
+            else:
+                moved[key] = value.to(device=device)
+        except TypeError:
+            moved[key] = value.to(device)
+    return moved
+
+
 def _large_model_load_kwargs(model_id: str) -> dict:
     # Hard target-Mac rule: no supported transient model may silently load FP32.
     # Apple Silicon CPU/GPU share unified memory, so swapping layers to CPU is not
@@ -401,11 +453,15 @@ def _load_siglip():
     if not _verify_snapshot(key):
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
     _prepare_for_model(key)
+    import torch
     from transformers import AutoModel, AutoProcessor
     path = str(_model_dir(key))
     processor = AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
+    target, load_kwargs = _warm_encoder_load_kwargs(torch)
     model = AutoModel.from_pretrained(
-        path, local_files_only=True, trust_remote_code=False, low_cpu_mem_usage=True)
+        path, local_files_only=True, trust_remote_code=False, **load_kwargs)
+    if target == "mps":
+        model = model.to("mps")
     model.eval()
     _CACHE[key] = (model, processor)
     return model, processor
@@ -415,7 +471,8 @@ def _siglip_image(image) -> dict:
     import torch
     model, processor = _load_siglip()
     with torch.inference_mode():
-        inputs = processor(images=image, return_tensors="pt")
+        inputs = _move_encoder_inputs(
+            processor(images=image, return_tensors="pt"), model, torch)
         if hasattr(model, "get_image_features"):
             vector = model.get_image_features(**inputs)
         else:
@@ -433,7 +490,9 @@ def _siglip_text(text: str) -> dict:
     import torch
     model, processor = _load_siglip()
     with torch.inference_mode():
-        inputs = processor(text=[text[:MAX_TEXT_CHARS]], padding="max_length", return_tensors="pt")
+        inputs = _move_encoder_inputs(
+            processor(text=[text[:MAX_TEXT_CHARS]], padding="max_length", return_tensors="pt"),
+            model, torch)
         if hasattr(model, "get_text_features"):
             vector = model.get_text_features(**inputs)
         else:
@@ -454,11 +513,15 @@ def _load_dino():
     if not _verify_snapshot(key):
         raise RuntimeError(f"untrusted/unprovisioned model: {key}")
     _prepare_for_model(key)
+    import torch
     from transformers import AutoImageProcessor, AutoModel
     path = str(_model_dir(key))
     processor = AutoImageProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=False)
+    target, load_kwargs = _warm_encoder_load_kwargs(torch)
     model = AutoModel.from_pretrained(
-        path, local_files_only=True, trust_remote_code=False, low_cpu_mem_usage=True)
+        path, local_files_only=True, trust_remote_code=False, **load_kwargs)
+    if target == "mps":
+        model = model.to("mps")
     model.eval()
     _CACHE[key] = (model, processor)
     return model, processor
@@ -468,7 +531,9 @@ def _dino_image(image) -> dict:
     import torch
     model, processor = _load_dino()
     with torch.inference_mode():
-        output = model(**processor(images=image, return_tensors="pt"))
+        inputs = _move_encoder_inputs(
+            processor(images=image, return_tensors="pt"), model, torch)
+        output = model(**inputs)
         vector = getattr(output, "pooler_output", None)
         if vector is None:
             hidden = getattr(output, "last_hidden_state", None)
@@ -673,6 +738,7 @@ def main() -> int:
             "offline": True,
             "models": sorted(MODEL_SPECS),
             "memory_policy": "11.50-GB-ceiling; warm-encoders-only; transient-exclusive; MPS-fp16",
+            "warm_encoder_backend": "mps-fp16-when-available; cpu-fp32-fallback",
         }))
         return 0
     if args.runtime_check:
