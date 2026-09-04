@@ -8,7 +8,7 @@ For a current commit, a fresh GitHub Actions run plus any required host-only mac
 
 The normal CI workflow has three jobs:
 
-- `test` — repository hygiene, debug build, Swift 6 warnings-as-errors build, the full Swift suite, large-tree regressions, Tier-2/provider contracts, Hugging Face auth/runtime checks, and vendored SQLCipher provenance;
+- `test` — repository hygiene, debug build, Swift 6 warnings-as-errors build, the full Swift suite, large-tree regressions, Tier-2/provider contracts, Hugging Face auth/runtime checks, pinned clean-Mac runtime-bootstrap checks, and vendored SQLCipher provenance;
 - `quality` — deterministic Golden Library metric/schema checks;
 - `entitlement-audit` — release build, local E2E verification, packaging, and signed packaged-app entitlement audit.
 
@@ -96,7 +96,7 @@ The product must **not** have:
 
 Why read/write? Analysis itself remains read-only through `SourceBroker`, but the user can explicitly confirm **Apply to Finder** and later Undo inside a folder they selected. A read-only sandbox entitlement would make that advertised feature fail in the real packaged app.
 
-Why network client? The user can explicitly press **Install Selected Models** in Settings. That provisioning action needs outbound access. Normal inference is separately constrained to local/offline loading, and the app has no inbound/listener entitlement.
+Why network client? The user can explicitly start model setup from the main Analyze flow or Settings. That provisioning action needs outbound access to the pinned runtime/model hosts. Normal inference is separately constrained to local/offline loading, and the app has no inbound/listener entitlement.
 
 A blanket deny-network probe is therefore no longer an accurate packaged-app acceptance test. The relevant checks are:
 
@@ -112,7 +112,7 @@ The in-app credential contract is:
 
 ```text
 macOS Keychain
-    ↓ explicit Install action
+    ↓ explicit setup action
 Swift model setup
     ↓ stdin
 setup_models.sh
@@ -171,11 +171,25 @@ The current production fp16 specialist registry is intentionally bounded for the
 
 PaddleOCR-VL is reported but skipped on the current macOS target path; Apple Vision OCR is the supported baseline there.
 
-### Python bootstrap limitation
+### Clean-Mac Python bootstrap
 
-The default release does not yet ship its own Python distribution. In-app model setup needs a usable host Python to create the isolated runtime unless the package was explicitly built with a compatible runtime included.
+On Apple-silicon macOS, model setup no longer depends on Homebrew, Xcode, or a preinstalled global Python. If the app-private model runtime is absent and no compatible host Python is available, `setup_models.sh` downloads one exact `python-build-standalone` archive into the app's Application Support tree.
 
-A pristine consumer Mac without usable Python is therefore a real remaining distribution boundary. Do not label model setup “self-contained on every Mac” until a pinned bootstrap runtime is shipped and verified.
+The bootstrap is deliberately narrow:
+
+- CPython version `3.11.16`;
+- upstream dated release `20260825`;
+- Apple-silicon `install_only` archive only;
+- repository-pinned SHA-256 `2e50ed6ec49d8714a83c093e9ce74e1b8b21a2c64a49c3b603471d9c4caac76b`;
+- HTTPS-only `curl` invocation with no pipe to a shell;
+- archive checksum verified with `/usr/bin/shasum -a 256` before extraction/use;
+- extracted runtime stays inside Private Librarian's Application Support tree.
+
+CI syntax-checks the helper and asserts the exact version, dated release, digest, checksum verification, HTTPS restriction, no `latest` release URL, and no curl-pipe-shell pattern. Ordinary CI intentionally does not re-download the large runtime/dependency/model stack on every commit.
+
+Automatic runtime bootstrap currently targets Apple-silicon macOS. Intel hosts must provide a compatible Python 3.10+ via `LIBRARIAN_BOOTSTRAP_PYTHON` or use a package containing an appropriate runtime.
+
+A real **packaged sandbox** clean-user-account smoke remains required before calling this distribution path release-proven: hosted CI verifies the supply-chain contract and package entitlements, but does not perform the full external runtime + multi-gigabyte model install inside a consumer App Sandbox on every run.
 
 ## Large-tree verification
 
@@ -223,7 +237,7 @@ It does **not** by itself prove:
 
 - a genuine persisted `NSOpenPanel` security-scope token works after relaunch on the user's host;
 - the user's Hugging Face account has actually been approved for a gated repository;
-- a pristine Mac without Python can bootstrap the optional Python model runtime;
+- the full pinned Python/dependency/model bootstrap has completed successfully inside a clean consumer packaged sandbox;
 - public distribution is notarized/stapled unless the release process explicitly performed those steps;
 - large-tree performance meets an SLA that was never benchmarked on that exact commit/hardware.
 
