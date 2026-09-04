@@ -25,8 +25,9 @@ Examples:
   python3 scripts/provision_image_models.py --all --verify-only
   python3 scripts/provision_image_models.py --all --models-dir /path/to/Models
 
-The app itself never downloads. Use ``scripts/setup_models.sh`` to install the
-isolated local runtime and these checkpoints together. Without ``--models-dir``
+The app downloads only after an explicit setup action. Use
+``scripts/setup_models.sh`` to install the isolated local runtime and these
+checkpoints together. Without ``--models-dir``
 the provisioner uses the user's Application Support model root.
 """
 from __future__ import annotations
@@ -284,15 +285,50 @@ def model_lock(root: Path) -> Iterator[None]:
                 pass
 
 
-def archive_existing(destination: Path) -> Path:
+def _move_path(source: Path, target: Path) -> None:
+    source.rename(target)
+
+
+def archive_existing(destination: Path, *, move=_move_path) -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     archive = destination.with_name(f".{destination.name}.previous-{stamp}-{os.getpid()}")
     while archive.exists():
         archive = destination.with_name(
             f".{destination.name}.previous-{stamp}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         )
-    destination.rename(archive)
+    move(destination, archive)
     return archive
+
+
+def activate_download(partial: Path, destination: Path, *, move=_move_path) -> Path | None:
+    """Atomically activate a verified download with rollback on rename failure."""
+    archived: Path | None = None
+    if destination.exists() or destination.is_symlink():
+        archived = archive_existing(destination, move=move)
+    try:
+        move(partial, destination)
+    except Exception as activation_error:
+        if (
+            archived is not None
+            and (archived.exists() or archived.is_symlink())
+            and not (destination.exists() or destination.is_symlink())
+        ):
+            try:
+                move(archived, destination)
+            except Exception as restore_error:
+                raise ProvisioningError(
+                    "model activation failed and the previous checkpoint could not "
+                    f"be restored automatically; recover {archived} to {destination}"
+                ) from restore_error
+        raise activation_error
+
+    if archived is not None:
+        for candidate in destination.parent.glob(f".{destination.name}.previous-*"):
+            if candidate == archived:
+                continue
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate, ignore_errors=True)
+    return archived
 
 
 def download_one(name: str, models_dir: Path, *, force: bool = False) -> bool:
@@ -361,10 +397,9 @@ def download_one(name: str, models_dir: Path, *, force: bool = False) -> bool:
         ready, reason = verify_directory(partial, name, check_hashes=True)
         if not ready:
             raise ProvisioningError("post-download verification failed: " + reason)
-        if destination.exists() or destination.is_symlink():
-            archived = archive_existing(destination)
+        archived = activate_download(partial, destination)
+        if archived is not None:
             print(f"  preserved previous directory at {archived}")
-        partial.rename(destination)
         print(f"[{name}] installed: {destination}")
         return True
     except (OSError, ProvisioningError) as exc:

@@ -261,6 +261,63 @@ def verify_one(name: str, require_revision: str | None = None) -> bool:
     return _verify_snapshot(name, MODELS_ROOT / name, require_revision=require_revision)
 
 
+def _move_path(source: Path, target: Path) -> None:
+    source.rename(target)
+
+
+def activate_staged_snapshot(
+    staging: Path,
+    destination: Path,
+    *,
+    move=_move_path,
+) -> Path | None:
+    """Activate a verified snapshot without ever stranding the old model.
+
+    The previous active directory is retained as the single newest recovery
+    copy. If the staging->active rename fails, the previous directory is moved
+    back immediately before the error escapes.
+    """
+    previous_parent: Path | None = None
+    previous: Path | None = None
+    if destination.exists() or destination.is_symlink():
+        previous_parent = Path(tempfile.mkdtemp(
+            prefix=f".{destination.name}.previous-", dir=destination.parent))
+        previous = previous_parent / destination.name
+        move(destination, previous)
+
+    try:
+        move(staging, destination)
+    except Exception as activation_error:
+        if (
+            previous is not None
+            and (previous.exists() or previous.is_symlink())
+            and not (destination.exists() or destination.is_symlink())
+        ):
+            try:
+                move(previous, destination)
+            except Exception as restore_error:
+                raise RuntimeError(
+                    "model activation failed and the previous checkpoint could not "
+                    f"be restored automatically; recover {previous} to {destination}"
+                ) from restore_error
+        if previous_parent is not None:
+            try:
+                previous_parent.rmdir()
+            except OSError:
+                pass
+        raise activation_error
+
+    if previous_parent is not None:
+        # Model snapshots can be multi-GB. Keep one recovery generation rather
+        # than leaking another full checkpoint on every --force/update run.
+        for candidate in destination.parent.glob(f".{destination.name}.previous-*"):
+            if candidate == previous_parent:
+                continue
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate, ignore_errors=True)
+    return previous_parent
+
+
 def provision_one(
     name: str,
     *,
@@ -302,12 +359,11 @@ def provision_one(
         if not _verify_snapshot(name, staging, require_revision=revision):
             return False
 
-        # Keep the previous checkpoint recoverable. The final rename is the
-        # only point at which the active model directory changes.
-        if dest.exists() or dest.is_symlink():
-            archive_parent = Path(tempfile.mkdtemp(prefix=f".{name}.previous-", dir=MODELS_ROOT))
-            dest.rename(archive_parent / name)
-        staging.rename(dest)
+        # Activation is rollback-safe: a failed final rename restores the
+        # previous active checkpoint instead of leaving the app with no model.
+        previous_parent = activate_staged_snapshot(staging, dest)
+        if previous_parent is not None:
+            print(f"  preserved previous directory at {previous_parent / name}")
     except Exception as exc:
         extra = " Accept the gated model terms and authenticate first." if spec.get("gated") else ""
         print(f"[{name}] provisioning failed: {exc}.{extra}", file=sys.stderr)

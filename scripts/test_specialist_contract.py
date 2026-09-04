@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("specialist.py")
 PROVISIONER = Path(__file__).with_name("provision_specialist_models.py")
+IMAGE_PROVISIONER = Path(__file__).with_name("provision_image_models.py")
 MODEL = "siglip2-so400m-naflex"
 
 
@@ -72,6 +73,70 @@ class SpecialistContractTests(unittest.TestCase):
         self.assertNotIn("siglip2-so400m-naflex", provisioner.selected_for_profile("balanced"))
         self.assertIn("siglip2-so400m-naflex", provisioner.selected_for_profile("quality"))
         self.assertNotIn("siglip2-base-naflex", provisioner.selected_for_profile("quality"))
+
+    def test_specialist_activation_restores_previous_on_final_rename_failure(self) -> None:
+        module = load_module(PROVISIONER, "private_librarian_specialist_activation_test")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "model"
+            staging = root / "staging"
+            destination.mkdir()
+            staging.mkdir()
+            destination.joinpath("marker").write_text("old")
+            staging.joinpath("marker").write_text("new")
+
+            def fail_final_move(source: Path, target: Path) -> None:
+                if source == staging:
+                    raise OSError("simulated activation failure")
+                source.rename(target)
+
+            with self.assertRaisesRegex(OSError, "simulated activation failure"):
+                module.activate_staged_snapshot(staging, destination, move=fail_final_move)
+            self.assertEqual(destination.joinpath("marker").read_text(), "old")
+            self.assertTrue(staging.is_dir())
+            self.assertEqual(list(root.glob(".model.previous-*")), [])
+
+    def test_specialist_activation_keeps_only_one_previous_generation(self) -> None:
+        module = load_module(PROVISIONER, "private_librarian_specialist_retention_test")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "model"
+            staging = root / "staging"
+            destination.mkdir()
+            staging.mkdir()
+            destination.joinpath("marker").write_text("old")
+            staging.joinpath("marker").write_text("new")
+            stale = root / ".model.previous-stale"
+            stale.mkdir()
+            stale.joinpath("model").mkdir()
+
+            kept = module.activate_staged_snapshot(staging, destination)
+            self.assertEqual(destination.joinpath("marker").read_text(), "new")
+            self.assertIsNotNone(kept)
+            self.assertFalse(stale.exists())
+            self.assertEqual(len(list(root.glob(".model.previous-*"))), 1)
+
+    def test_legacy_model_activation_restores_previous_on_final_rename_failure(self) -> None:
+        module = load_module(IMAGE_PROVISIONER, "private_librarian_image_activation_test")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "model"
+            partial = root / "partial"
+            destination.mkdir()
+            partial.mkdir()
+            destination.joinpath("marker").write_text("old")
+            partial.joinpath("marker").write_text("new")
+
+            def fail_final_move(source: Path, target: Path) -> None:
+                if source == partial:
+                    raise OSError("simulated activation failure")
+                source.rename(target)
+
+            with self.assertRaisesRegex(OSError, "simulated activation failure"):
+                module.activate_download(partial, destination, move=fail_final_move)
+            self.assertEqual(destination.joinpath("marker").read_text(), "old")
+            self.assertTrue(partial.is_dir())
+            self.assertEqual(list(root.glob(".model.previous-*")), [])
 
     def test_warm_encoders_use_mps_fp16_on_apple_silicon_hosts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
