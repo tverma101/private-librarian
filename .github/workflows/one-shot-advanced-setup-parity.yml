@@ -1,0 +1,271 @@
+name: One-shot Advanced Library setup parity repair
+
+on:
+  push:
+    branches:
+      - fix/app-does-not-work-as-intended
+    paths:
+      - .github/workflows/one-shot-advanced-setup-parity.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/app-does-not-work-as-intended
+
+      - name: Make Advanced Library setup resume the requested analysis
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('Sources/LibrarianApp/Library/LibraryViews.swift')
+          text = path.read_text()
+
+          old = '''struct MagicContentView: View {
+    @EnvironmentObject private var model: LibrarianModel
+    @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
+'''
+          new = '''struct MagicContentView: View {
+    private enum PendingAnalysis: Equatable {
+        case all
+        case source(UUID)
+    }
+
+    @EnvironmentObject private var model: LibrarianModel
+    @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
+    @State private var showModelSetup = false
+    @State private var pendingAnalysis: PendingAnalysis?
+'''
+          if old not in text:
+              raise SystemExit('MagicContentView state marker missing')
+          text = text.replace(old, new, 1)
+
+          old = '''                    if model.isIndexing {
+                        Button("Stop Analysis") { model.cancelIndexing() }
+                    } else if !model.isLocalModelProfileReady(model.localModelProfile) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            SettingsLink {
+                                Label("Set Up Local AI…", systemImage: "arrow.down.circle")
+                            }
+                            Text("The selected quality level needs one-time setup. Settings will show one Install & Continue action; no account is required.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Menu("Analyze Folder") {
+                            Button("All Available Folders") { model.startIndexing() }
+                            Divider()
+                            ForEach(eligibleSources) { source in
+                                let name = (source.path as NSString).lastPathComponent
+                                Button("Only \\(name.isEmpty ? source.path : name)") {
+                                    model.startIndexing(source: source)
+                                }
+                            }
+                        }
+                        .disabled(model.sources.isEmpty || eligibleSources.isEmpty)
+                        .disabled(model.isReconciling)
+                        .help(model.sources.isEmpty
+                              ? "Add a folder first"
+                              : (eligibleSources.isEmpty
+                                 ? "All folders are paused or need permission — resume or re-authorize one"
+                                 : "Read and understand files without moving them"))
+                    }
+'''
+          new = '''                    if model.isIndexing {
+                        Button("Stop Analysis") { model.cancelIndexing() }
+                    } else {
+                        Menu {
+                            Button("All Available Folders") { requestAnalysis(nil) }
+                            Divider()
+                            ForEach(eligibleSources) { source in
+                                let name = (source.path as NSString).lastPathComponent
+                                Button("Only \\(name.isEmpty ? source.path : name)") {
+                                    requestAnalysis(source)
+                                }
+                            }
+                        } label: {
+                            Label(
+                                model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "Analyze Folder" : "Set Up & Analyze",
+                                systemImage: model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "sparkles" : "arrow.down.circle")
+                        }
+                        .disabled(model.sources.isEmpty || eligibleSources.isEmpty || model.isReconciling)
+                        .help(model.sources.isEmpty
+                              ? "Add a folder first"
+                              : (eligibleSources.isEmpty
+                                 ? "All folders are paused or need permission — resume or re-authorize one"
+                                 : (model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "Read and understand files without moving them"
+                                    : "Set up the selected local quality level, then analyze the folder you chose")))
+                        if !model.isLocalModelProfileReady(model.localModelProfile) {
+                            Text("One-time setup runs here, then the exact folder choice resumes automatically. No account is required for Balanced or Quality.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+'''
+          if old not in text:
+              raise SystemExit('Advanced Library analysis control marker missing')
+          text = text.replace(old, new, 1)
+
+          old = '''        .onAppear { model.start() }
+        .confirmationDialog(
+'''
+          new = '''        .onAppear { model.start() }
+        .sheet(isPresented: $showModelSetup, onDismiss: {
+            if !model.isLocalModelProfileReady(model.localModelProfile) {
+                pendingAnalysis = nil
+            }
+        }) {
+            ModelSetupView(
+                profile: model.localModelProfile,
+                onReady: { resumePendingAnalysis() },
+                onUseFast: {
+                    model.localModelProfile = .fast
+                    resumePendingAnalysis()
+                })
+                .environmentObject(model)
+        }
+        .confirmationDialog(
+'''
+          if old not in text:
+              raise SystemExit('Advanced Library sheet insertion marker missing')
+          text = text.replace(old, new, 1)
+
+          old = '''    @ViewBuilder
+    private var sectionBody: some View {
+'''
+          new = '''    private func requestAnalysis(_ source: LibrarianModel.SourceFolder?) {
+        guard !model.isIndexing, !model.isReconciling else { return }
+        let request: PendingAnalysis = source.map { .source($0.id) } ?? .all
+        if model.isLocalModelProfileReady(model.localModelProfile) {
+            runAnalysis(request)
+        } else {
+            pendingAnalysis = request
+            showModelSetup = true
+        }
+    }
+
+    private func resumePendingAnalysis() {
+        guard let request = pendingAnalysis else { return }
+        pendingAnalysis = nil
+        runAnalysis(request)
+    }
+
+    private func runAnalysis(_ request: PendingAnalysis) {
+        switch request {
+        case .all:
+            guard !eligibleSources.isEmpty else { return }
+            model.startIndexing()
+        case .source(let id):
+            guard let source = eligibleSources.first(where: { $0.id == id }) else { return }
+            model.startIndexing(source: source)
+        }
+    }
+
+    @ViewBuilder
+    private var sectionBody: some View {
+'''
+          if old not in text:
+              raise SystemExit('MagicContentView helper insertion marker missing')
+          text = text.replace(old, new, 1)
+
+          old = '''        case .overview:
+            OverviewView()
+'''
+          new = '''        case .overview:
+            OverviewView(onAnalyze: { requestAnalysis(nil) })
+'''
+          if old not in text:
+              raise SystemExit('OverviewView invocation marker missing')
+          text = text.replace(old, new, 1)
+
+          old = '''private struct OverviewView: View {
+    @EnvironmentObject private var model: LibrarianModel
+
+    var body: some View {
+'''
+          new = '''private struct OverviewView: View {
+    @EnvironmentObject private var model: LibrarianModel
+    let onAnalyze: () -> Void
+
+    var body: some View {
+'''
+          if old not in text:
+              raise SystemExit('OverviewView declaration marker missing')
+          text = text.replace(old, new, 1)
+
+          old = '''                    if model.sources.isEmpty {
+                        Button("Add a Folder") { model.addSourceFolder() }
+                    } else if !model.isLocalModelProfileReady(model.localModelProfile) {
+                        SettingsLink {
+                            Label("Set Up Local AI…", systemImage: "arrow.down.circle")
+                        }
+                    } else {
+                        Button("Analyze Folders") { model.startIndexing() }
+                    }
+'''
+          new = '''                    if model.sources.isEmpty {
+                        Button("Add a Folder") { model.addSourceFolder() }
+                    } else {
+                        Button {
+                            onAnalyze()
+                        } label: {
+                            Label(
+                                model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "Analyze Folders" : "Set Up & Analyze",
+                                systemImage: model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "sparkles" : "arrow.down.circle")
+                        }
+                    }
+'''
+          if old not in text:
+              raise SystemExit('Overview empty-state setup marker missing')
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          ci = Path('.github/workflows/ci.yml')
+          ci_text = ci.read_text()
+          marker = '''      - name: Test (mandatory security suite)
+'''
+          guard = '''      - name: Human-facing model setup flow contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F 'private func requestAnalysis(_ source: LibrarianModel.SourceFolder?)' Sources/LibrarianApp/Library/LibraryViews.swift >/dev/null
+          grep -F 'private func resumePendingAnalysis()' Sources/LibrarianApp/Library/LibraryViews.swift >/dev/null
+          grep -F 'One-time setup runs here, then the exact folder choice resumes automatically.' Sources/LibrarianApp/Library/LibraryViews.swift >/dev/null
+          if grep -F 'Settings will show one Install & Continue action' Sources/LibrarianApp/Library/LibraryViews.swift; then
+            echo 'Advanced Library regressed to redirecting setup into Settings' >&2
+            exit 1
+          fi
+
+'''
+          if marker not in ci_text:
+              raise SystemExit('CI test-step marker missing')
+          if 'Human-facing model setup flow contract' not in ci_text:
+              ci_text = ci_text.replace(marker, guard + marker, 1)
+          ci.write_text(ci_text)
+          PY
+
+      - name: Guard repaired UX contract
+        run: |
+          grep -F 'private func requestAnalysis(_ source: LibrarianModel.SourceFolder?)' Sources/LibrarianApp/Library/LibraryViews.swift
+          grep -F 'One-time setup runs here, then the exact folder choice resumes automatically.' Sources/LibrarianApp/Library/LibraryViews.swift
+          ! grep -F 'Settings will show one Install & Continue action' Sources/LibrarianApp/Library/LibraryViews.swift
+          grep -F 'Human-facing model setup flow contract' .github/workflows/ci.yml
+
+      - name: Commit repair
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Sources/LibrarianApp/Library/LibraryViews.swift .github/workflows/ci.yml
+          git diff --cached --quiet && exit 0
+          git commit -m 'Resume Advanced Library analysis after model setup'
+          git push origin HEAD:fix/app-does-not-work-as-intended
