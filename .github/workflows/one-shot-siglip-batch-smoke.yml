@@ -14,13 +14,17 @@ jobs:
   smoke:
     runs-on: macos-15
     timeout-minutes: 45
-    env:
-      LIBRARIAN_APP_SUPPORT_DIR: ${{ runner.temp }}/private-librarian-smoke
-      LIBRARIAN_MODELS_DIR: ${{ runner.temp }}/private-librarian-smoke/Models
-      LIBRARIAN_SPECIALIST_MODELS_DIR: ${{ runner.temp }}/private-librarian-smoke/Models/specialists
-      LIBRARIAN_MODEL_RUNTIME_DIR: ${{ runner.temp }}/private-librarian-smoke/model-runtime
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure isolated benchmark paths
+        run: |
+          {
+            echo "LIBRARIAN_APP_SUPPORT_DIR=$RUNNER_TEMP/private-librarian-smoke"
+            echo "LIBRARIAN_MODELS_DIR=$RUNNER_TEMP/private-librarian-smoke/Models"
+            echo "LIBRARIAN_SPECIALIST_MODELS_DIR=$RUNNER_TEMP/private-librarian-smoke/Models/specialists"
+            echo "LIBRARIAN_MODEL_RUNTIME_DIR=$RUNNER_TEMP/private-librarian-smoke/model-runtime"
+          } >> "$GITHUB_ENV"
 
       - name: Record runner hardware
         run: |
