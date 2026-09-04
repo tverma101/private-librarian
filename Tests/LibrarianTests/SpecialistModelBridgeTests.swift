@@ -51,6 +51,58 @@ final class SpecialistModelBridgeTests: XCTestCase {
         XCTAssertFalse(SpecialistModelBridge.isProvisioned(LocalModelStack.siglip2, roots: [root]))
     }
 
+    func testSigLIPBatchParserPreservesOpaqueIDOrderAndSpace() throws {
+        let model = LocalModelStack.siglip2Base
+        let dimension = SpecialistModelBridge.siglipBaseDimension
+        let vector = [Double](repeating: 0.25, count: dimension)
+        let object: [String: Any] = [
+            "model": model.id,
+            "space": "\(model.id)-joint",
+            "count": 2,
+            "items": [
+                ["id": "generation-a", "dim": dimension, "vector": vector],
+                ["id": "generation-b", "dim": dimension, "vector": vector],
+            ],
+        ]
+
+        let parsed = try XCTUnwrap(SpecialistModelBridge.parseSigLIPBatchResponse(
+            object, model: model, expectedIDs: ["generation-a", "generation-b"]))
+        XCTAssertEqual(parsed.map(\.id), ["generation-a", "generation-b"])
+        XCTAssertEqual(parsed.map(\.vector.dim), [dimension, dimension])
+        XCTAssertTrue(parsed.allSatisfy {
+            $0.vector.spaceID == SpecialistModelBridge.siglipSpaceID(for: model)
+                && $0.vector.data.count == dimension * MemoryLayout<Float>.stride
+        })
+    }
+
+    func testSigLIPBatchParserRejectsReorderedOrMalformedRows() {
+        let model = LocalModelStack.siglip2Base
+        let dimension = SpecialistModelBridge.siglipBaseDimension
+        let vector = [Double](repeating: 0.25, count: dimension)
+        let reordered: [String: Any] = [
+            "model": model.id,
+            "space": "\(model.id)-joint",
+            "count": 2,
+            "items": [
+                ["id": "generation-b", "dim": dimension, "vector": vector],
+                ["id": "generation-a", "dim": dimension, "vector": vector],
+            ],
+        ]
+        XCTAssertNil(SpecialistModelBridge.parseSigLIPBatchResponse(
+            reordered, model: model, expectedIDs: ["generation-a", "generation-b"]))
+
+        let malformed: [String: Any] = [
+            "model": model.id,
+            "space": "\(model.id)-joint",
+            "count": 1,
+            "items": [
+                ["id": "generation-a", "dim": dimension, "vector": [Double](repeating: 0.25, count: dimension - 1)],
+            ],
+        ]
+        XCTAssertNil(SpecialistModelBridge.parseSigLIPBatchResponse(
+            malformed, model: model, expectedIDs: ["generation-a"]))
+    }
+
     #if os(macOS)
     func testPaddleOCRIsReportedUnsupportedOnMacOS() {
         let preflight = SpecialistModelBridge.preflight(LocalModelStack.paddleOCR)
