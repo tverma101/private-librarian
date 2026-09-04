@@ -1,0 +1,41 @@
+name: One-shot semantic cache test fix
+
+on:
+  push:
+    branches:
+      - fix/app-does-not-work-as-intended
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/app-does-not-work-as-intended
+          fetch-depth: 0
+      - name: Fix profile-exclusive cache invariant
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/specialist.py')
+          text = p.read_text()
+          old = '''    _CACHE["siglip2-so400m-naflex"] = object()\n    _prepare_for_model("siglip2-base-naflex")\n    if _CACHE:\n        raise RuntimeError("Base preparation did not evict So400m")\n    _CACHE.clear()\n'''
+          new = '''    _CACHE["siglip2-so400m-naflex"] = object()\n    _prepare_for_model("siglip2-base-naflex")\n    if set(_CACHE) != {"dinov3-vitb16-lvd1689m"}:\n        raise RuntimeError("Base preparation did not evict So400m while retaining DINO")\n    _CACHE.clear()\n'''
+          if text.count(old) != 1:
+              raise SystemExit('expected cache self-test block exactly once')
+          p.write_text(text.replace(old, new, 1))
+          PY
+          python3 scripts/specialist.py --syntax-check
+          git diff --check
+      - name: Commit fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/specialist.py
+          git commit -m 'Fix profile-exclusive cache invariant test'
+          git push origin HEAD:fix/app-does-not-work-as-intended
