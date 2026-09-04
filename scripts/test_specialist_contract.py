@@ -12,7 +12,16 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("specialist.py")
+PROVISIONER = Path(__file__).with_name("provision_specialist_models.py")
 MODEL = "siglip2-so400m-naflex"
+
+
+def load_module(path: Path, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def load_worker(root: Path, roots: list[Path] | None = None):
@@ -21,11 +30,7 @@ def load_worker(root: Path, roots: list[Path] | None = None):
         os.environ.pop("LIBRARIAN_SPECIALIST_MODELS_DIRS", None)
     else:
         os.environ["LIBRARIAN_SPECIALIST_MODELS_DIRS"] = os.pathsep.join(map(str, roots))
-    spec = importlib.util.spec_from_file_location("private_librarian_specialist_test", SCRIPT)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_module(SCRIPT, "private_librarian_specialist_test")
 
 
 def write_snapshot(root: Path, extra: str | None = None) -> Path:
@@ -47,6 +52,20 @@ def write_snapshot(root: Path, extra: str | None = None) -> Path:
 
 
 class SpecialistContractTests(unittest.TestCase):
+    def test_consumer_profiles_never_require_gated_models(self) -> None:
+        provisioner = load_module(
+            PROVISIONER, "private_librarian_provision_profile_test")
+        for profile in ("embeddings", "balanced", "quality"):
+            names = provisioner.selected_for_profile(profile)
+            self.assertTrue(names, profile)
+            gated = [name for name in names if provisioner.MODELS[name].get("gated", False)]
+            self.assertEqual(gated, [], f"{profile} unexpectedly requires gated models")
+        self.assertNotIn(
+            "dinov3-vitb16-lvd1689m",
+            provisioner.selected_for_profile("quality"),
+        )
+        self.assertTrue(provisioner.MODELS["dinov3-vitb16-lvd1689m"].get("gated"))
+
     def test_transformers_pooling_output_is_unwrapped_before_normalization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             module = load_worker(Path(directory))
