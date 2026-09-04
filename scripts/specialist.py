@@ -288,8 +288,8 @@ def _memory_policy_self_test() -> None:
 
     _CACHE["siglip2-so400m-naflex"] = object()
     _prepare_for_model("siglip2-base-naflex")
-    if _CACHE:
-        raise RuntimeError("Base preparation did not evict So400m")
+    if set(_CACHE) != {"dinov3-vitb16-lvd1689m"}:
+        raise RuntimeError("Base preparation did not evict So400m while retaining DINO")
     _CACHE.clear()
 
 
