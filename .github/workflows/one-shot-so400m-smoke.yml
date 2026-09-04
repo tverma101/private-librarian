@@ -41,7 +41,7 @@ jobs:
             --specialists-dir "$LIBRARIAN_SPECIALIST_MODELS_DIR" \
             --runtime-dir "$LIBRARIAN_MODEL_RUNTIME_DIR"
 
-      - name: Run hardened So400m benchmark
+      - name: Run So400m benchmark with MPS memory telemetry
         run: |
           set -euxo pipefail
           "$LIBRARIAN_MODEL_RUNTIME_DIR/bin/python3" scripts/benchmark_specialist.py \
