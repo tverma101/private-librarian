@@ -29,26 +29,12 @@ jobs:
           new = '            ("Network only for explicit model setup", true),'
           if old not in text:
               raise SystemExit('privacy indicator marker missing')
-          text = text.replace(old, new, 1)
-          old_func = '''    private func hasNetworkEntitlement() -> Bool {
-              guard let task = SecTaskCreateFromSelf(nil) else { return false }
-              let client = SecTaskCopyValueForEntitlement(task, "com.apple.security.network.client" as CFString, nil) as? Bool
-              let server = SecTaskCopyValueForEntitlement(task, "com.apple.security.network.server" as CFString, nil) as? Bool
-              return (client ?? false) || (server ?? false)
-          }
-          '''
-          # Account for normal four-space source indentation rather than YAML indentation.
-          old_func = old_func.replace('              ', '        ').replace('          }', '    }')
-          if old_func not in text:
-              raise SystemExit('obsolete entitlement helper marker missing')
-          text = text.replace(old_func, '', 1)
-          app.write_text(text)
+          app.write_text(text.replace(old, new, 1))
 
           bridge = Path('Sources/LibrarianCore/LocalModels/LocalModelBridge.swift')
           text = bridge.read_text()
           old = '/// - No network entitlement is ever required.'
-          new = '''/// - This inference bridge never uses networking; the app's network-client
-          ///   entitlement exists only for explicit model provisioning.'''.replace('          ///', '///')
+          new = "/// - This inference bridge never uses networking; the app's network-client\n///   entitlement exists only for explicit model provisioning."
           if old not in text:
               raise SystemExit('LocalModelBridge network comment marker missing')
           bridge.write_text(text.replace(old, new, 1))
@@ -66,7 +52,6 @@ jobs:
         run: |
           grep -F 'Network only for explicit model setup' Sources/LibrarianApp/Library/AppEntryPoint.swift
           ! grep -F 'Internet disabled' Sources/LibrarianApp/Library/AppEntryPoint.swift
-          ! grep -F 'private func hasNetworkEntitlement' Sources/LibrarianApp/Library/AppEntryPoint.swift
           grep -F "entitlement exists only for explicit model provisioning" Sources/LibrarianCore/LocalModels/LocalModelBridge.swift
           grep -F 'offline environment enforced by the Swift bridge and CI' scripts/embed.py
 
