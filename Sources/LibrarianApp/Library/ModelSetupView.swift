@@ -85,7 +85,7 @@ struct ModelSetupView: View {
                     statusMessage,
                     systemImage: statusIsCancellation ? "stop.circle.fill" : "exclamationmark.triangle.fill")
                     .font(.subheadline)
-                    .foregroundStyle(statusIsCancellation ? .secondary : .orange)
+                    .foregroundStyle(statusIsCancellation ? Color.gray : Color.orange)
                     .textSelection(.enabled)
             }
 
