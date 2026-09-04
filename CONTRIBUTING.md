@@ -18,16 +18,19 @@ swift test
 bash script/build_and_run.sh
 ```
 
-The default build does not require downloaded AI models. Optional embedding and transcription backends are provisioned separately and must fail closed when they are unavailable.
+Fast mode does not require downloaded AI models. Balanced/Quality model setup is explicit and app-initiated; optional backends must fail closed when they are unavailable.
 
 ## Project rules that should not be broken
 
 These are product invariants, not style preferences:
 
-- Original user files are read-only. Do not add code that moves, renames, deletes, rewrites, tags, changes permissions on, or sets xattrs on source files.
-- `SourceBroker` owns source-file access. Analysis and model code should receive broker-owned bytes, derived text, feature data, or decoded PCM rather than source filesystem authority.
-- The encrypted catalog is the writable knowledge layer. Organization is virtual.
-- The app is local-first and offline. Do not add telemetry, cloud inference, update beacons, or runtime network access.
+- Analysis of original user files is read-only. `SourceBroker` owns that read boundary and must never hand a write-capable source handle to model or parser code.
+- Finder mutation is allowed only through the explicit, reviewed `OrganizationApplier` Apply/Undo workflow. Do not add hidden or automatic moves, renames, deletes, rewrites, permission changes, Finder tags, or xattrs.
+- Every Apply move must remain confined to an active user-authorized read/write root, be journaled in the encrypted catalog, and remain undoable according to the Apply contract.
+- Analysis and model code should receive broker-owned bytes, derived text, feature data, or decoded PCM rather than source filesystem authority.
+- The encrypted catalog is the writable knowledge layer. Organization remains virtual until the user explicitly confirms Apply.
+- The app is local-first. Do not add telemetry, cloud inference, update beacons, listeners, or unrelated runtime network access. Outbound networking is reserved for explicit user-initiated model provisioning; normal indexing and inference stay offline.
+- Credentials for optional gated model setup belong in Keychain and must not be placed in argv, shell history, UserDefaults, manifests, or logs.
 - Symlinks and package boundaries must stay fail-closed.
 - Expensive work must stay incremental. An unchanged file should not repeatedly trigger OCR, embeddings, decoding, or ASR.
 - Tests should use generated or synthetic fixtures, not files copied from a real Desktop, Downloads folder, class folder, photo library, or other personal source.
@@ -68,6 +71,6 @@ Use neutral synthetic examples such as `/Users/example/...` in tests and documen
 
 Do not publish exploit details in a normal issue. Follow the private reporting instructions in `SECURITY.md`.
 
-## License status
+## License
 
-A project-level license has not been selected yet. That owner decision is tracked in issue #48. Third-party notices already stored under `ThirdParty/` must remain intact.
+Private Librarian is licensed under the Apache License 2.0. Keep third-party notices and provenance stored under `ThirdParty/` intact.
