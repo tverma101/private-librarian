@@ -6,7 +6,6 @@ import ImageIO
 /// librarian-cli — verification harness for the librarian core.
 /// Every subcommand is read-only with respect to source folders.
 /// Catalog lives under the caller-specified path (tests use temp dirs).
-import Foundation
 
 let io = FileHandle.standardOutput
 
@@ -15,14 +14,23 @@ func printUsage() {
     librarian-cli — Private Local Librarian (read-only verification harness)
 
     USAGE:
-      librarian-cli index <folder> --catalog <path>     Index a folder into an encrypted catalog
-      librarian-cli search <query> --catalog <path> [--tier2] [--provider <kind>]
+      librarian-cli index <folder> --catalog <path> [--tier2] [--profile fast|balanced|quality] [--provider <kind>]
+                                                          Index a folder into an encrypted catalog
+      librarian-cli search <query> --catalog <path> [--tier2] [--profile fast|balanced|quality] [--provider <kind>]
                                                           Search inside the encrypted catalog
       librarian-cli status  --catalog <path>            Show catalog counts
-    librarian-cli dupes   --catalog <path>            Compute exact duplicate groups
-    librarian-cli graph-stats --catalog <path>         Measure virtual graph query size
-    librarian-cli tree    --catalog <path>            Print virtual category tree
-    librarian-cli provider-smoke [--samples <n>]      Measure genuine MobileCLIP image/text inference
+      librarian-cli dupes   --catalog <path>            Compute exact duplicate groups
+      librarian-cli graph-stats --catalog <path>        Measure virtual graph query size
+      librarian-cli tree    --catalog <path>            Print virtual category tree
+      librarian-cli provider-smoke [--samples <n>]      Measure genuine MobileCLIP image/text inference
+      librarian-cli specialist-smoke --profile balanced|quality [--samples <n>]
+                                                          Measure the selected SigLIP2 profile on this Mac
+
+    PROFILE RULES:
+      No profile / no --tier2  → Fast, no downloaded specialist required.
+      --tier2 alone            → Balanced (compatibility with the old CLI flag).
+      --profile balanced       → Balanced + Tier-2 enabled.
+      --profile quality        → Quality + Tier-2 enabled.
 
     The GUI app owns its stable signed app-specific Keychain item. The CLI never
     opens that item; set LIBRARIAN_CATALOG_KEY to a 64-character hex key for
@@ -45,8 +53,42 @@ func hasFlag(_ name: String) -> Bool {
 
 func positional(_ index: Int) -> String? {
     // Drop program name AND the subcommand (args[1]); flags filtered out.
+    // Values belonging to flags are still present, so callers should use this
+    // only for the first positional argument, which every current command does.
     let args = CommandLine.arguments.dropFirst(2).filter { !$0.hasPrefix("--") }
     return args.count > index ? args[index] : nil
+}
+
+enum CLIError: Error, CustomStringConvertible {
+    case invalidProfile(String)
+    case fastHasNoSpecialist
+
+    var description: String {
+        switch self {
+        case .invalidProfile(let value):
+            return "unknown local-model profile '\(value)'; expected fast, balanced, or quality"
+        case .fastHasNoSpecialist:
+            return "Fast has no downloaded SigLIP2 specialist; use --profile balanced or --profile quality"
+        }
+    }
+}
+
+/// Keep the verification harness aligned with the product profile contract.
+/// Historically `--tier2` meant "turn on the local model stack"; after the
+/// Base-vs-So400m migration, preserve that behavior by treating a bare
+/// `--tier2` as Balanced rather than silently selecting Fast/no specialist.
+func requestedLocalModelProfile() throws -> LocalModelProfile {
+    if let raw = argValue("--profile") {
+        guard let profile = LocalModelProfile(rawValue: raw.lowercased()) else {
+            throw CLIError.invalidProfile(raw)
+        }
+        return profile
+    }
+    return hasFlag("--tier2") ? .balanced : .fast
+}
+
+func tier2Enabled(for profile: LocalModelProfile) -> Bool {
+    hasFlag("--tier2") || profile != .fast
 }
 
 func percentile(_ values: [Double], _ fraction: Double) -> Double {
@@ -71,49 +113,79 @@ func deterministicPNG() -> Data? {
     return output as Data
 }
 
-func runProviderSmoke(samples: Int) throws {
-    let provider = CoreMLMobileCLIPProvider()
-    let preflight = provider.preflight
+func measuredProviderResult(
+    providerID: String,
+    modelID: String,
+    profile: String,
+    expectedDimension: Int,
+    preflight: EmbeddingProviderPreflight,
+    imageEmbed: (Data) -> EmbeddingVector?,
+    textEmbed: (String) -> EmbeddingVector?,
+    samples: Int
+) throws -> [String: Any] {
     if !preflight.available {
-        print(String(data: try JSONSerialization.data(withJSONObject: [
-            "provider": provider.providerID,
+        return [
+            "provider": providerID,
+            "model": modelID,
+            "profile": profile,
             "status": "unavailable",
             "reason": preflight.reason,
             "artifacts": preflight.artifacts,
             "dependencies": preflight.dependencies,
-        ], options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
-        return
+        ]
     }
-    guard let imageBytes = deterministicPNG() else { throw NSError(domain: "provider-smoke", code: 1) }
+
+    guard let imageBytes = deterministicPNG() else {
+        throw NSError(domain: "provider-smoke", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "could not create deterministic PNG fixture"])
+    }
     let query = "a red square"
+    let warmCalls = max(1, samples)
     var imageLatencies: [Double] = []
     var textLatencies: [Double] = []
     var image: EmbeddingVector?
     var text: EmbeddingVector?
+
     let coldImageStart = Date().timeIntervalSinceReferenceDate
-    image = provider.embedImageBytes(imageBytes)
+    image = imageEmbed(imageBytes)
     let coldImageLatency = (Date().timeIntervalSinceReferenceDate - coldImageStart) * 1000
+
     let coldTextStart = Date().timeIntervalSinceReferenceDate
-    text = provider.embedJointText(query)
+    text = textEmbed(query)
     let coldTextLatency = (Date().timeIntervalSinceReferenceDate - coldTextStart) * 1000
-    for _ in 0..<max(1, samples) {
-        let imageStart = Date().timeIntervalSinceReferenceDate
-        image = provider.embedImageBytes(imageBytes)
-        imageLatencies.append((Date().timeIntervalSinceReferenceDate - imageStart) * 1000)
-        let textStart = Date().timeIntervalSinceReferenceDate
-        text = provider.embedJointText(query)
-        textLatencies.append((Date().timeIntervalSinceReferenceDate - textStart) * 1000)
+
+    let warmImageStart = Date().timeIntervalSinceReferenceDate
+    for _ in 0..<warmCalls {
+        let start = Date().timeIntervalSinceReferenceDate
+        image = imageEmbed(imageBytes)
+        imageLatencies.append((Date().timeIntervalSinceReferenceDate - start) * 1000)
     }
+    let warmImageSeconds = Date().timeIntervalSinceReferenceDate - warmImageStart
+
+    let warmTextStart = Date().timeIntervalSinceReferenceDate
+    for _ in 0..<warmCalls {
+        let start = Date().timeIntervalSinceReferenceDate
+        text = textEmbed(query)
+        textLatencies.append((Date().timeIntervalSinceReferenceDate - start) * 1000)
+    }
+    let warmTextSeconds = Date().timeIntervalSinceReferenceDate - warmTextStart
+
     guard let image, let text,
-          image.dim == CoreMLMobileCLIPProvider.dimension,
-          text.dim == CoreMLMobileCLIPProvider.dimension,
+          image.dim == expectedDimension,
+          text.dim == expectedDimension,
           image.spaceID == text.spaceID,
           let cosine = LocalModelBridge.cosineSimilarity(image.data, text.data) else {
         throw NSError(domain: "provider-smoke", code: 2,
-                      userInfo: [NSLocalizedDescriptionKey: "MobileCLIP did not produce matching 512-D image/text vectors"])
+                      userInfo: [NSLocalizedDescriptionKey:
+                        "provider did not produce matching \(expectedDimension)-D image/text vectors"])
     }
-    let result: [String: Any] = [
-        "provider": provider.providerID,
+
+    let imageThroughput = warmImageSeconds > 0 ? Double(warmCalls) / warmImageSeconds : 0
+    let textThroughput = warmTextSeconds > 0 ? Double(warmCalls) / warmTextSeconds : 0
+    return [
+        "provider": providerID,
+        "model": modelID,
+        "profile": profile,
         "status": "measured",
         "fixture": "deterministic-red-square-v1",
         "space_id": image.spaceID,
@@ -121,11 +193,60 @@ func runProviderSmoke(samples: Int) throws {
         "text_to_image_cosine": cosine,
         "cold_image_latency_ms": coldImageLatency,
         "cold_text_latency_ms": coldTextLatency,
-        "image_latency_ms": ["p50": percentile(imageLatencies, 0.50), "p95": percentile(imageLatencies, 0.95)],
-        "text_latency_ms": ["p50": percentile(textLatencies, 0.50), "p95": percentile(textLatencies, 0.95)],
-        "warm_calls": max(1, samples),
+        "image_latency_ms": [
+            "p50": percentile(imageLatencies, 0.50),
+            "p95": percentile(imageLatencies, 0.95),
+        ],
+        "text_latency_ms": [
+            "p50": percentile(textLatencies, 0.50),
+            "p95": percentile(textLatencies, 0.95),
+        ],
+        "sequential_image_embeddings_per_second": imageThroughput,
+        "sequential_text_embeddings_per_second": textThroughput,
+        "warm_calls": warmCalls,
+        "note": "Sequential warm-call baseline; not a batched throughput claim.",
     ]
-    print(String(data: try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]), encoding: .utf8)!)
+}
+
+func printJSON(_ object: [String: Any]) throws {
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+}
+
+func runProviderSmoke(samples: Int) throws {
+    let provider = CoreMLMobileCLIPProvider()
+    let result = try measuredProviderResult(
+        providerID: provider.providerID,
+        modelID: CoreMLMobileCLIPProvider.checkpointID,
+        profile: "coreml-mobileclip",
+        expectedDimension: CoreMLMobileCLIPProvider.dimension,
+        preflight: provider.preflight,
+        imageEmbed: { provider.embedImageBytes($0) },
+        textEmbed: { provider.embedJointText($0) },
+        samples: samples)
+    try printJSON(result)
+}
+
+func runSpecialistSmoke(profile: LocalModelProfile, samples: Int) throws {
+    guard let model = LocalModelStack.semanticModel(for: profile) else {
+        throw CLIError.fastHasNoSpecialist
+    }
+    let bridge = SpecialistModelBridge()
+    let provider = SpecialistSigLIP2EmbeddingProvider(model: model, bridge: bridge)
+    guard let expectedDimension = SpecialistModelBridge.siglipDimension(for: model) else {
+        throw NSError(domain: "specialist-smoke", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "unknown SigLIP2 embedding dimension"])
+    }
+    let result = try measuredProviderResult(
+        providerID: provider.providerID,
+        modelID: model.id,
+        profile: profile.rawValue,
+        expectedDimension: expectedDimension,
+        preflight: provider.preflight,
+        imageEmbed: { provider.embedImageBytes($0) },
+        textEmbed: { provider.embedJointText($0) },
+        samples: samples)
+    try printJSON(result)
 }
 
 func openCatalog(_ catalogPath: String) throws -> Catalog {
@@ -172,6 +293,8 @@ do {
         guard let folder = positional(0), let catalogPath = argValue("--catalog") else {
             printUsage(); exit(2)
         }
+        let profile = try requestedLocalModelProfile()
+        let useTier2 = tier2Enabled(for: profile)
         let url = URL(fileURLWithPath: folder)
         // Security-scoped bookmark flow belongs to the GUI app; the CLI takes
         // an explicit path argument from the operator.
@@ -183,16 +306,18 @@ do {
         let catalog = try openCatalog(catalogPath)
         let broker = SourceBroker()
         var options = Indexer.Options()
-        options.enableLocalEmbeddings = hasFlag("--tier2")
+        options.enableLocalEmbeddings = useTier2
         options.embeddingProviderKind = argValue("--provider")
+        options.localModelProfile = profile
         let indexer = Indexer(broker: broker, catalog: catalog, scheduler: Scheduler(), options: options)
         let t0 = Date()
         var sessionOptions = ScalableIndexSession.Options()
-        sessionOptions.enablePersistentEmbeddingWorker = hasFlag("--tier2")
+        sessionOptions.enablePersistentEmbeddingWorker = useTier2
         let session = ScalableIndexSession(
             broker: broker, catalog: catalog, indexer: indexer, options: sessionOptions)
         let result = try session.indexRoot(url)
         let groups = try indexer.computeDuplicateGroups()
+        print("profile=\(profile.rawValue) tier2=\(useTier2) provider=\(indexer.embeddingProvider.providerID)")
         print("index-root=\(result.rootPath) completion=\(result.completion.rawValue) indexed=\(result.processed) scanned=\(result.scanned) missing=\(result.missingMarked) unreadable-directories=\(result.unreadableDirectories) cancelled=\(result.cancelled) paused=\(result.paused) elapsed=\(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
         let metrics = indexer.workMetrics
         print("work-metrics visionCalls=\(metrics.visionCalls) ocrCalls=\(metrics.ocrCalls) clipCalls=\(metrics.clipCalls) textEmbedCalls=\(metrics.textEmbedCalls) decodeCalls=\(metrics.decodeCalls)")
@@ -206,9 +331,12 @@ do {
         guard let q = positional(0), let catalogPath = argValue("--catalog") else {
             printUsage(); exit(2)
         }
+        let profile = try requestedLocalModelProfile()
+        let useTier2 = tier2Enabled(for: profile)
         let catalog = try openCatalog(catalogPath)
         let provider = argValue("--provider").map { EmbeddingProviderFactory.make(kind: $0) }
-        let svc = SearchService(catalog: catalog, enableLocalEmbeddings: hasFlag("--tier2"),
+        let svc = SearchService(catalog: catalog, enableLocalEmbeddings: useTier2,
+                                localModelProfile: profile,
                                 embeddingProvider: provider)
         for hit in try svc.search(q) {
             print("\(hit.fileID)  rank=\(hit.rank ?? 0)  \((hit.path as NSString).lastPathComponent)")
@@ -249,6 +377,10 @@ do {
     case "provider-smoke":
         let samples = max(1, Int(argValue("--samples") ?? "5") ?? 5)
         try runProviderSmoke(samples: samples)
+    case "specialist-smoke":
+        let profile = try requestedLocalModelProfile()
+        let samples = max(1, Int(argValue("--samples") ?? "5") ?? 5)
+        try runSpecialistSmoke(profile: profile, samples: samples)
     default:
         printUsage()
         exit(2)
