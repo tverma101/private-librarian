@@ -89,6 +89,23 @@ jobs:
           grep -F 'kwargs["torch_dtype"] = torch.float16' scripts/specialist.py
           python3 scripts/provision_specialist_models.py --list >/dev/null
 
+          # Clean-Mac bootstrap is executable supply-chain code. Keep it pinned
+          # to one immutable python-build-standalone release + checksum and
+          # never regress into curl-pipe-shell or an unverified "latest" URL.
+          grep -F 'BOOTSTRAP_PYTHON_VERSION="3.11.16"' scripts/setup_models.sh >/dev/null
+          grep -F 'BOOTSTRAP_PYTHON_RELEASE="20260825"' scripts/setup_models.sh >/dev/null
+          grep -F 'BOOTSTRAP_PYTHON_SHA256="2e50ed6ec49d8714a83c093e9ce74e1b8b21a2c64a49c3b603471d9c4caac76b"' scripts/setup_models.sh >/dev/null
+          grep -F '/usr/bin/shasum -a 256' scripts/setup_models.sh >/dev/null
+          grep -F -- "--proto '=https'" scripts/setup_models.sh >/dev/null
+          if grep -E 'curl[^\n]*\|' scripts/setup_models.sh; then
+            echo "Model runtime bootstrap must never execute curl output through a shell" >&2
+            exit 1
+          fi
+          if grep -F '/releases/latest/' scripts/setup_models.sh; then
+            echo "Model runtime bootstrap must use a pinned release, not latest" >&2
+            exit 1
+          fi
+
           # Gated-model auth must be possible without putting an app-supplied
           # token in argv, source, UserDefaults, generated manifests, or child
           # process environment variables. setup_models.sh reads stdin once;
@@ -185,8 +202,8 @@ jobs:
           python3 scripts/audit_entitlements.py .build/package-stage/PrivateLibrarian.app --expect-hardened
 
           # This app intentionally has outbound client networking for the
-          # explicit Settings > Install Models action. The entitlement audit
-          # proves server/listener capability remains absent; offline model
-          # worker behavior is asserted in the test job above.
+          # explicit model-setup action. The entitlement audit proves
+          # server/listener capability remains absent; offline model worker
+          # behavior is asserted in the test job above.
           ! codesign -d --entitlements :- .build/package-stage/PrivateLibrarian.app 2>&1 \
             | grep -q '<key>com.apple.security.network.server</key>[[:space:]]*<true/>'
