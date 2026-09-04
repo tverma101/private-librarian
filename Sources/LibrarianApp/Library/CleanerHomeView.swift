@@ -55,9 +55,9 @@ struct CleanerHomeView: View {
         case .fast:
             return "Fast analysis uses deterministic rules and Apple Vision. No model download is required."
         case .balanced:
-            return "Balanced uses downloaded local models when available and keeps uncertain files for review."
+            return "Balanced uses SigLIP2 Base and local fallbacks, then keeps uncertain files for review."
         case .quality:
-            return "Quality uses the full downloaded local stack for harder images and documents."
+            return "Quality uses SigLIP2 So400m and the stronger local fallback stack for harder images and documents."
         }
     }
 

@@ -5,7 +5,7 @@ import LibrarianAppSupport
 
 /// Native SwiftUI shell (plan §1, §45, §46). No web server, no WebView,
 /// no listening socket. Sources are added via the system folder picker with
-/// read-only security-scoped bookmarks; the catalog is SQLCipher-encrypted
+/// security-scoped bookmarks; the catalog is SQLCipher-encrypted
 /// with its key in the app-owned Keychain.
 @main
 struct PrivateLibrarianApp: App {
@@ -235,8 +235,17 @@ final class LibrarianModel: ObservableObject {
     @Published var localModelProfile: LocalModelProfile {
         didSet {
             UserDefaults.standard.set(localModelProfile.rawValue, forKey: "local-model-profile-v1")
-            restartLiveCoordinator()
-            refreshDashboard()
+            // Quality is the consumer-facing source of truth. Fast means the
+            // zero-download path; Balanced/Quality mean their downloaded local
+            // stack is actually enabled. Do not let an old hidden Tier-2 toggle
+            // silently make the selected quality level lie to the user.
+            let shouldEnable = localModelProfile != .fast
+            if localEmbeddingsEnabled != shouldEnable {
+                localEmbeddingsEnabled = shouldEnable
+            } else {
+                restartLiveCoordinator()
+                refreshDashboard()
+            }
         }
     }
     @Published var searchMode: String = "auto" // auto | exact | semantic | visual | clipText
@@ -313,9 +322,13 @@ final class LibrarianModel: ObservableObject {
     init() {
         self.localTranscriptionEnabled = UserDefaults.standard.bool(forKey: AppLocalTranscription.enabledDefaultsKey)
             && AppLocalTranscription.isAvailable
-        self.localEmbeddingsEnabled = UserDefaults.standard.bool(forKey: "tier2-enabled-v1")
-        self.localModelProfile = LocalModelProfile(
+        let storedProfile = LocalModelProfile(
             rawValue: UserDefaults.standard.string(forKey: "local-model-profile-v1") ?? "fast") ?? .fast
+        // Migrate older builds that persisted an independent Tier-2 toggle.
+        // The visible quality choice now owns this behavior deterministically.
+        self.localEmbeddingsEnabled = storedProfile != .fast
+        self.localModelProfile = storedProfile
+        UserDefaults.standard.set(storedProfile != .fast, forKey: "tier2-enabled-v1")
         if let m = UserDefaults.standard.string(forKey: "tier2-search-mode-v1") { self.searchMode = m }
         loadBookmarks()
         loadExclusions()
@@ -537,7 +550,7 @@ final class LibrarianModel: ObservableObject {
         }
     }
 
-    // MARK: - Read-only source access via security-scoped bookmarks
+    // MARK: - Security-scoped source access
 
     func addSourceFolder() {
         let panel = NSOpenPanel()
@@ -552,7 +565,7 @@ final class LibrarianModel: ObservableObject {
                     options: [.withSecurityScope],
                     includingResourceValuesForKeys: nil,
                     relativeTo: nil), !data.isEmpty else {
-                    self.log("could not persist read-only bookmark: \(url.path)")
+                    self.log("could not persist folder permission: \(url.path)")
                     continue
                 }
                 self.bookmarkDataByPath[url.path] = data
@@ -624,7 +637,7 @@ final class LibrarianModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-            panel.message = "Choose the replacement folder. Indexing stays read-only; files move only when you apply a plan."
+        panel.message = "Choose the replacement folder. Analysis reads only; files move only when you apply a plan."
         panel.begin { [weak self] response in
             guard let self, response == .OK, let url = panel.url else { return }
             guard let data = try? url.bookmarkData(
@@ -684,7 +697,7 @@ final class LibrarianModel: ObservableObject {
         sourcesNeedingReauthorization.contains(source.path)
     }
 
-    /// Resolve a stored read-only security-scoped bookmark and run `body`
+    /// Resolve a stored security-scoped bookmark and run `body`
     /// while access is active. Production app access never falls back to a raw
     /// path: missing, stale, and corrupt bookmarks require reauthorization.
     func withSource<T>(_ source: SourceFolder, _ body: (URL) throws -> T) rethrows -> T? {

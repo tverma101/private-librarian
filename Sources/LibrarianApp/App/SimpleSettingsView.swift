@@ -140,7 +140,13 @@ struct SimpleSettingsView: View {
                                 .buttonStyle(.borderless)
                         }
 
-                        Toggle("Use downloaded local embeddings", isOn: $model.localEmbeddingsEnabled)
+                        Label(
+                            model.localModelProfile == .fast
+                                ? "Downloaded local AI is off in Fast mode"
+                                : "Downloaded local AI follows the selected quality level",
+                            systemImage: model.localModelProfile == .fast ? "bolt" : "checkmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
 
                         Divider()
 
