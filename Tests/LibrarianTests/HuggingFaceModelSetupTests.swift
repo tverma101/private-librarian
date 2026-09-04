@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import LibrarianCore
 @testable import LibrarianAppSupport
 
 final class HuggingFaceModelSetupTests: XCTestCase {
@@ -49,5 +50,35 @@ final class HuggingFaceModelSetupTests: XCTestCase {
         XCTAssertFalse(operation.isCancellationRequested)
         operation.cancel()
         XCTAssertTrue(operation.isCancellationRequested)
+    }
+
+    func testConsumerProfileSelectorsAreExplicitAndCredentialFree() {
+        XCTAssertEqual(
+            AppModelSetup.selectorArguments(profile: .fast),
+            ["--specialist-profile", "embeddings"])
+        XCTAssertEqual(
+            AppModelSetup.selectorArguments(profile: .balanced),
+            ["--specialist-profile", "balanced"])
+        XCTAssertEqual(
+            AppModelSetup.selectorArguments(profile: .quality),
+            ["--specialist-profile", "quality"])
+
+        for profile in LocalModelProfile.allCases {
+            let arguments = AppModelSetup.selectorArguments(profile: profile)
+            XCTAssertFalse(arguments.contains("--hf-token-stdin"))
+            XCTAssertFalse(arguments.joined(separator: " ").contains("hf_"))
+        }
+    }
+
+    func testAdvancedGatedSelectorOnlyAllowsRegisteredGatedSpecialists() {
+        XCTAssertEqual(
+            AppModelSetup.selectorArguments(specialist: LocalModelStack.dinov3),
+            ["--specialist-model", LocalModelStack.dinov3.id])
+        XCTAssertNil(AppModelSetup.selectorArguments(specialist: LocalModelStack.siglip2Base))
+        XCTAssertNil(AppModelSetup.selectorArguments(specialist: LocalModelStack.siglip2So400m))
+
+        let arguments = AppModelSetup.selectorArguments(specialist: LocalModelStack.dinov3) ?? []
+        XCTAssertFalse(arguments.contains("--hf-token-stdin"))
+        XCTAssertFalse(arguments.joined(separator: " ").contains("hf_"))
     }
 }
