@@ -227,7 +227,7 @@ public enum LocalEmbeddingProviderSelection {
         if enabled,
            let semantic = LocalModelStack.semanticModel(for: profile),
            SpecialistModelBridge.isProvisioned(semantic) {
-            return SpecialistSigLIP2EmbeddingProvider(
+            return PrefetchingSigLIP2EmbeddingProvider(
                 model: semantic,
                 bridge: specialistBridge ?? SpecialistModelBridge())
         }
