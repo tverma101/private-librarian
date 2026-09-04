@@ -24,6 +24,7 @@ HF_TOKEN_STDIN=0
 HF_TOKEN_VALUE=""
 CURRENT_CHILD_PID=""
 CANCEL_REQUESTED=0
+BOOTSTRAP_TEMP_DIR=""
 
 # Machine-readable stage records are deliberately also human-readable in the
 # setup log. The app parses only this prefix and never invents a percentage.
@@ -53,6 +54,14 @@ cancel_setup() {
         for pid in $(jobs -pr); do
             wait "$pid" 2>/dev/null || true
         done
+    fi
+
+    # If cancellation landed while the standalone Python archive was being
+    # downloaded or extracted, remove only the mktemp directory owned by this
+    # setup process. Never leave a half-runtime staging tree in app data.
+    if [ -n "$BOOTSTRAP_TEMP_DIR" ] && [ -d "$BOOTSTRAP_TEMP_DIR" ]; then
+        rm -rf "$BOOTSTRAP_TEMP_DIR"
+        BOOTSTRAP_TEMP_DIR=""
     fi
     exit 130
 }
@@ -286,10 +295,14 @@ bootstrap_standalone_python() {
     parent="$(dirname "$RUNTIME_DIR")"
     mkdir -p "$parent"
     temp_dir="$(mktemp -d "$parent/.private-librarian-python.XXXXXX")"
+    BOOTSTRAP_TEMP_DIR="$temp_dir"
     archive="$temp_dir/$BOOTSTRAP_PYTHON_ARCHIVE"
 
     cleanup_python_bootstrap() {
         rm -rf "$temp_dir"
+        if [ "$BOOTSTRAP_TEMP_DIR" = "$temp_dir" ]; then
+            BOOTSTRAP_TEMP_DIR=""
+        fi
     }
     trap cleanup_python_bootstrap RETURN
 
@@ -327,6 +340,7 @@ bootstrap_standalone_python() {
     fi
     mv "$temp_dir/python" "$RUNTIME_DIR"
     echo "Installed pinned Python $BOOTSTRAP_PYTHON_VERSION runtime for Private Librarian."
+    BOOTSTRAP_TEMP_DIR=""
     trap - RETURN
     rm -rf "$temp_dir"
 }

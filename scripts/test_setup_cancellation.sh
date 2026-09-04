@@ -2,6 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The live cancellation fixture below uses a fake existing Python runtime, so
+# statically pin the separate clean-Mac bootstrap cleanup contract here too.
+grep -F 'BOOTSTRAP_TEMP_DIR=""' "$ROOT_DIR/scripts/setup_models.sh" >/dev/null
+grep -F 'rm -rf "$BOOTSTRAP_TEMP_DIR"' "$ROOT_DIR/scripts/setup_models.sh" >/dev/null
+
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/private-librarian-cancel-test.XXXXXX")"
 SETUP_PID=""
 CHILD_PID=""
