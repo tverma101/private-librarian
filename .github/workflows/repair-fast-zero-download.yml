@@ -1,0 +1,78 @@
+name: Repair Fast zero-download invariant
+
+on:
+  push:
+    branches:
+      - fix/app-does-not-work-as-intended
+    paths:
+      - .github/workflows/repair-fast-zero-download.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/app-does-not-work-as-intended
+      - name: Patch Fast setup invariant
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one patch target, found {count}")
+              target.write_text(text.replace(old, new, 1))
+
+          setup = "Sources/LibrarianAppSupport/Runtime/HuggingFaceModelSetup.swift"
+          replace_once(setup,
+              '''        switch profile {\n        case .fast: return ["--specialist-profile", "embeddings"]\n        case .balanced: return ["--specialist-profile", "balanced"]\n        case .quality: return ["--specialist-profile", "quality"]\n        }\n''',
+              '''        switch profile {\n        case .fast: return []\n        case .balanced: return ["--specialist-profile", "balanced"]\n        case .quality: return ["--specialist-profile", "quality"]\n        }\n''')
+
+          replace_once(setup,
+              '''    public static func run(\n        profile: LocalModelProfile,\n        token: String?,\n        operation: ModelSetupOperation = ModelSetupOperation()\n    ) async -> ModelSetupResult {\n        await run(\n            selectorArguments: selectorArguments(profile: profile),\n            token: token,\n            operation: operation)\n    }\n''',
+              '''    public static func run(\n        profile: LocalModelProfile,\n        token: String?,\n        operation: ModelSetupOperation = ModelSetupOperation()\n    ) async -> ModelSetupResult {\n        // Fast is the hard zero-download baseline. Keep this invariant here,\n        // below the UI, so any future caller cannot accidentally turn Fast\n        // into an embeddings/runtime install by invoking AppModelSetup directly.\n        if profile == .fast {\n            return ModelSetupResult(\n                succeeded: true,\n                status: 0,\n                message: "Fast uses built-in macOS analysis and requires no model setup.",\n                output: "")\n        }\n        return await run(\n            selectorArguments: selectorArguments(profile: profile),\n            token: token,\n            operation: operation)\n    }\n''')
+
+          tests = "Tests/LibrarianTests/HuggingFaceModelSetupTests.swift"
+          replace_once(tests,
+              '''        XCTAssertEqual(\n            AppModelSetup.selectorArguments(profile: .fast),\n            ["--specialist-profile", "embeddings"])\n''',
+              '''        XCTAssertEqual(\n            AppModelSetup.selectorArguments(profile: .fast),\n            [])\n''')
+          replace_once(tests,
+              '''    func testAdvancedGatedSelectorOnlyAllowsRegisteredGatedSpecialists() {\n''',
+              '''    func testFastSetupIsAlwaysAZeroDownloadNoOp() async {\n        let result = await AppModelSetup.run(profile: .fast, token: "must-not-be-used")\n        XCTAssertTrue(result.succeeded)\n        XCTAssertEqual(result.status, 0)\n        XCTAssertEqual(result.output, "")\n        XCTAssertFalse(result.cancelled)\n        XCTAssertTrue(result.message.contains("requires no model setup"))\n    }\n\n    func testAdvancedGatedSelectorOnlyAllowsRegisteredGatedSpecialists() {\n''')
+
+          settings = "Sources/LibrarianApp/App/SimpleSettingsView.swift"
+          replace_once(settings,
+              '''                        HStack {\n                            Button("Run Setup Again…") { showModelSetup = true }\n                            Button("Open Models Folder") { openModelsFolder() }\n                            Button {\n                                copySetupCommand(openTerminal: true)\n                            } label: {\n                                Label(copiedCommand ? "Command Copied" : "Terminal Fallback", systemImage: "terminal")\n                            }\n                        }\n\n                        DisclosureGroup("Terminal command") {\n                            Text(setupCommand)\n                                .font(.system(.caption2, design: .monospaced))\n                                .foregroundStyle(.secondary)\n                                .textSelection(.enabled)\n                            Text("This profile command installs only public models. Installing DINOv3 is a separate advanced action because its upstream repository requires account approval.")\n                                .font(.caption2)\n                                .foregroundStyle(.secondary)\n                        }\n''',
+              '''                        HStack {\n                            if model.localModelProfile != .fast {\n                                Button("Run Setup Again…") { showModelSetup = true }\n                            }\n                            Button("Open Models Folder") { openModelsFolder() }\n                            if model.localModelProfile != .fast {\n                                Button {\n                                    copySetupCommand(openTerminal: true)\n                                } label: {\n                                    Label(copiedCommand ? "Command Copied" : "Terminal Fallback", systemImage: "terminal")\n                                }\n                            }\n                        }\n\n                        if model.localModelProfile == .fast {\n                            Text("Fast has no setup command and downloads no model runtime or weights.")\n                                .font(.caption2)\n                                .foregroundStyle(.secondary)\n                        } else {\n                            DisclosureGroup("Terminal command") {\n                                Text(setupCommand)\n                                    .font(.system(.caption2, design: .monospaced))\n                                    .foregroundStyle(.secondary)\n                                    .textSelection(.enabled)\n                                Text("This profile command installs only public models. Installing DINOv3 is a separate advanced action because its upstream repository requires account approval.")\n                                    .font(.caption2)\n                                    .foregroundStyle(.secondary)\n                            }\n                        }\n''')
+
+          replace_once(settings,
+              '''        switch model.localModelProfile {\n        case .fast: profile = "embeddings"\n        case .balanced: profile = "balanced"\n        case .quality: profile = "quality"\n        }\n''',
+              '''        switch model.localModelProfile {\n        case .fast:\n            return "# Fast uses built-in macOS analysis; no model setup is required."\n        case .balanced: profile = "balanced"\n        case .quality: profile = "quality"\n        }\n''')
+          PY
+
+      - name: Verify repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEVELOPER_DIR=/Applications/Xcode_16.app/Contents/Developer swift test --filter HuggingFaceModelSetupTests
+          git diff --check
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Sources/LibrarianAppSupport/Runtime/HuggingFaceModelSetup.swift Tests/LibrarianTests/HuggingFaceModelSetupTests.swift Sources/LibrarianApp/App/SimpleSettingsView.swift
+          git diff --cached --quiet && exit 0
+          git commit -m "Keep Fast mode strictly zero-download"
+          git push origin HEAD:fix/app-does-not-work-as-intended
