@@ -1,0 +1,57 @@
+name: One-shot Apple-silicon SigLIP batch smoke
+
+on:
+  push:
+    branches:
+      - fix/app-does-not-work-as-intended
+    paths:
+      - .github/workflows/one-shot-siglip-batch-smoke.yml
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      LIBRARIAN_APP_SUPPORT_DIR: ${{ runner.temp }}/private-librarian-smoke
+      LIBRARIAN_MODELS_DIR: ${{ runner.temp }}/private-librarian-smoke/Models
+      LIBRARIAN_SPECIALIST_MODELS_DIR: ${{ runner.temp }}/private-librarian-smoke/Models/specialists
+      LIBRARIAN_MODEL_RUNTIME_DIR: ${{ runner.temp }}/private-librarian-smoke/model-runtime
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner hardware
+        run: |
+          set -euxo pipefail
+          uname -a
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.memsize || true
+          sw_vers
+
+      - name: Provision only SigLIP2 Base and specialist runtime
+        run: |
+          set -euxo pipefail
+          ./scripts/setup_models.sh --specialist-profile embeddings \
+            --specialists-dir "$LIBRARIAN_SPECIALIST_MODELS_DIR" \
+            --runtime-dir "$LIBRARIAN_MODEL_RUNTIME_DIR"
+
+      - name: Run real bounded batch benchmark
+        run: |
+          set -euxo pipefail
+          "$LIBRARIAN_MODEL_RUNTIME_DIR/bin/python3" scripts/benchmark_specialist.py \
+            --profile balanced \
+            --models-dir "$LIBRARIAN_SPECIALIST_MODELS_DIR" \
+            --samples 3 \
+            --batch-sizes 1,2,4,8 \
+            --output "$RUNNER_TEMP/siglip-base-benchmark.json"
+          cat "$RUNNER_TEMP/siglip-base-benchmark.json"
+
+      - name: Upload benchmark receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: siglip-base-apple-silicon-smoke
+          path: ${{ runner.temp }}/siglip-base-benchmark.json
+          if-no-files-found: error
