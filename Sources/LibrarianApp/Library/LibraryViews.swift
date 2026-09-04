@@ -114,8 +114,15 @@ enum LibrarySection: String, CaseIterable, Identifiable {
 }
 
 struct MagicContentView: View {
+    private enum PendingAnalysis: Equatable {
+        case all
+        case source(UUID)
+    }
+
     @EnvironmentObject private var model: LibrarianModel
     @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
+    @State private var showModelSetup = false
+    @State private var pendingAnalysis: PendingAnalysis?
 
     private var eligibleSources: [LibrarianModel.SourceFolder] {
         model.sources.filter { !model.isPaused($0) && !model.needsReauthorization($0) }
@@ -193,33 +200,36 @@ struct MagicContentView: View {
                     }
                     if model.isIndexing {
                         Button("Stop Analysis") { model.cancelIndexing() }
-                    } else if !model.isLocalModelProfileReady(model.localModelProfile) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            SettingsLink {
-                                Label("Set Up Local AI…", systemImage: "arrow.down.circle")
-                            }
-                            Text("The selected quality level needs one-time setup. Settings will show one Install & Continue action; no account is required.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
                     } else {
-                        Menu("Analyze Folder") {
-                            Button("All Available Folders") { model.startIndexing() }
+                        Menu {
+                            Button("All Available Folders") { requestAnalysis(nil) }
                             Divider()
                             ForEach(eligibleSources) { source in
                                 let name = (source.path as NSString).lastPathComponent
                                 Button("Only \(name.isEmpty ? source.path : name)") {
-                                    model.startIndexing(source: source)
+                                    requestAnalysis(source)
                                 }
                             }
+                        } label: {
+                            Label(
+                                model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "Analyze Folder" : "Set Up & Analyze",
+                                systemImage: model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "sparkles" : "arrow.down.circle")
                         }
-                        .disabled(model.sources.isEmpty || eligibleSources.isEmpty)
-                        .disabled(model.isReconciling)
+                        .disabled(model.sources.isEmpty || eligibleSources.isEmpty || model.isReconciling)
                         .help(model.sources.isEmpty
                               ? "Add a folder first"
                               : (eligibleSources.isEmpty
                                  ? "All folders are paused or need permission — resume or re-authorize one"
-                                 : "Read and understand files without moving them"))
+                                 : (model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "Read and understand files without moving them"
+                                    : "Set up the selected local quality level, then analyze the folder you chose")))
+                        if !model.isLocalModelProfileReady(model.localModelProfile) {
+                            Text("One-time setup runs here, then the exact folder choice resumes automatically. No account is required for Balanced or Quality.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -330,6 +340,20 @@ struct MagicContentView: View {
             }
         }
         .onAppear { model.start() }
+        .sheet(isPresented: $showModelSetup, onDismiss: {
+            if !model.isLocalModelProfileReady(model.localModelProfile) {
+                pendingAnalysis = nil
+            }
+        }) {
+            ModelSetupView(
+                profile: model.localModelProfile,
+                onReady: { resumePendingAnalysis() },
+                onUseFast: {
+                    model.localModelProfile = .fast
+                    resumePendingAnalysis()
+                })
+                .environmentObject(model)
+        }
         .confirmationDialog(
             "Remove “\(sourcePendingRemoval.map { ($0.path as NSString).lastPathComponent } ?? "")”?",
             isPresented: Binding(get: { sourcePendingRemoval != nil },
@@ -345,11 +369,39 @@ struct MagicContentView: View {
         }
     }
 
+    private func requestAnalysis(_ source: LibrarianModel.SourceFolder?) {
+        guard !model.isIndexing, !model.isReconciling else { return }
+        let request: PendingAnalysis = source.map { .source($0.id) } ?? .all
+        if model.isLocalModelProfileReady(model.localModelProfile) {
+            runAnalysis(request)
+        } else {
+            pendingAnalysis = request
+            showModelSetup = true
+        }
+    }
+
+    private func resumePendingAnalysis() {
+        guard let request = pendingAnalysis else { return }
+        pendingAnalysis = nil
+        runAnalysis(request)
+    }
+
+    private func runAnalysis(_ request: PendingAnalysis) {
+        switch request {
+        case .all:
+            guard !eligibleSources.isEmpty else { return }
+            model.startIndexing()
+        case .source(let id):
+            guard let source = eligibleSources.first(where: { $0.id == id }) else { return }
+            model.startIndexing(source: source)
+        }
+    }
+
     @ViewBuilder
     private var sectionBody: some View {
         switch model.selectedSection {
         case .overview:
-            OverviewView()
+            OverviewView(onAnalyze: { requestAnalysis(nil) })
         case .smart:
             SmartGroupsView()
         case .screenshots:
@@ -379,6 +431,7 @@ struct MagicContentView: View {
 
 private struct OverviewView: View {
     @EnvironmentObject private var model: LibrarianModel
+    let onAnalyze: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -390,12 +443,16 @@ private struct OverviewView: View {
                 } actions: {
                     if model.sources.isEmpty {
                         Button("Add a Folder") { model.addSourceFolder() }
-                    } else if !model.isLocalModelProfileReady(model.localModelProfile) {
-                        SettingsLink {
-                            Label("Set Up Local AI…", systemImage: "arrow.down.circle")
-                        }
                     } else {
-                        Button("Analyze Folders") { model.startIndexing() }
+                        Button {
+                            onAnalyze()
+                        } label: {
+                            Label(
+                                model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "Analyze Folders" : "Set Up & Analyze",
+                                systemImage: model.isLocalModelProfileReady(model.localModelProfile)
+                                    ? "sparkles" : "arrow.down.circle")
+                        }
                     }
                 }
                 .padding(.top, 40)
