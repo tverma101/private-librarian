@@ -47,7 +47,7 @@ struct CleanerHomeView: View {
     }
 
     private var selectedProfileReady: Bool {
-        model.localModelProfile == .fast || model.isTier2Provisioned
+        model.isLocalModelProfileReady(model.localModelProfile)
     }
 
     private var profileDescription: String {
@@ -171,10 +171,8 @@ struct CleanerHomeView: View {
             Spacer()
 
             HStack(spacing: 6) {
-                // In Fast mode the local-model stack is irrelevant; showing a
-                // gray dot there reads as "something is wrong".
                 Circle()
-                    .fill(model.isTier2Provisioned || model.localModelProfile == .fast ? Color.green : Color.secondary)
+                    .fill(selectedProfileReady ? Color.green : Color.secondary)
                     .frame(width: 7, height: 7)
                 Text(model.localModelProfile.shortDisplayName)
                     .font(.caption.weight(.medium))
@@ -182,7 +180,7 @@ struct CleanerHomeView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .background(.quaternary, in: Capsule())
-            .help(model.tier2Status)
+            .help(selectedProfileReady ? "This quality level is ready" : "One-time local AI setup is needed for this quality level")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -210,7 +208,7 @@ struct CleanerHomeView: View {
                     Text(profileDescription)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    if model.localModelProfile != .fast, !model.isTier2Provisioned {
+                    if model.localModelProfile != .fast, !selectedProfileReady {
                         HStack(alignment: .center, spacing: 8) {
                             Image(systemName: "arrow.down.circle")
                             VStack(alignment: .leading, spacing: 2) {
