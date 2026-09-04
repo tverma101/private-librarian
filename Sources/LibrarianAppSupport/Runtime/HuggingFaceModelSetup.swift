@@ -254,7 +254,7 @@ public enum AppModelSetup {
 
     static func selectorArguments(profile: LocalModelProfile) -> [String] {
         switch profile {
-        case .fast: return ["--specialist-profile", "embeddings"]
+        case .fast: return []
         case .balanced: return ["--specialist-profile", "balanced"]
         case .quality: return ["--specialist-profile", "quality"]
         }
@@ -274,7 +274,17 @@ public enum AppModelSetup {
         token: String?,
         operation: ModelSetupOperation = ModelSetupOperation()
     ) async -> ModelSetupResult {
-        await run(
+        // Fast is the hard zero-download baseline. Keep this invariant here,
+        // below the UI, so any future caller cannot accidentally turn Fast
+        // into an embeddings/runtime install by invoking AppModelSetup directly.
+        if profile == .fast {
+            return ModelSetupResult(
+                succeeded: true,
+                status: 0,
+                message: "Fast uses built-in macOS analysis and requires no model setup.",
+                output: "")
+        }
+        return await run(
             selectorArguments: selectorArguments(profile: profile),
             token: token,
             operation: operation)

@@ -55,7 +55,7 @@ final class HuggingFaceModelSetupTests: XCTestCase {
     func testConsumerProfileSelectorsAreExplicitAndCredentialFree() {
         XCTAssertEqual(
             AppModelSetup.selectorArguments(profile: .fast),
-            ["--specialist-profile", "embeddings"])
+            [])
         XCTAssertEqual(
             AppModelSetup.selectorArguments(profile: .balanced),
             ["--specialist-profile", "balanced"])
@@ -68,6 +68,15 @@ final class HuggingFaceModelSetupTests: XCTestCase {
             XCTAssertFalse(arguments.contains("--hf-token-stdin"))
             XCTAssertFalse(arguments.joined(separator: " ").contains("hf_"))
         }
+    }
+
+    func testFastSetupIsAlwaysAZeroDownloadNoOp() async {
+        let result = await AppModelSetup.run(profile: .fast, token: "must-not-be-used")
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.output, "")
+        XCTAssertFalse(result.cancelled)
+        XCTAssertTrue(result.message.contains("requires no model setup"))
     }
 
     func testAdvancedGatedSelectorOnlyAllowsRegisteredGatedSpecialists() {

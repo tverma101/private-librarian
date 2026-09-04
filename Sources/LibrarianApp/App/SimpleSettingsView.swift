@@ -240,23 +240,33 @@ struct SimpleSettingsView: View {
                         Divider()
 
                         HStack {
-                            Button("Run Setup Again…") { showModelSetup = true }
+                            if model.localModelProfile != .fast {
+                                Button("Run Setup Again…") { showModelSetup = true }
+                            }
                             Button("Open Models Folder") { openModelsFolder() }
-                            Button {
-                                copySetupCommand(openTerminal: true)
-                            } label: {
-                                Label(copiedCommand ? "Command Copied" : "Terminal Fallback", systemImage: "terminal")
+                            if model.localModelProfile != .fast {
+                                Button {
+                                    copySetupCommand(openTerminal: true)
+                                } label: {
+                                    Label(copiedCommand ? "Command Copied" : "Terminal Fallback", systemImage: "terminal")
+                                }
                             }
                         }
 
-                        DisclosureGroup("Terminal command") {
-                            Text(setupCommand)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                            Text("This profile command installs only public models. Installing DINOv3 is a separate advanced action because its upstream repository requires account approval.")
+                        if model.localModelProfile == .fast {
+                            Text("Fast has no setup command and downloads no model runtime or weights.")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
+                        } else {
+                            DisclosureGroup("Terminal command") {
+                                Text(setupCommand)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                Text("This profile command installs only public models. Installing DINOv3 is a separate advanced action because its upstream repository requires account approval.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                     .padding(.top, 8)
@@ -352,7 +362,8 @@ struct SimpleSettingsView: View {
         let scriptPath = AppModelSetup.setupScriptURL()?.path ?? "./scripts/setup_models.sh"
         let profile: String
         switch model.localModelProfile {
-        case .fast: profile = "embeddings"
+        case .fast:
+            return "# Fast uses built-in macOS analysis; no model setup is required."
         case .balanced: profile = "balanced"
         case .quality: profile = "quality"
         }
