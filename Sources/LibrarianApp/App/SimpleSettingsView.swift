@@ -4,7 +4,8 @@ import LibrarianCore
 import LibrarianAppSupport
 
 /// Human-facing preferences first; provider/runtime plumbing stays behind one
-/// explicit Advanced disclosure. The normal setup path lives beside Analyze.
+/// explicit Advanced disclosure. The normal setup path lives beside Analyze
+/// and uses public checkpoints only.
 struct SimpleSettingsView: View {
     @EnvironmentObject private var model: LibrarianModel
     @State private var showModelSetup = false
@@ -144,8 +145,11 @@ struct SimpleSettingsView: View {
                         Divider()
 
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Hugging Face access")
+                            Text("Optional gated-model access")
                                 .font(.subheadline.weight(.medium))
+                            Text("Normal Fast, Balanced, and Quality setup does not require an account or token. This credential is only for explicitly installing optional gated models such as DINOv3.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                             HStack(spacing: 8) {
                                 Image(systemName: hasHuggingFaceToken ? "key.fill" : "key")
                                     .foregroundStyle(hasHuggingFaceToken ? .green : .secondary)
@@ -154,7 +158,7 @@ struct SimpleSettingsView: View {
                                     .foregroundStyle(.secondary)
                                 Spacer()
                             }
-                            SecureField("Paste replacement access token", text: $huggingFaceToken)
+                            SecureField("Paste optional access token", text: $huggingFaceToken)
                                 .textFieldStyle(.roundedBorder)
                             HStack {
                                 Button("Save in Keychain") { saveHuggingFaceToken() }
@@ -171,10 +175,15 @@ struct SimpleSettingsView: View {
                         Divider()
 
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Selected local models")
+                            Text("Models used by this quality level")
                                 .font(.subheadline.weight(.medium))
                             ForEach(selectedModels) { descriptor in
                                 modelRow(descriptor)
+                            }
+                            if !model.specialistProvisionedIDs.contains(LocalModelStack.dinov3.id) {
+                                Text("Optional gated DINOv3 visual clustering is not required for this quality level.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                             }
                         }
 
@@ -195,6 +204,9 @@ struct SimpleSettingsView: View {
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
+                            Text("This profile command installs only public models. Installing DINOv3 is a separate advanced action because its upstream repository requires account approval.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     .padding(.top, 8)
@@ -228,7 +240,7 @@ struct SimpleSettingsView: View {
         if qualityReady {
             return "This quality level's downloaded local AI is ready and normal analysis runs offline."
         }
-        return "Set it up here or let Set Up & Analyze handle it from the main window."
+        return "Set it up here or let Set Up & Analyze handle it from the main window. No account is required."
     }
 
     private var profileDescription: String {
@@ -236,25 +248,32 @@ struct SimpleSettingsView: View {
         case .fast:
             return "No downloads. Best when you want the quickest first pass."
         case .balanced:
-            return "Recommended. Better visual meaning and similarity with moderate memory use."
+            return "Recommended. Better visual meaning and ambiguity handling with moderate memory use."
         case .quality:
             return "For harder libraries. Uses more local AI when the cheaper stages are uncertain."
         }
     }
 
+    /// Consumer profiles intentionally list only the public checkpoints that
+    /// their one-click installer provisions. DINOv3 remains an optional gated
+    /// advanced model and must never make these modes look incomplete.
     private var selectedModels: [LocalModelDescriptor] {
         switch model.localModelProfile {
         case .fast:
-            return [LocalModelStack.siglip2, LocalModelStack.dinov3]
+            return [LocalModelStack.siglip2]
         case .balanced:
             return [
                 LocalModelStack.siglip2,
-                LocalModelStack.dinov3,
                 LocalModelStack.paddleOCR,
                 LocalModelStack.miniCPM,
             ]
         case .quality:
-            return LocalModelStack.all
+            return [
+                LocalModelStack.siglip2,
+                LocalModelStack.paddleOCR,
+                LocalModelStack.miniCPM,
+                LocalModelStack.lfm,
+            ]
         }
     }
 
@@ -307,8 +326,8 @@ struct SimpleSettingsView: View {
         do {
             hasHuggingFaceToken = try HuggingFaceTokenStore.load() != nil
             huggingFaceStatus = hasHuggingFaceToken
-                ? "Access token stored in macOS Keychain"
-                : "No access token saved"
+                ? "Optional access token stored in macOS Keychain"
+                : "No optional access token saved"
         } catch {
             hasHuggingFaceToken = false
             huggingFaceStatus = error.localizedDescription
@@ -320,7 +339,7 @@ struct SimpleSettingsView: View {
             try HuggingFaceTokenStore.save(huggingFaceToken)
             huggingFaceToken = ""
             hasHuggingFaceToken = true
-            huggingFaceStatus = "Access token stored in macOS Keychain"
+            huggingFaceStatus = "Optional access token stored in macOS Keychain"
         } catch {
             huggingFaceStatus = error.localizedDescription
         }
@@ -331,7 +350,7 @@ struct SimpleSettingsView: View {
             try HuggingFaceTokenStore.remove()
             huggingFaceToken = ""
             hasHuggingFaceToken = false
-            huggingFaceStatus = "No access token saved"
+            huggingFaceStatus = "No optional access token saved"
         } catch {
             huggingFaceStatus = error.localizedDescription
         }
@@ -371,7 +390,7 @@ struct SimpleSettingsView: View {
         }
         #endif
         if provisioned { return "Installed" }
-        if descriptor.gated { return "Not installed · Hugging Face approval required" }
+        if descriptor.gated { return "Optional · Hugging Face approval required" }
         return "Not installed"
     }
 
