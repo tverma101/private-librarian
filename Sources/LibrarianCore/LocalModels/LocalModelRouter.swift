@@ -48,16 +48,33 @@ public struct LocalModelDescriptor: Codable, Sendable, Equatable, Identifiable {
 }
 
 public enum LocalModelStack: Sendable {
-    /// Semantic image/text space used for broad meaning and text-to-image search.
-    public static let siglip2 = LocalModelDescriptor(
+    /// Balanced semantic image/text space. Base NaFlex is materially smaller
+    /// than So400m while preserving native screenshot/document aspect ratios.
+    public static let siglip2Base = LocalModelDescriptor(
+        id: "siglip2-base-naflex",
+        capability: .imageSemantic,
+        hfID: "google/siglip2-base-patch16-naflex",
+        revisionPrefix: "b53b807",
+        license: "Apache-2.0",
+        cost: .small,
+        defaultEnabled: true,
+        runtime: "transformers")
+
+    /// Quality semantic image/text space. This must never share stored vectors
+    /// with Base because the output dimensions/space identity differ.
+    public static let siglip2So400m = LocalModelDescriptor(
         id: "siglip2-so400m-naflex",
         capability: .imageSemantic,
         hfID: "google/siglip2-so400m-patch16-naflex",
         revisionPrefix: "cc24074",
         license: "Apache-2.0",
         cost: .medium,
-        defaultEnabled: true,
+        defaultEnabled: false,
         runtime: "transformers")
+
+    /// Compatibility alias for older call sites/tests while the product moves
+    /// to explicit Base-vs-So400m selection. New code should use semanticModel(for:).
+    public static let siglip2 = siglip2So400m
 
     /// Optional advanced visual representation. It remains routable whenever a
     /// user explicitly provisions it, but upstream access is gated, so normal
@@ -104,23 +121,33 @@ public enum LocalModelStack: Sendable {
         runtime: "transformers-remote-code")
 
     /// Product-supported registry for the target Mac. `all` includes optional
-    /// advanced specialists; `defaultEnabled` and the provisioner decide which
-    /// ones belong in a consumer profile.
+    /// advanced specialists; consumer profiles decide which semantic encoder
+    /// belongs in one run so incompatible SigLIP spaces are never mixed.
     public static let all: [LocalModelDescriptor] = [
-        siglip2, dinov3, paddleOCR, miniCPM, lfm
+        siglip2Base, siglip2So400m, dinov3, paddleOCR, miniCPM, lfm
     ]
 
     public static func descriptor(id: String) -> LocalModelDescriptor? {
         all.first { $0.id == id }
     }
+
+    /// Fast stays zero-download. Balanced uses Base NaFlex for throughput.
+    /// Quality swaps to So400m rather than stacking both semantic encoders.
+    public static func semanticModel(for profile: LocalModelProfile) -> LocalModelDescriptor? {
+        switch profile {
+        case .fast: return nil
+        case .balanced: return siglip2Base
+        case .quality: return siglip2So400m
+        }
+    }
 }
 
 public enum LocalModelProfile: String, Codable, Sendable, CaseIterable {
-    /// Prefer throughput. Embeddings + native OCR; no generative model required.
+    /// Built-in macOS analysis only; no downloaded semantic encoder required.
     case fast
-    /// Embeddings first, MiniCPM only for unresolved images, specialist OCR when native OCR is weak.
+    /// Base NaFlex first, MiniCPM only for unresolved images, native OCR on macOS.
     case balanced
-    /// Same cheap-first path, with one bounded LFM2.5-VL 3B fallback for the hard queue.
+    /// So400m NaFlex first, with one bounded LFM2.5-VL 3B fallback for the hard queue.
     case quality
 }
 
@@ -156,11 +183,12 @@ public struct LocalModelRouter: Sendable {
             route.append(model)
         }
 
-        if context.kind == .image {
-            append(LocalModelStack.siglip2)
-            // Advanced DINOv3 is opportunistic: if the user installed it, use
-            // it for the separate visual-similarity space; otherwise the normal
-            // profile continues without an account-gated dependency.
+        if context.kind == .image, profile != .fast {
+            if let semantic = LocalModelStack.semanticModel(for: profile) {
+                append(semantic)
+            }
+            // Advanced DINOv3 is opportunistic for Balanced/Quality only. Fast
+            // intentionally remains the no-download/no-Python path.
             append(LocalModelStack.dinov3)
         }
 
@@ -192,11 +220,15 @@ public struct LocalModelRouter: Sendable {
 public enum LocalEmbeddingProviderSelection {
     public static func make(
         enabled: Bool,
+        profile: LocalModelProfile = .fast,
         requestedProviderKind: String? = nil,
         specialistBridge: SpecialistModelBridge? = nil
     ) -> any EmbeddingProvider {
-        if enabled, SpecialistModelBridge.isProvisioned(LocalModelStack.siglip2) {
+        if enabled,
+           let semantic = LocalModelStack.semanticModel(for: profile),
+           SpecialistModelBridge.isProvisioned(semantic) {
             return SpecialistSigLIP2EmbeddingProvider(
+                model: semantic,
                 bridge: specialistBridge ?? SpecialistModelBridge())
         }
         if let requestedProviderKind {
