@@ -7,7 +7,8 @@ import Darwin
 
 /// Bridge to optional downloaded local models (CLIP / MiniLM) running 100% offline.
 ///
-/// - No network entitlement is ever required.
+/// - This inference bridge never uses networking; the app's network-client
+///   entitlement exists only for explicit model provisioning.
 /// - No `Models/` path is added to the indexed tree.
 /// - If no model is provisioned, or the helper is missing deps, every call
 ///   returns nil and Vision remains the sole signal — no crash, no blocking.

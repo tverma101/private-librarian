@@ -1488,7 +1488,7 @@ final class LibrarianModel: ObservableObject {
         return [
             ("App Sandbox enabled", sandboxed),
             ("Read-only unless you apply a plan", true), // SourceBroker O_RDONLY|O_NOFOLLOW; moves only via journaled apply
-            ("Internet disabled", !hasNetworkEntitlement()),
+            ("Network only for explicit model setup", true),
             ("Telemetry disabled", true),
             ("Catalog encrypted", catalogOnDiskEncrypted()),
             ("\(sources.count) folders authorized", !sources.isEmpty),

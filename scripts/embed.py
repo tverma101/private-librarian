@@ -12,7 +12,7 @@ Usage:
   python3 scripts/embed.py --worker  # JSONL bytes/text worker
 
 Output: JSON to stdout {"dim":512,"vector":[0.1, ...]} or {"error":"..."}.
-Never touches the network — verified by entitlement-audit and network_negative_probe.
+Inference stays offline through local_files_only plus the offline environment enforced by the Swift bridge and CI.
 """
 
 import argparse
