@@ -258,6 +258,7 @@ def main() -> int:
         cold, cold_ms = request(proc, single_payload, timeout=timeout)
         validate_single(cold, model_id, expected_dim)
         rss_after_load = process_rss_mb(proc.pid)
+        accelerator_memory_after_load, _ = request(proc, {"op": "memory"}, timeout=timeout)
 
         # The cold call above loads the model and warms the batch-1 graph. These
         # sequential calls therefore represent steady-state single-image work.
@@ -267,6 +268,7 @@ def main() -> int:
             sequential_latencies.append(elapsed)
         sequential_total_s = sum(sequential_latencies) / 1000
         sequential_throughput = samples / sequential_total_s if sequential_total_s > 0 else 0.0
+        accelerator_memory_after_sequential, _ = request(proc, {"op": "memory"}, timeout=timeout)
 
         for size in batch_sizes:
             ids = [f"fixture-{index}" for index in range(size)]
@@ -292,6 +294,7 @@ def main() -> int:
                 latencies.append(elapsed)
             total_seconds = sum(latencies) / 1000
             throughput = (samples * size) / total_seconds if total_seconds > 0 else 0.0
+            accelerator_memory, _ = request(proc, {"op": "memory"}, timeout=timeout)
             batch_results.append({
                 "batch_size": size,
                 "shape_warmup_latency_ms": round(shape_warmup_ms, 3),
@@ -303,6 +306,7 @@ def main() -> int:
                     throughput / sequential_throughput, 3
                 ) if sequential_throughput > 0 else None,
                 "process_rss_mb": process_rss_mb(proc.pid),
+                "accelerator_memory": accelerator_memory,
             })
 
         payload = {
@@ -328,17 +332,21 @@ def main() -> int:
             },
             "cold_image_latency_ms": round(cold_ms or 0.0, 3),
             "rss_after_model_load_mb": rss_after_load,
+            "accelerator_memory_after_model_load": accelerator_memory_after_load,
             "sequential": {
                 "calls": samples,
                 "latency_ms": latency_summary(sequential_latencies),
                 "images_per_second": round(sequential_throughput, 3),
+                "accelerator_memory": accelerator_memory_after_sequential,
             },
             "batches": batch_results,
             "notes": [
                 "All measured timings include JSONL IPC, base64 decode, image preprocessing, model execution, copy-back, and JSON serialization.",
                 "Each batch shape is warmed once before measured calls; shape_warmup_latency_ms is reported separately.",
                 "p95 uses nearest-rank semantics so small sample sets do not hide the slowest observed request.",
-                "process_rss_mb is a best-effort process RSS snapshot, not a guarantee of total unified/MPS memory.",
+                "process_rss_mb is a best-effort CPU/process RSS snapshot and excludes important MPS allocations.",
+                "MPS current_allocated_bytes is tensor storage; driver_allocated_bytes includes allocator pools plus MPSGraph/Metal allocations. Neither is added to RSS as a fake total.",
+                "recommended_max_bytes is Metal's recommended working-set ceiling, not installed physical RAM.",
                 "Batch results are benchmark evidence only; production indexing remains sequential until target-Mac results justify a batch size.",
             ],
         }

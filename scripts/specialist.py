@@ -777,6 +777,41 @@ def _release(model_id: str | None) -> dict:
     return {"released": model_id or "all", "resident": sorted(_CACHE)}
 
 
+def _accelerator_memory_status() -> dict:
+    """Report allocator/driver memory without changing cache residency.
+
+    On MPS, ``current_allocated_bytes`` is tensor storage only, while
+    ``driver_allocated_bytes`` also includes allocator pools and MPSGraph/Metal
+    allocations. Keep these distinct rather than pretending either is total
+    unified memory.
+    """
+    result = {"backend": "cpu", "mps_available": False, "resident": sorted(_CACHE)}
+    try:
+        import torch
+        mps = getattr(torch, "mps", None)
+        backend = getattr(getattr(torch, "backends", None), "mps", None)
+        available = bool(mps is not None and backend is not None and backend.is_available())
+        result["mps_available"] = available
+        if not available:
+            return result
+        result["backend"] = "mps"
+        for key, name in (
+            ("current_allocated_bytes", "current_allocated_memory"),
+            ("driver_allocated_bytes", "driver_allocated_memory"),
+            ("recommended_max_bytes", "recommended_max_memory"),
+        ):
+            getter = getattr(mps, name, None)
+            if not callable(getter):
+                continue
+            try:
+                result[key] = int(getter())
+            except Exception as exc:
+                result[key + "_error"] = str(exc)[:160]
+    except Exception as exc:
+        result["error"] = str(exc)[:160]
+    return result
+
+
 def _handle(request: dict) -> dict:
     op = request.get("op")
     if op == "status":
@@ -787,6 +822,8 @@ def _handle(request: dict) -> dict:
             "resident": sorted(_CACHE),
             "memory_policy": "11.50-GB-ceiling; warm-encoders-only; transient-exclusive; MPS-fp16",
         }
+    if op == "memory":
+        return _accelerator_memory_status()
     if op == "release":
         model_id = request.get("model")
         return _release(str(model_id) if model_id else None)
