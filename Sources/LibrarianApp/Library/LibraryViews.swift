@@ -67,7 +67,8 @@ struct SearchResultRow: View {
     }
 }
 
-enum LibrarySection: String, CaseIterable, Identifiable {    case overview
+enum LibrarySection: String, CaseIterable, Identifiable {
+    case overview
     case smart
     case screenshots
     case school
@@ -116,18 +117,22 @@ struct MagicContentView: View {
     @EnvironmentObject private var model: LibrarianModel
     @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
 
+    private var eligibleSources: [LibrarianModel.SourceFolder] {
+        model.sources.filter { !model.isPaused($0) && !model.needsReauthorization($0) }
+    }
+
     var body: some View {
         NavigationSplitView {
             List(selection: $model.selectedSection) {
-                Section("Magic Library") {
+                Section("Library") {
                     ForEach(LibrarySection.allCases) { section in
                         Label(section.title, systemImage: section.icon).tag(section)
                     }
                 }
 
-                Section("Sources · read-only") {
+                Section("Folders") {
                     if model.sources.isEmpty {
-                        Text("No folders authorized").foregroundStyle(.secondary)
+                        Text("No folders added").foregroundStyle(.secondary)
                     } else {
                         ForEach(model.sources) { source in
                             VStack(alignment: .leading, spacing: 4) {
@@ -155,16 +160,19 @@ struct MagicContentView: View {
                                     }.buttonStyle(.borderless)
                                         .frame(width: 28, height: 28)
                                         .contentShape(Rectangle())
-                                        .help("Remove folder from the catalog view (its files stay on disk)")
-                                        .accessibilityLabel("Remove source from catalog")
+                                        .help("Remove folder from the library view; its files stay on disk")
+                                        .accessibilityLabel("Remove source from library")
                                 }
                                 Text(source.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                                 if model.needsReauthorization(source) {
-                                    Text("Needs reauthorization — indexing is paused for this folder")
+                                    Text("Needs permission — analysis is paused for this folder")
                                         .font(.caption2).foregroundStyle(.orange)
                                 } else if model.isPaused(source) {
                                     Text("Paused — originals remain untouched")
                                         .font(.caption2).foregroundStyle(.orange)
+                                } else {
+                                    Text("Analysis reads only · Finder changes need a separate Apply confirmation")
+                                        .font(.caption2).foregroundStyle(.secondary)
                                 }
                             }
                         }
@@ -185,22 +193,31 @@ struct MagicContentView: View {
                     }
                     if model.isIndexing {
                         Button("Stop Analysis") { model.cancelIndexing() }
+                    } else if !model.isLocalModelProfileReady(model.localModelProfile) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            SettingsLink {
+                                Label("Set Up Local AI…", systemImage: "arrow.down.circle")
+                            }
+                            Text("The selected quality level needs one-time setup. Settings will show one Install & Continue action; no account is required.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     } else {
                         Menu("Analyze Folder") {
-                            Button("All Authorized Folders") { model.startIndexing() }
+                            Button("All Available Folders") { model.startIndexing() }
                             Divider()
-                            ForEach(model.sources.filter { !model.isPaused($0) && !model.needsReauthorization($0) }) { source in
+                            ForEach(eligibleSources) { source in
                                 let name = (source.path as NSString).lastPathComponent
                                 Button("Only \(name.isEmpty ? source.path : name)") {
                                     model.startIndexing(source: source)
                                 }
                             }
                         }
-                        .disabled(model.sources.isEmpty || model.sources.allSatisfy { model.isPaused($0) || model.needsReauthorization($0) })
+                        .disabled(model.sources.isEmpty || eligibleSources.isEmpty)
                         .disabled(model.isReconciling)
                         .help(model.sources.isEmpty
                               ? "Add a folder first"
-                              : (model.sources.allSatisfy { model.isPaused($0) || model.needsReauthorization($0) }
+                              : (eligibleSources.isEmpty
                                  ? "All folders are paused or need permission — resume or re-authorize one"
                                  : "Read and understand files without moving them"))
                     }
@@ -227,8 +244,8 @@ struct MagicContentView: View {
                         model.refreshModelStatus()
                     } label: {
                         Image(systemName: "arrow.clockwise")
-                    }.help("Refresh catalog dashboard")
-                        .accessibilityLabel("Refresh catalog dashboard")
+                    }.help("Refresh library status")
+                        .accessibilityLabel("Refresh library status")
                 }
                 .padding(12)
 
@@ -287,7 +304,7 @@ struct MagicContentView: View {
                                 HStack {
                                     Text(model.selectedSection.title).font(.title2.bold())
                                     Spacer()
-                                    Text("virtual · offline · read-only")
+                                    Text("virtual organization · local analysis")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                                 sectionBody
@@ -367,12 +384,16 @@ private struct OverviewView: View {
         VStack(alignment: .leading, spacing: 18) {
             if model.dashboard.total == 0 {
                 ContentUnavailableView {
-                    Label("Nothing indexed yet", systemImage: "sparkles.rectangle.stack")
+                    Label("Nothing analyzed yet", systemImage: "sparkles.rectangle.stack")
                 } description: {
-                    Text("Add a folder on the home screen (or in the sidebar) and run an analysis. Your files stay exactly where they are — Private Librarian builds a private, searchable map of them here.")
+                    Text("Add a folder and run an analysis. Your files stay exactly where they are while Private Librarian builds a private, searchable map of them.")
                 } actions: {
                     if model.sources.isEmpty {
                         Button("Add a Folder") { model.addSourceFolder() }
+                    } else if !model.isLocalModelProfileReady(model.localModelProfile) {
+                        SettingsLink {
+                            Label("Set Up Local AI…", systemImage: "arrow.down.circle")
+                        }
                     } else {
                         Button("Analyze Folders") { model.startIndexing() }
                     }
@@ -421,7 +442,7 @@ private struct OverviewView: View {
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
             GroupBox("What the librarian knows") {
-                Text("Multiple labels, review state, similarity relationships, and missing-file history live in the encrypted catalog. The source folders remain untouched.")
+                Text("Multiple labels, review state, similarity relationships, and missing-file history live in the encrypted catalog. Source folders stay untouched until you explicitly Apply a reviewed plan.")
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if !model.projectSummaries.isEmpty {
@@ -470,7 +491,7 @@ private struct FileExplorerView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text(subtitle).font(.caption).foregroundStyle(.secondary)
                 if files.isEmpty {
-                    Text("Nothing here yet — index an authorized folder to populate the view.")
+                    Text("Nothing here yet — analyze an available folder to populate the view.")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(files) { file in
@@ -524,7 +545,7 @@ private struct SmartGroupsView: View {
                 ContentUnavailableView(
                     "No smart groups yet",
                     systemImage: "sparkles.rectangle.stack",
-                    description: Text("Index a folder first. Groups appear only when there is enough evidence to be useful."))
+                    description: Text("Analyze a folder first. Groups appear only when there is enough evidence to be useful."))
             } else {
                 ForEach(model.smartGroups) { group in
                     SmartGroupCard(group: group)
@@ -813,7 +834,7 @@ private struct SimilarityMapView: View {
                 Text("Near-duplicate and semantic families are virtual catalog relationships. Files are not moved or renamed.")
                     .font(.caption).foregroundStyle(.secondary)
                 if clusters.isEmpty {
-                    Text("Families will appear after indexing and refreshing.").foregroundStyle(.secondary)
+                    Text("Families will appear after analysis and refreshing.").foregroundStyle(.secondary)
                 } else {
                     ForEach(clusters, id: \.id) { cluster in
                         DisclosureGroup(isExpanded: expandedBinding(for: cluster.id)) {
@@ -1136,7 +1157,9 @@ private struct MagicPrivacyBar: View {
                     .font(.caption)
             }
             Spacer()
-            Text("OFFLINE · ENCRYPTED · MOVES ONLY WHEN YOU APPLY").font(.caption2).foregroundStyle(.secondary)
+            Text("LOCAL · ENCRYPTED · MOVES ONLY WHEN YOU APPLY")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
     }
 }
