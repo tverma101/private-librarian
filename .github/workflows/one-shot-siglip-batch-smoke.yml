@@ -42,14 +42,15 @@ jobs:
             --specialists-dir "$LIBRARIAN_SPECIALIST_MODELS_DIR" \
             --runtime-dir "$LIBRARIAN_MODEL_RUNTIME_DIR"
 
-      - name: Run real bounded batch benchmark
+      - name: Run hardened bounded batch benchmark
         run: |
           set -euxo pipefail
           "$LIBRARIAN_MODEL_RUNTIME_DIR/bin/python3" scripts/benchmark_specialist.py \
             --profile balanced \
             --models-dir "$LIBRARIAN_SPECIALIST_MODELS_DIR" \
-            --samples 3 \
+            --samples 10 \
             --batch-sizes 1,2,4,8 \
+            --timeout 180 \
             --output "$RUNNER_TEMP/siglip-base-benchmark.json"
           cat "$RUNNER_TEMP/siglip-base-benchmark.json"
 
