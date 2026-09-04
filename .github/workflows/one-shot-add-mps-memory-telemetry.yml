@@ -1,0 +1,109 @@
+name: One-shot add MPS memory telemetry
+
+on:
+  push:
+    branches:
+      - fix/app-does-not-work-as-intended
+    paths:
+      - .github/workflows/one-shot-add-mps-memory-telemetry.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/app-does-not-work-as-intended
+
+      - name: Patch worker and benchmark memory receipts
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          specialist = Path('scripts/specialist.py')
+          text = specialist.read_text()
+          marker = '''\n\ndef _handle(request: dict) -> dict:\n'''
+          insert = '''\n\ndef _accelerator_memory_status() -> dict:\n    """Report allocator/driver memory without changing cache residency.\n\n    On MPS, ``current_allocated_bytes`` is tensor storage only, while\n    ``driver_allocated_bytes`` also includes allocator pools and MPSGraph/Metal\n    allocations. Keep these distinct rather than pretending either is total\n    unified memory.\n    """\n    result = {"backend": "cpu", "mps_available": False, "resident": sorted(_CACHE)}\n    try:\n        import torch\n        mps = getattr(torch, "mps", None)\n        backend = getattr(getattr(torch, "backends", None), "mps", None)\n        available = bool(mps is not None and backend is not None and backend.is_available())\n        result["mps_available"] = available\n        if not available:\n            return result\n        result["backend"] = "mps"\n        for key, name in (\n            ("current_allocated_bytes", "current_allocated_memory"),\n            ("driver_allocated_bytes", "driver_allocated_memory"),\n            ("recommended_max_bytes", "recommended_max_memory"),\n        ):\n            getter = getattr(mps, name, None)\n            if not callable(getter):\n                continue\n            try:\n                result[key] = int(getter())\n            except Exception as exc:\n                result[key + "_error"] = str(exc)[:160]\n    except Exception as exc:\n        result["error"] = str(exc)[:160]\n    return result\n'''
+          if marker not in text:
+              raise SystemExit('specialist _handle marker missing')
+          if 'def _accelerator_memory_status()' not in text:
+              text = text.replace(marker, insert + marker, 1)
+          status_marker = '''        }\n    if op == "release":\n'''
+          status_repl = '''        }\n    if op == "memory":\n        return _accelerator_memory_status()\n    if op == "release":\n'''
+          if 'if op == "memory":' not in text:
+              if status_marker not in text:
+                  raise SystemExit('specialist status handler marker missing')
+              text = text.replace(status_marker, status_repl, 1)
+          specialist.write_text(text)
+
+          bench = Path('scripts/benchmark_specialist.py')
+          text = bench.read_text()
+          old = '''        rss_after_load = process_rss_mb(proc.pid)\n\n        # The cold call above loads the model and warms the batch-1 graph. These\n'''
+          new = '''        rss_after_load = process_rss_mb(proc.pid)\n        accelerator_memory_after_load, _ = request(proc, {"op": "memory"}, timeout=timeout)\n\n        # The cold call above loads the model and warms the batch-1 graph. These\n'''
+          if 'accelerator_memory_after_load' not in text:
+              if old not in text:
+                  raise SystemExit('benchmark load marker missing')
+              text = text.replace(old, new, 1)
+
+          old = '''        sequential_throughput = samples / sequential_total_s if sequential_total_s > 0 else 0.0\n\n        for size in batch_sizes:\n'''
+          new = '''        sequential_throughput = samples / sequential_total_s if sequential_total_s > 0 else 0.0\n        accelerator_memory_after_sequential, _ = request(proc, {"op": "memory"}, timeout=timeout)\n\n        for size in batch_sizes:\n'''
+          if 'accelerator_memory_after_sequential' not in text:
+              if old not in text:
+                  raise SystemExit('benchmark sequential marker missing')
+              text = text.replace(old, new, 1)
+
+          old = '''            throughput = (samples * size) / total_seconds if total_seconds > 0 else 0.0\n            batch_results.append({\n'''
+          new = '''            throughput = (samples * size) / total_seconds if total_seconds > 0 else 0.0\n            accelerator_memory, _ = request(proc, {"op": "memory"}, timeout=timeout)\n            batch_results.append({\n'''
+          if 'accelerator_memory, _ = request' not in text:
+              if old not in text:
+                  raise SystemExit('benchmark batch marker missing')
+              text = text.replace(old, new, 1)
+
+          old = '''                "process_rss_mb": process_rss_mb(proc.pid),\n            })\n'''
+          new = '''                "process_rss_mb": process_rss_mb(proc.pid),\n                "accelerator_memory": accelerator_memory,\n            })\n'''
+          if '"accelerator_memory": accelerator_memory' not in text:
+              if old not in text:
+                  raise SystemExit('benchmark batch output marker missing')
+              text = text.replace(old, new, 1)
+
+          old = '''            "rss_after_model_load_mb": rss_after_load,\n            "sequential": {\n'''
+          new = '''            "rss_after_model_load_mb": rss_after_load,\n            "accelerator_memory_after_model_load": accelerator_memory_after_load,\n            "sequential": {\n'''
+          if '"accelerator_memory_after_model_load"' not in text:
+              if old not in text:
+                  raise SystemExit('benchmark top-level memory marker missing')
+              text = text.replace(old, new, 1)
+
+          old = '''                "images_per_second": round(sequential_throughput, 3),\n            },\n            "batches": batch_results,\n'''
+          new = '''                "images_per_second": round(sequential_throughput, 3),\n                "accelerator_memory": accelerator_memory_after_sequential,\n            },\n            "batches": batch_results,\n'''
+          if '"accelerator_memory": accelerator_memory_after_sequential' not in text:
+              if old not in text:
+                  raise SystemExit('benchmark sequential output marker missing')
+              text = text.replace(old, new, 1)
+
+          old = '''                "process_rss_mb is a best-effort process RSS snapshot, not a guarantee of total unified/MPS memory.",\n                "Batch results are benchmark evidence only; production indexing remains sequential until target-Mac results justify a batch size.",\n'''
+          new = '''                "process_rss_mb is a best-effort CPU/process RSS snapshot and excludes important MPS allocations.",\n                "MPS current_allocated_bytes is tensor storage; driver_allocated_bytes includes allocator pools plus MPSGraph/Metal allocations. Neither is added to RSS as a fake total.",\n                "recommended_max_bytes is Metal's recommended working-set ceiling, not installed physical RAM.",\n                "Batch results are benchmark evidence only; production indexing remains sequential until target-Mac results justify a batch size.",\n'''
+          if 'MPS current_allocated_bytes is tensor storage' not in text:
+              if old not in text:
+                  raise SystemExit('benchmark note marker missing')
+              text = text.replace(old, new, 1)
+          bench.write_text(text)
+          PY
+
+      - name: Validate syntax and contracts
+        run: |
+          python3 -m py_compile scripts/specialist.py scripts/benchmark_specialist.py
+          python3 scripts/specialist.py --syntax-check
+          grep -q 'driver_allocated_bytes' scripts/specialist.py
+          grep -q 'accelerator_memory_after_model_load' scripts/benchmark_specialist.py
+
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/specialist.py scripts/benchmark_specialist.py
+          git diff --cached --quiet && exit 0
+          git commit -m 'Measure MPS allocator and driver memory'
+          git push origin HEAD:fix/app-does-not-work-as-intended
