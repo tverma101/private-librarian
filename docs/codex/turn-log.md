@@ -1,5 +1,15 @@
 # Codex turn log
 
+## 2026-09-04 — synchronize the local feature branch
+
+- `scope`: update the canonical checkout to the requested remote branch `fix/app-does-not-work-as-intended`.
+- `changed`: no application source; the worktree was fast-forwarded from `cc1e68c` to `bb3cf46e89305f17bca21b07a47f4551daae853a`; this receipt is the only local documentation change.
+- `validation`: fetched `origin --prune`; verified the live remote branch with `git ls-remote`; confirmed the branch had no local divergence or dirty files; applied `git merge --ff-only`; rechecked `git status`, `git rev-parse HEAD`, worktrees, and `git diff --check`.
+- `evidence`: source synchronized=yes; tested=no; packaged/live state not rechecked in this sync-only turn; user-confirmed=no.
+- `blocker`: none for local synchronization; the quoted CI and installed-app claims were not independently rerun here.
+- `next`: run the branch's local build/test/package checks if a fresh validation pass is desired.
+- `rollout_refs`: current Codex turn, 2026-09-04.
+
 ## 2026-08-31 — provision specialist models and repair live inference
 
 - `scope`: install the required local embedding runtime/models, exercise the installed bundle headlessly, fix concrete runtime/UI defects, and preserve default-app behavior.
