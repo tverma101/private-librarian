@@ -8,7 +8,8 @@ Private Librarian separates **analysis authority** from **explicit organization 
 - The encrypted catalog is the normal writable state layer.
 - Source files move only after the user reviews and confirms an **Apply to Finder** plan. That operation is contained to the user-authorized security-scoped root, journaled, and undoable.
 - Normal indexing and inference are local/offline. The packaged app has outbound network-client permission only for explicit model setup and ordinary browser links. It has no network-server/listener entitlement.
-- Hugging Face credentials entered in the app are stored in macOS Keychain and travel through provisioning over stdin/in-memory rather than argv, shell history, UserDefaults, provenance manifests, or setup logs.
+- Normal Fast/Balanced/Quality setup provisions public checkpoints only and requires no external account/token.
+- Credentials for an explicitly selected optional gated model are stored in macOS Keychain and travel through provisioning over stdin/in-memory rather than argv, shell history, UserDefaults, provenance manifests, or setup logs.
 
 ## Hard boundaries
 
@@ -38,7 +39,7 @@ Code outside this boundary should not acquire generic filesystem write authority
 
 The catalog is SQLCipher-encrypted. Its key is stored in an app-owned generic-password Keychain item under a stable service name. Virtual categories, extracted text, embeddings, transcripts, similarity relationships, review state, corrections, learned rules, scan generations, access backoff, and Apply journals belong in the catalog.
 
-Hugging Face credentials use a separate generic-password Keychain service/account. Deleting or rebuilding catalog state must not alter originals.
+Optional gated-model credentials use a separate generic-password Keychain service/account. The consumer setup path does not need that credential. Deleting or rebuilding catalog state must not alter originals.
 
 ### Normal inference stays local
 
@@ -46,17 +47,23 @@ The app has `com.apple.security.network.client` because the user can explicitly 
 
 Production model workers force offline/local-file loading (`local_files_only` / offline Hub settings). There is no cloud inference fallback. Network-capable code belongs only to explicit provisioning and system-browser links.
 
-### Model provisioning credentials
+### Consumer model profiles are public-only
 
-For in-app gated-model setup:
+`embeddings`, `balanced`, and `quality` are the one-click product profiles. Their provisioner selection explicitly rejects any registry entry marked `gated`. This is a product/security contract: selecting a normal quality mode must not unexpectedly create an account, credential, license-approval, or secret-management dependency.
 
-1. Swift loads the token only after an explicit setup action.
+DINOv3 remains registered as an optional gated visual-similarity specialist. If it is explicitly installed, the router may use its separate visual embedding space. Its absence never blocks Fast, Balanced, Quality, or Analyze.
+
+### Optional gated-model credentials
+
+For an explicitly requested gated-model install:
+
+1. Swift/Terminal supplies a token only after the user deliberately chooses that advanced path.
 2. The token is written to the setup helper's stdin.
 3. The helper forwards it to the specialist provisioner over stdin.
 4. Python passes the in-memory value directly to `huggingface_hub` API/download calls.
 5. The token is not required in argv, shell history, UserDefaults, generated provenance files, or child-process environment variables.
 
-Gated repositories still require the account owner to accept/request upstream access. The provisioner preflights checkpoints that need downloading before the first large transfer, so a missing DINOv3 approval fails early.
+Gated repositories still require the account owner to accept/request upstream access. An explicit gated-model install preflights its revision/access before its large transfer. That failure is isolated from the normal public profile installation.
 
 ## Pinned clean-Mac runtime bootstrap
 
@@ -77,7 +84,7 @@ CI asserts the exact version, dated release, digest, checksum-verification comma
 
 Automatic bootstrap currently targets Apple-silicon macOS. Intel hosts must provide a compatible Python 3.10+ via `LIBRARIAN_BOOTSTRAP_PYTHON` or use a package that already contains a compatible runtime.
 
-A green CI contract is not the same as a completed consumer install: the final packaged sandbox still needs a clean-user-account smoke that downloads/executes the pinned runtime and provisions the selected real model stack under the final distribution signature.
+A green CI contract is not the same as a completed consumer install: the final packaged sandbox still needs a clean-user-account smoke that downloads/executes the pinned runtime and provisions a real public model profile under the final distribution signature.
 
 ## Security-scoped folders
 
@@ -120,8 +127,9 @@ Scale controls are also reliability/security controls. Current safeguards includ
 | Saved bookmark falls back to raw path | restoration fails closed + reauthorization UI | runtime/bookmark tests |
 | Live indexing loses sandbox permission | live coordinator retains bookmark leases | runtime tests + host smoke |
 | Huge source tree exhausts memory | batched traversal/SQL paging/top-K scoring | scale regressions |
-| Gated failure wastes public downloads | all needed Hub revisions preflight first | provisioning contract/host smoke |
-| App HF token leaks through argv/env | Keychain → stdin → in-memory Hub calls | CI auth contract + secret scan |
+| Normal quality mode unexpectedly needs an account | consumer profile selection excludes every gated registry entry | specialist contract test |
+| Explicit gated failure wastes unrelated public downloads | gated model is installed separately and preflighted first | provisioning contract/optional host smoke |
+| Optional app token leaks through argv/env | Keychain → stdin → in-memory Hub calls | CI auth contract + secret scan |
 | Runtime bootstrap executes unverified code | pinned dated asset + SHA-256-before-exec + no curl pipe | CI bootstrap contract + host smoke |
 | Inference silently calls network | local-files-only/offline worker settings | CI model-runtime contract |
 | App opens inbound network service | no network-server entitlement | entitlement audit |
@@ -130,7 +138,7 @@ Scale controls are also reliability/security controls. Current safeguards includ
 
 Tier 1 uses Apple's on-device Vision framework and requires no downloaded model.
 
-Tier 2 is optional. Provisioning resolves pinned Hub revisions, preflights required access, stages downloads before activation, verifies model files against SHA-256 provenance manifests, and places artifacts under the app's Foundation-resolved Application Support directory.
+Tier 2 is optional. Consumer provisioning resolves pinned **public** Hub revisions, stages downloads before activation, verifies model files against SHA-256 provenance manifests, and places artifacts under the app's Foundation-resolved Application Support directory. Optional gated specialists use the same provenance and offline-runtime rules when explicitly installed.
 
 The current fp16 specialist set is constrained by an explicit target-Mac memory ceiling. Larger models require a separately validated quantized/MLX runtime before entering production routing. PaddleOCR-VL remains unsupported on the current macOS path, so native Vision OCR is the document-OCR baseline.
 
@@ -159,27 +167,30 @@ CI separately asserts:
 - outbound `network.client` is present for explicit provisioning;
 - inbound `network.server` is absent;
 - production inference stays offline/local-files-only;
-- the in-app HF credential path is stdin/in-memory and token-like secrets are not tracked;
+- normal model profiles contain no gated registry entries;
+- optional gated credentials use the stdin/in-memory path and token-like secrets are not tracked;
 - the clean-Mac runtime bootstrap is pinned and cannot regress to `latest` or curl-pipe-shell;
 - the specialist router obeys its memory ceiling;
 - normal source analysis stays read-only and Apply/Undo remains the narrow mutation path.
 
-## Remaining host/account validation
+## Remaining host validation
 
-Hosted CI cannot manufacture the genuine App Sandbox extension token created when a human selects a folder through `NSOpenPanel`. It also cannot use the owner's private Hugging Face approval or economically perform the full external runtime/dependency/model bootstrap inside a clean consumer sandbox on every commit.
+Hosted CI cannot manufacture the genuine App Sandbox extension token created when a human selects a folder through `NSOpenPanel`, and it cannot economically perform the full external runtime/dependency/model bootstrap inside a clean consumer sandbox on every commit.
 
 Before a daily-use release, perform one packaged smoke that:
 
-1. launches on a clean Apple-silicon user account without Homebrew/global Python;
+1. launches on a clean Apple-silicon user account without Homebrew/global Python or a model-hosting account;
 2. selects a real folder;
 3. indexes it without mutation;
-4. switches to Balanced, provisions the pinned runtime/model stack through the in-app flow with an approved gated account, and confirms analysis resumes;
+4. switches to Balanced, provisions the pinned public runtime/model stack through the in-app flow, and confirms analysis resumes;
 5. performs one reviewed Apply and Undo;
 6. quits/relaunches and restores the bookmark;
 7. confirms a later FSEvent reindexes a changed file;
 8. pauses/removes/reauthorizes the root and confirms leases are released/replaced.
 
-These are genuine OS/account/distribution acceptance boundaries and should not be replaced by synthetic CI claims.
+A separate private-account smoke is required only if the optional DINOv3 advanced path is going to be advertised as supported. It is not a consumer/daily-use blocker.
+
+These are genuine OS/distribution acceptance boundaries and should not be replaced by synthetic CI claims.
 
 ## Still intentionally limited
 
@@ -188,6 +199,7 @@ These are genuine OS/account/distribution acceptance boundaries and should not b
 - The real Whisper integration test is host-conditional because hosted CI does not ship that local runtime/model.
 - Automatic clean-Mac Python bootstrap currently targets Apple-silicon macOS; Intel requires a supplied compatible runtime.
 - The final packaged-app bookmark Apply/Undo/relaunch/FSEvent smoke remains host-only.
-- The clean-account packaged runtime + real gated-model provisioning smoke remains host/account-only.
+- A full clean-account packaged public-model bootstrap smoke remains host-only because of its download/runtime cost.
+- Optional DINOv3 provisioning remains a separate account-gated advanced path.
 
 Security bugs should be reported through the private process described in the repository-root `SECURITY.md`, not through a public issue containing exploit details.
