@@ -1,0 +1,92 @@
+name: One-shot gated model install flow repair
+
+on:
+  push:
+    branches:
+      - fix/app-does-not-work-as-intended
+    paths:
+      - .github/workflows/one-shot-gated-install-flow.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/app-does-not-work-as-intended
+
+      - name: Add real in-app gated specialist install
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  raise SystemExit(f"replacement marker missing: {label}")
+              return text.replace(old, new, 1)
+
+          setup = Path("Sources/LibrarianAppSupport/Runtime/HuggingFaceModelSetup.swift")
+          text = setup.read_text()
+          old = '''    public static func run(\n        profile: LocalModelProfile,\n        token: String?,\n        operation: ModelSetupOperation = ModelSetupOperation()\n    ) async -> ModelSetupResult {\n        guard let script = setupScriptURL() else {\n            return ModelSetupResult(\n                succeeded: false,\n                status: 127,\n                message: "The packaged model setup helper is missing. Reinstall Private Librarian.",\n                output: "")\n        }\n\n        if operation.isCancellationRequested {\n            return cancelledResult(output: "")\n        }\n\n        let profileName: String\n        switch profile {\n        case .fast: profileName = "embeddings"\n        case .balanced: profileName = "balanced"\n        case .quality: profileName = "quality"\n        }\n        let trimmedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)\n        let appSupport = applicationSupportURL()\n\n        return await Task.detached(priority: .utility) {\n            runBlocking(\n                script: script,\n                profile: profileName,\n                token: trimmedToken,\n                appSupport: appSupport,\n                operation: operation)\n        }.value\n    }\n'''
+          new = '''    static func selectorArguments(profile: LocalModelProfile) -> [String] {\n        switch profile {\n        case .fast: return ["--specialist-profile", "embeddings"]\n        case .balanced: return ["--specialist-profile", "balanced"]\n        case .quality: return ["--specialist-profile", "quality"]\n        }\n    }\n\n    static func selectorArguments(specialist descriptor: LocalModelDescriptor) -> [String]? {\n        // The in-app advanced installer is intentionally narrow: only models\n        // registered by this build and explicitly marked gated can use a\n        // Keychain credential. Normal public profile setup never needs one.\n        guard descriptor.gated,\n              LocalModelStack.all.contains(where: { $0.id == descriptor.id }) else { return nil }\n        return ["--specialist-model", descriptor.id]\n    }\n\n    public static func run(\n        profile: LocalModelProfile,\n        token: String?,\n        operation: ModelSetupOperation = ModelSetupOperation()\n    ) async -> ModelSetupResult {\n        await run(\n            selectorArguments: selectorArguments(profile: profile),\n            token: token,\n            operation: operation)\n    }\n\n    public static func run(\n        specialist descriptor: LocalModelDescriptor,\n        token: String?,\n        operation: ModelSetupOperation = ModelSetupOperation()\n    ) async -> ModelSetupResult {\n        guard let arguments = selectorArguments(specialist: descriptor) else {\n            return ModelSetupResult(\n                succeeded: false,\n                status: 64,\n                message: "This specialist is not available through the advanced in-app installer.",\n                output: "")\n        }\n        return await run(selectorArguments: arguments, token: token, operation: operation)\n    }\n\n    private static func run(\n        selectorArguments: [String],\n        token: String?,\n        operation: ModelSetupOperation\n    ) async -> ModelSetupResult {\n        guard let script = setupScriptURL() else {\n            return ModelSetupResult(\n                succeeded: false,\n                status: 127,\n                message: "The packaged model setup helper is missing. Reinstall Private Librarian.",\n                output: "")\n        }\n\n        if operation.isCancellationRequested {\n            return cancelledResult(output: "")\n        }\n\n        let trimmedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)\n        let appSupport = applicationSupportURL()\n        return await Task.detached(priority: .utility) {\n            runBlocking(\n                script: script,\n                selectorArguments: selectorArguments,\n                token: trimmedToken,\n                appSupport: appSupport,\n                operation: operation)\n        }.value\n    }\n'''
+          text = replace_once(text, old, new, "AppModelSetup run selector")
+          text = replace_once(text,
+              '''    private static func runBlocking(\n        script: URL,\n        profile: String,\n        token: String?,\n''',
+              '''    private static func runBlocking(\n        script: URL,\n        selectorArguments: [String],\n        token: String?,\n''',
+              "runBlocking signature")
+          text = replace_once(text,
+              '''        var arguments = [script.path, "--specialist-profile", profile]\n''',
+              '''        var arguments = [script.path] + selectorArguments\n''',
+              "runBlocking arguments")
+          setup.write_text(text)
+
+          settings = Path("Sources/LibrarianApp/App/SimpleSettingsView.swift")
+          text = settings.read_text()
+          text = replace_once(text,
+              '''    @State private var copiedCommand = false\n''',
+              '''    @State private var copiedCommand = false\n    @State private var installingGatedModel = false\n    @State private var gatedModelOperation: ModelSetupOperation?\n    @State private var gatedModelProgress: ModelSetupProgress?\n    @State private var gatedModelStatus: String?\n    @State private var gatedModelDetails = ""\n    @State private var showGatedModelDetails = false\n''',
+              "settings gated model state")
+          old = '''                            HStack {\n                                Button("Save in Keychain") { saveHuggingFaceToken() }\n                                    .disabled(huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)\n                                Button("Remove Token") { removeHuggingFaceToken() }\n                                    .disabled(!hasHuggingFaceToken)\n                                Spacer()\n                                Link("DINOv3 access", destination: AppModelSetup.dinov3AgreementURL)\n                                Link("Tokens", destination: AppModelSetup.huggingFaceAccountURL)\n                            }\n                            .font(.caption)\n'''
+          new = '''                            HStack {\n                                Button("Save in Keychain") { saveHuggingFaceToken() }\n                                    .disabled(huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)\n                                Button("Remove Token") { removeHuggingFaceToken() }\n                                    .disabled(!hasHuggingFaceToken || installingGatedModel)\n                                Spacer()\n                                Link("1. Accept DINOv3 access", destination: AppModelSetup.dinov3AgreementURL)\n                                Link("Create token", destination: AppModelSetup.huggingFaceAccountURL)\n                            }\n                            .font(.caption)\n\n                            if model.specialistReadyIDs.contains(LocalModelStack.dinov3.id) {\n                                Label("DINOv3 is installed and ready", systemImage: "checkmark.circle.fill")\n                                    .font(.caption)\n                                    .foregroundStyle(.green)\n                            } else {\n                                HStack(spacing: 8) {\n                                    Button(gatedInstallButtonTitle) { installDINOv3() }\n                                        .buttonStyle(.borderedProminent)\n                                        .disabled(installingGatedModel || (!hasHuggingFaceToken && huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))\n                                    if installingGatedModel {\n                                        ProgressView().controlSize(.small)\n                                        Text(gatedModelProgress?.message ?? "Preparing DINOv3…")\n                                            .font(.caption2)\n                                            .foregroundStyle(.secondary)\n                                        Button("Cancel") { cancelDINOv3Install() }\n                                            .buttonStyle(.borderless)\n                                    }\n                                }\n                                Text("DINOv3 is optional. After upstream access is approved, save a read token here and install it without opening Terminal.")\n                                    .font(.caption2)\n                                    .foregroundStyle(.secondary)\n                            }\n\n                            if let gatedModelStatus {\n                                Text(gatedModelStatus)\n                                    .font(.caption2)\n                                    .foregroundStyle(.secondary)\n                                    .textSelection(.enabled)\n                            }\n                            if !gatedModelDetails.isEmpty {\n                                DisclosureGroup("DINOv3 setup details", isExpanded: $showGatedModelDetails) {\n                                    Text(gatedModelDetails)\n                                        .font(.system(.caption2, design: .monospaced))\n                                        .textSelection(.enabled)\n                                        .frame(maxWidth: .infinity, alignment: .leading)\n                                }\n                            }\n'''
+          text = replace_once(text, old, new, "settings gated install controls")
+          marker = '''    private func saveHuggingFaceToken() {\n'''
+          methods = '''    private var gatedInstallButtonTitle: String {\n        if installingGatedModel { return "Installing DINOv3…" }\n        if !huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {\n            return "Save & Install DINOv3"\n        }\n        return "Install DINOv3"\n    }\n\n    @MainActor\n    private func installDINOv3() {\n        guard !installingGatedModel else { return }\n        do {\n            let entered = huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines)\n            if !entered.isEmpty {\n                try HuggingFaceTokenStore.save(entered)\n                huggingFaceToken = ""\n                hasHuggingFaceToken = true\n                huggingFaceStatus = "Optional access token stored in macOS Keychain"\n            }\n            guard let token = try HuggingFaceTokenStore.load(), !token.isEmpty else {\n                gatedModelStatus = "Save a Hugging Face read token after accepting DINOv3 access first."\n                return\n            }\n\n            let operation = ModelSetupOperation()\n            gatedModelOperation = operation\n            gatedModelProgress = ModelSetupProgress(phase: "starting", message: "Preparing DINOv3…")\n            gatedModelStatus = nil\n            gatedModelDetails = ""\n            showGatedModelDetails = false\n            installingGatedModel = true\n\n            Task { @MainActor in\n                let watcher = Task { @MainActor in\n                    while !Task.isCancelled {\n                        if let progress = operation.progress { gatedModelProgress = progress }\n                        try? await Task.sleep(nanoseconds: 150_000_000)\n                    }\n                }\n                let result = await AppModelSetup.run(\n                    specialist: LocalModelStack.dinov3, token: token, operation: operation)\n                watcher.cancel()\n                installingGatedModel = false\n                gatedModelOperation = nil\n                gatedModelProgress = operation.progress\n                gatedModelDetails = result.output\n                if result.succeeded {\n                    gatedModelStatus = "DINOv3 is ready. It remains optional and is used only by advanced visual-similarity routing."\n                    model.refreshModelStatus()\n                } else if result.cancelled {\n                    gatedModelStatus = "DINOv3 setup was cancelled safely."\n                } else {\n                    let combined = (result.message + "\\n" + result.output).lowercased()\n                    if combined.contains("401") || combined.contains("403") || combined.contains("gated") || combined.contains("access") {\n                        gatedModelStatus = "DINOv3 access was denied. Accept the model terms first, then use a Hugging Face token with read access and try again."\n                    } else {\n                        gatedModelStatus = "DINOv3 setup did not finish. Open setup details for the exact local error."\n                    }\n                }\n            }\n        } catch {\n            gatedModelStatus = error.localizedDescription\n        }\n    }\n\n    @MainActor\n    private func cancelDINOv3Install() {\n        gatedModelOperation?.cancel()\n        gatedModelProgress = ModelSetupProgress(phase: "cancelling", message: "Stopping DINOv3 setup safely…")\n    }\n\n'''
+          if marker not in text:
+              raise SystemExit("settings token helper marker missing")
+          text = text.replace(marker, methods + marker, 1)
+          settings.write_text(text)
+
+          package = Path("scripts/package_app.sh")
+          text = package.read_text()
+          text = replace_once(text,
+              '''        for model in \\\n            siglip2-so400m-naflex \\\n''',
+              '''        for model in \\\n            siglip2-base-naflex \\\n            siglip2-so400m-naflex \\\n''',
+              "packaged specialist list")
+          text = replace_once(text,
+              '''# Model provisioning is intentionally an explicit Terminal action. The app's\n# runtime network entitlement stays disabled; these helpers are packaged so a\n# clean install can bootstrap pinned local models without a source checkout.\n''',
+              '''# Provisioning helpers support the explicit in-app setup flow as well as a\n# Terminal fallback. The app has outbound client networking only for setup;\n# normal inference is forced offline by the runtime bridge.\n''',
+              "packaging provisioning comment")
+          package.write_text(text)
+          PY
+
+      - name: Guard gated install contract
+        run: |
+          grep -F 'return ["--specialist-model", descriptor.id]' Sources/LibrarianAppSupport/Runtime/HuggingFaceModelSetup.swift
+          grep -F 'specialist: LocalModelStack.dinov3' Sources/LibrarianApp/App/SimpleSettingsView.swift
+          grep -F 'Save & Install DINOv3' Sources/LibrarianApp/App/SimpleSettingsView.swift
+          grep -F 'siglip2-base-naflex' scripts/package_app.sh
+          ! grep -F 'runtime network entitlement stays disabled' scripts/package_app.sh
+
+      - name: Commit repair
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Sources/LibrarianAppSupport/Runtime/HuggingFaceModelSetup.swift \
+                  Sources/LibrarianApp/App/SimpleSettingsView.swift \
+                  scripts/package_app.sh
+          git diff --cached --quiet && exit 0
+          git commit -m 'Install gated DINOv3 from the app'
+          git push origin HEAD:fix/app-does-not-work-as-intended
