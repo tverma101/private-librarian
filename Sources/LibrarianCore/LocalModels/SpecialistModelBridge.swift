@@ -48,6 +48,29 @@ public struct SpecialistEvidence: Sendable, Equatable {
     }
 }
 
+/// One opaque, broker-owned image payload in a bounded SigLIP batch. The ID is
+/// returned unchanged by the worker so callers can bind vectors back to exact
+/// file generations without ever sending source paths to Python.
+public struct SpecialistImageEmbeddingBatchItem: Sendable, Equatable {
+    public let id: String
+    public let bytes: Data
+
+    public init(id: String, bytes: Data) {
+        self.id = id
+        self.bytes = bytes
+    }
+}
+
+public struct SpecialistImageEmbeddingBatchResult: Sendable, Equatable {
+    public let id: String
+    public let vector: EmbeddingVector
+
+    public init(id: String, vector: EmbeddingVector) {
+        self.id = id
+        self.vector = vector
+    }
+}
+
 /// Bounded bridge to `scripts/specialist.py`.
 /// The protocol accepts broker-owned bytes or derived text only; source paths are never sent.
 public final class SpecialistModelBridge: @unchecked Sendable {
@@ -57,6 +80,8 @@ public final class SpecialistModelBridge: @unchecked Sendable {
     public static let siglipDimension = siglipSo400mDimension
     public static let dinoDimension = 768
     public static let maxImageBytes = 64 * 1024 * 1024
+    public static let maxBatchImages = 8
+    public static let maxBatchRawBytes = 64 * 1024 * 1024
 
     private let worker: Worker?
 
@@ -212,6 +237,47 @@ public final class SpecialistModelBridge: @unchecked Sendable {
         return EmbeddingVector(spaceID: Self.siglipSpaceID(for: model), dim: dimension, data: data)
     }
 
+    /// Execute one real grouped processor/model call in the already-warm
+    /// specialist worker. The same hard 8-image / 64-MiB raw-byte limits are
+    /// enforced on both sides of the JSONL boundary so production callers
+    /// cannot turn batching into an accidental unified-memory stress test.
+    public func embedSigLIPImages(
+        _ items: [SpecialistImageEmbeddingBatchItem],
+        model: LocalModelDescriptor = LocalModelStack.siglip2So400m,
+        timeout: TimeInterval = 60
+    ) -> [SpecialistImageEmbeddingBatchResult]? {
+        guard model.capability == .imageSemantic,
+              Self.siglipDimension(for: model) != nil,
+              !items.isEmpty, items.count <= Self.maxBatchImages,
+              Self.isProvisioned(model), let worker else { return nil }
+
+        var seenIDs = Set<String>()
+        var totalRawBytes = 0
+        var requestItems: [[String: Any]] = []
+        requestItems.reserveCapacity(items.count)
+        for item in items {
+            guard !item.id.isEmpty, item.id.count <= 128,
+                  seenIDs.insert(item.id).inserted,
+                  !item.bytes.isEmpty, item.bytes.count <= Self.maxImageBytes,
+                  item.bytes.count <= Self.maxBatchRawBytes - totalRawBytes else { return nil }
+            totalRawBytes += item.bytes.count
+            requestItems.append([
+                "id": item.id,
+                "data_b64": item.bytes.base64EncodedString(),
+            ])
+        }
+
+        let request: [String: Any] = [
+            "op": "siglip_image_batch",
+            "model": model.id,
+            "items": requestItems,
+        ]
+        return Self.parseSigLIPBatchResponse(
+            worker.call(request, timeout: timeout),
+            model: model,
+            expectedIDs: items.map(\.id))
+    }
+
     public func embedSigLIPText(_ text: String,
                                 model: LocalModelDescriptor = LocalModelStack.siglip2So400m,
                                 timeout: TimeInterval = 20) -> EmbeddingVector? {
@@ -310,6 +376,39 @@ public final class SpecialistModelBridge: @unchecked Sendable {
             description: String(description.prefix(512)),
             confidence: max(0, min(1, confidence)),
             reasons: Array(reasons.prefix(ClassifierContract.maxReasonCodes)).map { String($0.prefix(96)) })
+    }
+
+    /// Internal parser seam so contract tests can prove that a batch cannot
+    /// silently reorder IDs, change model spaces, or smuggle malformed vectors
+    /// into the catalog without requiring a multi-gigabyte checkpoint in CI.
+    static func parseSigLIPBatchResponse(
+        _ object: [String: Any]?,
+        model: LocalModelDescriptor,
+        expectedIDs: [String]
+    ) -> [SpecialistImageEmbeddingBatchResult]? {
+        guard let object, object["error"] == nil,
+              model.capability == .imageSemantic,
+              let dimension = siglipDimension(for: model),
+              object["model"] as? String == model.id,
+              object["space"] as? String == "\(model.id)-joint",
+              object["count"] as? Int == expectedIDs.count,
+              let rows = object["items"] as? [[String: Any]],
+              rows.count == expectedIDs.count else { return nil }
+
+        var results: [SpecialistImageEmbeddingBatchResult] = []
+        results.reserveCapacity(rows.count)
+        for (index, row) in rows.enumerated() {
+            guard let id = row["id"] as? String,
+                  id == expectedIDs[index],
+                  let data = vectorData(row, expectedDimension: dimension) else { return nil }
+            results.append(SpecialistImageEmbeddingBatchResult(
+                id: id,
+                vector: EmbeddingVector(
+                    spaceID: siglipSpaceID(for: model),
+                    dim: dimension,
+                    data: data)))
+        }
+        return results
     }
 
     private static func vectorData(_ object: [String: Any], expectedDimension: Int) -> Data? {
@@ -530,6 +629,12 @@ public final class SpecialistSigLIP2EmbeddingProvider: EmbeddingProvider, @unche
     }
     public func embedImageBytes(_ bytes: Data) -> EmbeddingVector? {
         bridge.embedSigLIPImage(bytes, model: model)
+    }
+    public func embedImageBatch(
+        _ items: [SpecialistImageEmbeddingBatchItem],
+        timeout: TimeInterval = 60
+    ) -> [SpecialistImageEmbeddingBatchResult]? {
+        bridge.embedSigLIPImages(items, model: model, timeout: timeout)
     }
     public func embedJointText(_ text: String) -> EmbeddingVector? {
         bridge.embedSigLIPText(text, model: model)
