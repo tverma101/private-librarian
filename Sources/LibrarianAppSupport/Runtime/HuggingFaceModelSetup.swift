@@ -252,10 +252,53 @@ public enum AppModelSetup {
         applicationSupportURL().appendingPathComponent("Models", isDirectory: true)
     }
 
+    static func selectorArguments(profile: LocalModelProfile) -> [String] {
+        switch profile {
+        case .fast: return ["--specialist-profile", "embeddings"]
+        case .balanced: return ["--specialist-profile", "balanced"]
+        case .quality: return ["--specialist-profile", "quality"]
+        }
+    }
+
+    static func selectorArguments(specialist descriptor: LocalModelDescriptor) -> [String]? {
+        // The in-app advanced installer is intentionally narrow: only models
+        // registered by this build and explicitly marked gated can use a
+        // Keychain credential. Normal public profile setup never needs one.
+        guard descriptor.gated,
+              LocalModelStack.all.contains(where: { $0.id == descriptor.id }) else { return nil }
+        return ["--specialist-model", descriptor.id]
+    }
+
     public static func run(
         profile: LocalModelProfile,
         token: String?,
         operation: ModelSetupOperation = ModelSetupOperation()
+    ) async -> ModelSetupResult {
+        await run(
+            selectorArguments: selectorArguments(profile: profile),
+            token: token,
+            operation: operation)
+    }
+
+    public static func run(
+        specialist descriptor: LocalModelDescriptor,
+        token: String?,
+        operation: ModelSetupOperation = ModelSetupOperation()
+    ) async -> ModelSetupResult {
+        guard let arguments = selectorArguments(specialist: descriptor) else {
+            return ModelSetupResult(
+                succeeded: false,
+                status: 64,
+                message: "This specialist is not available through the advanced in-app installer.",
+                output: "")
+        }
+        return await run(selectorArguments: arguments, token: token, operation: operation)
+    }
+
+    private static func run(
+        selectorArguments: [String],
+        token: String?,
+        operation: ModelSetupOperation
     ) async -> ModelSetupResult {
         guard let script = setupScriptURL() else {
             return ModelSetupResult(
@@ -269,19 +312,12 @@ public enum AppModelSetup {
             return cancelledResult(output: "")
         }
 
-        let profileName: String
-        switch profile {
-        case .fast: profileName = "embeddings"
-        case .balanced: profileName = "balanced"
-        case .quality: profileName = "quality"
-        }
         let trimmedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)
         let appSupport = applicationSupportURL()
-
         return await Task.detached(priority: .utility) {
             runBlocking(
                 script: script,
-                profile: profileName,
+                selectorArguments: selectorArguments,
                 token: trimmedToken,
                 appSupport: appSupport,
                 operation: operation)
@@ -301,7 +337,7 @@ public enum AppModelSetup {
 
     private static func runBlocking(
         script: URL,
-        profile: String,
+        selectorArguments: [String],
         token: String?,
         appSupport: URL,
         operation: ModelSetupOperation
@@ -336,7 +372,7 @@ public enum AppModelSetup {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        var arguments = [script.path, "--specialist-profile", profile]
+        var arguments = [script.path] + selectorArguments
         if let token, !token.isEmpty {
             arguments.append("--hf-token-stdin")
         }

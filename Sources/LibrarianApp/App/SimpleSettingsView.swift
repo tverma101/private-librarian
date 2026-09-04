@@ -14,6 +14,12 @@ struct SimpleSettingsView: View {
     @State private var hasHuggingFaceToken = false
     @State private var huggingFaceStatus = "Checking Keychain…"
     @State private var copiedCommand = false
+    @State private var installingGatedModel = false
+    @State private var gatedModelOperation: ModelSetupOperation?
+    @State private var gatedModelProgress: ModelSetupProgress?
+    @State private var gatedModelStatus: String?
+    @State private var gatedModelDetails = ""
+    @State private var showGatedModelDetails = false
 
     var body: some View {
         Form {
@@ -170,12 +176,50 @@ struct SimpleSettingsView: View {
                                 Button("Save in Keychain") { saveHuggingFaceToken() }
                                     .disabled(huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                                 Button("Remove Token") { removeHuggingFaceToken() }
-                                    .disabled(!hasHuggingFaceToken)
+                                    .disabled(!hasHuggingFaceToken || installingGatedModel)
                                 Spacer()
-                                Link("DINOv3 access", destination: AppModelSetup.dinov3AgreementURL)
-                                Link("Tokens", destination: AppModelSetup.huggingFaceAccountURL)
+                                Link("1. Accept DINOv3 access", destination: AppModelSetup.dinov3AgreementURL)
+                                Link("Create token", destination: AppModelSetup.huggingFaceAccountURL)
                             }
                             .font(.caption)
+
+                            if model.specialistReadyIDs.contains(LocalModelStack.dinov3.id) {
+                                Label("DINOv3 is installed and ready", systemImage: "checkmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                            } else {
+                                HStack(spacing: 8) {
+                                    Button(gatedInstallButtonTitle) { installDINOv3() }
+                                        .buttonStyle(.borderedProminent)
+                                        .disabled(installingGatedModel || (!hasHuggingFaceToken && huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                                    if installingGatedModel {
+                                        ProgressView().controlSize(.small)
+                                        Text(gatedModelProgress?.message ?? "Preparing DINOv3…")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                        Button("Cancel") { cancelDINOv3Install() }
+                                            .buttonStyle(.borderless)
+                                    }
+                                }
+                                Text("DINOv3 is optional. After upstream access is approved, save a read token here and install it without opening Terminal.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if let gatedModelStatus {
+                                Text(gatedModelStatus)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                            if !gatedModelDetails.isEmpty {
+                                DisclosureGroup("DINOv3 setup details", isExpanded: $showGatedModelDetails) {
+                                    Text(gatedModelDetails)
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
                         }
 
                         Divider()
@@ -338,6 +382,77 @@ struct SimpleSettingsView: View {
             hasHuggingFaceToken = false
             huggingFaceStatus = error.localizedDescription
         }
+    }
+
+    private var gatedInstallButtonTitle: String {
+        if installingGatedModel { return "Installing DINOv3…" }
+        if !huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Save & Install DINOv3"
+        }
+        return "Install DINOv3"
+    }
+
+    @MainActor
+    private func installDINOv3() {
+        guard !installingGatedModel else { return }
+        do {
+            let entered = huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !entered.isEmpty {
+                try HuggingFaceTokenStore.save(entered)
+                huggingFaceToken = ""
+                hasHuggingFaceToken = true
+                huggingFaceStatus = "Optional access token stored in macOS Keychain"
+            }
+            guard let token = try HuggingFaceTokenStore.load(), !token.isEmpty else {
+                gatedModelStatus = "Save a Hugging Face read token after accepting DINOv3 access first."
+                return
+            }
+
+            let operation = ModelSetupOperation()
+            gatedModelOperation = operation
+            gatedModelProgress = ModelSetupProgress(phase: "starting", message: "Preparing DINOv3…")
+            gatedModelStatus = nil
+            gatedModelDetails = ""
+            showGatedModelDetails = false
+            installingGatedModel = true
+
+            Task { @MainActor in
+                let watcher = Task { @MainActor in
+                    while !Task.isCancelled {
+                        if let progress = operation.progress { gatedModelProgress = progress }
+                        try? await Task.sleep(nanoseconds: 150_000_000)
+                    }
+                }
+                let result = await AppModelSetup.run(
+                    specialist: LocalModelStack.dinov3, token: token, operation: operation)
+                watcher.cancel()
+                installingGatedModel = false
+                gatedModelOperation = nil
+                gatedModelProgress = operation.progress
+                gatedModelDetails = result.output
+                if result.succeeded {
+                    gatedModelStatus = "DINOv3 is ready. It remains optional and is used only by advanced visual-similarity routing."
+                    model.refreshModelStatus()
+                } else if result.cancelled {
+                    gatedModelStatus = "DINOv3 setup was cancelled safely."
+                } else {
+                    let combined = (result.message + "\n" + result.output).lowercased()
+                    if combined.contains("401") || combined.contains("403") || combined.contains("gated") || combined.contains("access") {
+                        gatedModelStatus = "DINOv3 access was denied. Accept the model terms first, then use a Hugging Face token with read access and try again."
+                    } else {
+                        gatedModelStatus = "DINOv3 setup did not finish. Open setup details for the exact local error."
+                    }
+                }
+            }
+        } catch {
+            gatedModelStatus = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func cancelDINOv3Install() {
+        gatedModelOperation?.cancel()
+        gatedModelProgress = ModelSetupProgress(phase: "cancelling", message: "Stopping DINOv3 setup safely…")
     }
 
     private func saveHuggingFaceToken() {
