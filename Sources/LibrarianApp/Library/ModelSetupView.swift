@@ -150,7 +150,7 @@ struct ModelSetupView: View {
     private var setupDescription: String {
         switch profile {
         case .fast:
-            return "Optional public local encoders can be installed, but Fast itself works without them."
+            return "Fast itself works without downloads. You can close this setup and analyze immediately."
         case .balanced:
             return "Downloads SigLIP2 Base NaFlex for fast screenshot meaning plus bounded ambiguity handling."
         case .quality:
@@ -178,6 +178,17 @@ struct ModelSetupView: View {
     @MainActor
     private func installAndContinue() {
         guard !installing else { return }
+
+        // Fast is intentionally the zero-download path. If a settings entry
+        // ever presents this sheet while Fast is selected, do not turn that
+        // into a surprising model installation just because the generic setup
+        // view was reused.
+        guard profile != .fast else {
+            model.localModelProfile = .fast
+            onReady()
+            dismiss()
+            return
+        }
 
         let operation = ModelSetupOperation()
         setupOperation = operation
@@ -217,7 +228,10 @@ struct ModelSetupView: View {
 
             if result.succeeded {
                 model.refreshModelStatus()
-                model.localEmbeddingsEnabled = true
+                // The visible quality profile owns whether downloaded local AI
+                // is enabled. Re-assign it here so setup cannot leave behind a
+                // hidden Tier-2 state that contradicts what the UI says.
+                model.localModelProfile = profile
                 onReady()
                 dismiss()
             } else {
