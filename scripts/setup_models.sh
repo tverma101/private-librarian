@@ -32,11 +32,29 @@ emit_stage() {
 }
 
 cancel_setup() {
+    # Cancellation is terminal. Do not merely set a flag and then continue into
+    # the next pip/download step if SIGTERM landed between child commands.
+    trap - TERM INT
     CANCEL_REQUESTED=1
     emit_stage "cancelling" "Stopping setup safely…"
+
+    local pid
     if [ -n "$CURRENT_CHILD_PID" ]; then
         kill -TERM "$CURRENT_CHILD_PID" 2>/dev/null || true
+        wait "$CURRENT_CHILD_PID" 2>/dev/null || true
+        CURRENT_CHILD_PID=""
+    else
+        # Close the tiny race between launching an asynchronous command and
+        # copying `$!` into CURRENT_CHILD_PID. Any active shell job is part of
+        # this explicit setup run, so stop and reap it before exiting.
+        for pid in $(jobs -pr); do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        for pid in $(jobs -pr); do
+            wait "$pid" 2>/dev/null || true
+        done
     fi
+    exit 130
 }
 trap cancel_setup TERM INT
 
@@ -47,9 +65,9 @@ wait_for_child() {
     wait "$pid"
     status=$?
     if [ "$CANCEL_REQUESTED" -eq 1 ]; then
-        # A signal can interrupt wait before the child has fully exited. Wait a
-        # second time so no downloader/Python process is orphaned before the
-        # shell unwinds its normal cleanup traps.
+        # Defensive fallback if a future caller marks cancellation without
+        # entering the signal trap. Never report that interrupted work as a
+        # normal child failure.
         wait "$pid" 2>/dev/null || true
         status=130
     fi
