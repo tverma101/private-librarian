@@ -128,6 +128,33 @@ struct MagicContentView: View {
         model.sources.filter { !model.isPaused($0) && !model.needsReauthorization($0) }
     }
 
+    private var sectionSubtitle: String {
+        switch model.selectedSection {
+        case .overview:
+            return "A private map of your library, kept separate from your originals."
+        case .smart:
+            return "Curated virtual groups, ready to review without changing Finder."
+        case .screenshots:
+            return "Screenshot memberships from the encrypted local catalog."
+        case .school:
+            return "Course and assignment labels from local analysis."
+        case .projects:
+            return "Project labels remain virtual and source-safe."
+        case .documents:
+            return "Searchable text, PDF, and office evidence."
+        case .media:
+            return "Media labels and transcripts, kept in the encrypted catalog."
+        case .similarity:
+            return "Near-duplicate and semantic relationships between files."
+        case .review:
+            return "Low-confidence classifications waiting for your decision."
+        case .duplicates:
+            return "Duplicate candidates only; nothing is deleted automatically."
+        case .missing:
+            return "Catalog records whose originals are no longer available."
+        }
+    }
+
     var body: some View {
         NavigationSplitView {
             List(selection: $model.selectedSection) {
@@ -137,83 +164,91 @@ struct MagicContentView: View {
                     }
                 }
 
-                Section("Folders") {
+                Section {
                     if model.sources.isEmpty {
-                        Text("No folders added").foregroundStyle(.secondary)
+                        Text("No folders authorized yet")
+                            .foregroundStyle(.secondary)
                     } else {
                         ForEach(model.sources) { source in
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
-                                    Label((source.path as NSString).lastPathComponent.isEmpty
-                                          ? source.path : (source.path as NSString).lastPathComponent,
-                                          systemImage: model.isPaused(source) ? "pause.circle" : "folder")
-                                    Spacer()
-                                    Button { model.togglePaused(source) } label: {
-                                        Image(systemName: model.isPaused(source) ? "play" : "pause")
-                                    }.buttonStyle(.borderless)
-                                        .frame(width: 28, height: 28)
-                                        .contentShape(Rectangle())
-                                        .help(model.isPaused(source) ? "Resume analysis for this folder" : "Pause analysis for this folder")
-                                        .accessibilityLabel(model.isPaused(source) ? "Resume source" : "Pause source")
-                                    Button { model.reauthorizeSource(source) } label: {
-                                        Image(systemName: "arrow.triangle.2.circlepath")
-                                    }.buttonStyle(.borderless)
-                                        .frame(width: 28, height: 28)
-                                        .contentShape(Rectangle())
-                                        .help("Re-authorize folder")
-                                        .accessibilityLabel("Re-authorize folder")
-                                    Button { sourcePendingRemoval = source } label: {
-                                        Image(systemName: "trash")
-                                    }.buttonStyle(.borderless)
-                                        .frame(width: 28, height: 28)
-                                        .contentShape(Rectangle())
-                                        .help("Remove folder from the library view; its files stay on disk")
-                                        .accessibilityLabel("Remove source from library")
+                            let name = (source.path as NSString).lastPathComponent
+                            let unavailable = model.needsReauthorization(source)
+                            let paused = model.isPaused(source)
+                            HStack(spacing: 8) {
+                                Image(systemName: unavailable ? "exclamationmark.triangle.fill" : paused ? "pause.circle" : "folder.fill")
+                                    .foregroundStyle(unavailable ? .orange : .secondary)
+                                    .frame(width: 18)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(name.isEmpty ? source.path : name)
+                                        .lineLimit(1)
+                                    Text(unavailable ? "Needs permission" : paused ? "Paused" : "Ready")
+                                        .font(.caption2)
+                                        .foregroundStyle(unavailable || paused ? .orange : .secondary)
                                 }
-                                Text(source.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                if model.needsReauthorization(source) {
-                                    Text("Needs permission — analysis is paused for this folder")
-                                        .font(.caption2).foregroundStyle(.orange)
-                                } else if model.isPaused(source) {
-                                    Text("Paused — originals remain untouched")
-                                        .font(.caption2).foregroundStyle(.orange)
-                                } else {
-                                    Text("Analysis reads only · Finder changes need a separate Apply confirmation")
-                                        .font(.caption2).foregroundStyle(.secondary)
+                                .help(source.path)
+                                Spacer(minLength: 0)
+                                Menu {
+                                    if !unavailable {
+                                        Button(paused ? "Resume analysis" : "Pause analysis") {
+                                            model.togglePaused(source)
+                                        }
+                                    }
+                                    Button("Re-authorize…") { model.reauthorizeSource(source) }
+                                    Divider()
+                                    Button("Remove from Library", role: .destructive) {
+                                        sourcePendingRemoval = source
+                                    }
+                                } label: {
+                                    Image(systemName: "ellipsis.circle")
                                 }
+                                .menuStyle(.borderlessButton)
+                                .fixedSize()
+                                .accessibilityLabel("Actions for " + (name.isEmpty ? source.path : name))
                             }
+                            .padding(.vertical, 3)
                         }
                     }
-                    Button("Add Folder…") { model.addSourceFolder() }
-                    Button("Add Exclusion…") { model.addExclusionFolder() }
-                    ForEach(model.excludedPaths, id: \.self) { path in
-                        HStack {
-                            Label((path as NSString).lastPathComponent, systemImage: "eye.slash")
-                            Spacer()
-                            Button { model.removeExclusion(path) } label: {
-                                Image(systemName: "xmark.circle").foregroundStyle(.secondary)
-                            }.buttonStyle(.borderless)
-                                .frame(width: 28, height: 28)
-                                .contentShape(Rectangle())
-                                .accessibilityLabel("Remove exclusion")
+                    HStack(spacing: 8) {
+                        Button("Add Folder…") { model.addSourceFolder() }
+                        Menu {
+                            Button("Add Exclusion…") { model.addExclusionFolder() }
+                            if !model.excludedPaths.isEmpty {
+                                Divider()
+                                ForEach(model.excludedPaths, id: \.self) { path in
+                                    Button("Remove " + (path as NSString).lastPathComponent) {
+                                        model.removeExclusion(path)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
                         }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Manage exclusions")
+                        .accessibilityLabel("Manage exclusions")
+                        Spacer(minLength: 0)
+                    }
+                    if !model.excludedPaths.isEmpty {
+                        Text(String(model.excludedPaths.count) + " exclusion" + (model.excludedPaths.count == 1 ? "" : "s") + " active")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     if model.isIndexing {
                         Button("Stop Analysis") { model.cancelIndexing() }
                     } else {
                         Menu {
-                            Button("All Available Folders") { requestAnalysis(nil) }
+                            Button("All Authorized Folders") { requestAnalysis(nil) }
                             Divider()
                             ForEach(eligibleSources) { source in
                                 let name = (source.path as NSString).lastPathComponent
-                                Button("Only \(name.isEmpty ? source.path : name)") {
+                                Button(name.isEmpty ? source.path : name) {
                                     requestAnalysis(source)
                                 }
                             }
                         } label: {
                             Label(
                                 model.isLocalModelProfileReady(model.localModelProfile)
-                                    ? "Analyze Folder" : "Set Up & Analyze",
+                                    ? "Analyze" : "Set Up & Analyze",
                                 systemImage: model.isLocalModelProfileReady(model.localModelProfile)
                                     ? "sparkles" : "arrow.down.circle")
                         }
@@ -225,11 +260,14 @@ struct MagicContentView: View {
                                  : (model.isLocalModelProfileReady(model.localModelProfile)
                                     ? "Read and understand files without moving them"
                                     : "Set up the selected local quality level, then analyze the folder you chose")))
-                        if !model.isLocalModelProfileReady(model.localModelProfile) {
-                            Text("One-time setup runs here, then the exact folder choice resumes automatically. No account is required for Balanced or Quality.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
+                    }
+                } header: {
+                    HStack {
+                        Text("Sources")
+                        Spacer()
+                        Text("\(model.sources.count)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -237,11 +275,32 @@ struct MagicContentView: View {
             .navigationSplitViewColumnWidth(min: 250, ideal: 300, max: 360)
         } detail: {
             VStack(spacing: 0) {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.selectedSection.title)
+                            .font(.title2.bold())
+                        Text(sectionSubtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    if model.selectedSection == .smart {
+                        Text("\(model.smartGroups.count) groups")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+                .padding(.bottom, 10)
+
                 HStack(spacing: 10) {
                     TextField("Search everything…", text: $model.query)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { model.runSearch() }
                         .disabled(!model.catalogReady)
+                        .accessibilityLabel("Search library")
                     Button("Search") { model.runSearch() }
                         .disabled(model.isSearching || !model.catalogReady)
                     if model.isSearching {
@@ -311,12 +370,6 @@ struct MagicContentView: View {
                                 Color.clear
                                     .frame(height: 1)
                                     .id("detail-top")
-                                HStack {
-                                    Text(model.selectedSection.title).font(.title2.bold())
-                                    Spacer()
-                                    Text("virtual organization · local analysis")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
                                 sectionBody
                             }
                             .padding(20)
@@ -551,29 +604,32 @@ private struct FileExplorerView: View {
                     Text("Nothing here yet — analyze an available folder to populate the view.")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(files) { file in
-                        HStack {
-                            Image(systemName: file.status == "missing" ? "exclamationmark.triangle" : "doc")
-                                .foregroundStyle(file.status == "missing" ? .orange : .secondary)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text((file.path as NSString).lastPathComponent).lineLimit(1)
-                                Text(file.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(files) { file in
+                            HStack {
+                                Image(systemName: file.status == "missing" ? "exclamationmark.triangle" : "doc")
+                                    .foregroundStyle(file.status == "missing" ? .orange : .secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text((file.path as NSString).lastPathComponent).lineLimit(1)
+                                    Text(file.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                                Spacer()
+                                if let confidence = file.confidence {
+                                    Text(String(format: "%.0f%%", confidence * 100)).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Button {
+                                    model.revealInFinder(file.path)
+                                } label: {
+                                    Image(systemName: "arrow.up.forward.app")
+                                }
+                                .buttonStyle(.borderless)
+                                .disabled(file.status == "missing")
+                                .help("Reveal in Finder")
+                                .accessibilityLabel("Reveal in Finder")
                             }
-                            Spacer()
-                            if let confidence = file.confidence {
-                                Text(String(format: "%.0f%%", confidence * 100)).font(.caption).foregroundStyle(.secondary)
-                            }
-                            Button {
-                                model.revealInFinder(file.path)
-                            } label: {
-                                Image(systemName: "arrow.up.forward.app")
-                            }
-                            .buttonStyle(.borderless)
-                            .disabled(file.status == "missing")
-                            .help("Reveal in Finder")
-                            .accessibilityLabel("Reveal in Finder")
+                            .padding(.vertical, 5)
+                            Divider()
                         }
-                        Divider()
                     }
                     if files.count >= 200 {
                         Text("Showing the first 200 files; run a search to find anything specific.")
@@ -584,42 +640,131 @@ private struct FileExplorerView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } label: {
-            Label(title, systemImage: "square.grid.2x2")
+            HStack {
+                Label(title, systemImage: "square.grid.2x2")
+                Spacer()
+                Text("\(files.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }
 
 private struct SmartGroupsView: View {
     @EnvironmentObject private var model: LibrarianModel
+    @State private var groupFilter: GroupFilter = .all
+
+    private enum GroupFilter: String, CaseIterable, Identifiable {
+        case all
+        case categories
+        case relationships
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .all: return "All"
+            case .categories: return "Categories"
+            case .relationships: return "Relationships"
+            }
+        }
+
+        func matches(_ group: SmartOrganizationGroup) -> Bool {
+            switch self {
+            case .all: return true
+            case .categories: return group.kind == .category
+            case .relationships: return group.kind != .category
+            }
+        }
+    }
+
+    private var visibleGroups: [SmartOrganizationGroup] {
+        model.smartGroups.filter { groupFilter.matches($0) }
+    }
+
+    private var visibleItemCount: Int {
+        visibleGroups.reduce(0) { $0 + $1.fileIDs.count }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("A small set of useful virtual groups. Singleton model labels are hidden, related items are consolidated, and originals stay exactly where they are — unless you explicitly apply a group below.")
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Organize by intent")
+                        .font(.headline)
+                    Text("\(model.smartGroups.count) groups · \(visibleItemCount) visible memberships")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.isPreparingPlan {
+                    ProgressView("Preparing plan…")
+                        .controlSize(.small)
+                        .font(.caption)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Picker("Show", selection: $groupFilter) {
+                    ForEach(GroupFilter.allCases) { filter in
+                        Text(filter.title).tag(filter)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 330)
+                Spacer()
+                Text("Virtual only until you review a plan")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Label("Nothing moves or gets deleted from this screen. Review a plan before any Finder change.",
+                  systemImage: "lock.shield")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             if model.smartGroups.isEmpty {
                 ContentUnavailableView(
                     "No smart groups yet",
                     systemImage: "sparkles.rectangle.stack",
                     description: Text("Analyze a folder first. Groups appear only when there is enough evidence to be useful."))
+            } else if visibleGroups.isEmpty {
+                ContentUnavailableView(
+                    "No groups in this filter",
+                    systemImage: "line.3.horizontal.decrease.circle",
+                    description: Text("Choose another view to see the groups already found."))
             } else {
-                ForEach(model.smartGroups) { group in
-                    SmartGroupCard(group: group)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320, maximum: 480), spacing: 14)], spacing: 14) {
+                    ForEach(visibleGroups) { group in
+                        SmartGroupCard(group: group)
+                    }
                 }
             }
 
-            if model.canUndoApply || model.lastApplyMessage != nil || model.lastApplyFailureReport != nil {
+            applyStateFooter
+        }
+        .sheet(item: $model.pendingApplyPlan) { plan in
+            ApplyPlanConfirmationSheet(plan: plan)
+        }
+    }
+
+    @ViewBuilder
+    private var applyStateFooter: some View {
+        if model.canUndoApply || model.lastApplyMessage != nil || model.lastApplyFailureReport != nil {
+            GroupBox("Latest Finder action") {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 10) {
                         if model.canUndoApply {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Button("Undo Last Apply") { model.undoLastApply() }
-                                    .disabled(model.isApplyOperationInProgress || model.isReconciling)
-                                Text("restores \(model.undoBatchFileCount) file\(model.undoBatchFileCount == 1 ? "" : "s") from the last apply")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
+                            Button("Undo Last Apply") { model.undoLastApply() }
+                                .disabled(model.isApplyOperationInProgress || model.isReconciling)
+                            Text("restores \(model.undoBatchFileCount) file\(model.undoBatchFileCount == 1 ? "" : "s")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                         if model.isApplyOperationInProgress {
                             HStack(spacing: 6) {
@@ -659,9 +804,6 @@ private struct SmartGroupsView: View {
                 }
             }
         }
-        .sheet(item: $model.pendingApplyPlan) { plan in
-            ApplyPlanConfirmationSheet(plan: plan)
-        }
     }
 }
 
@@ -669,12 +811,15 @@ private struct SmartGroupCard: View {
     @EnvironmentObject private var model: LibrarianModel
     let group: SmartOrganizationGroup
 
+    private let previewLimit = 4
+
     var body: some View {
         GroupBox {
-            VStack(alignment: .leading, spacing: 7) {
-                HStack {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Label(group.title, systemImage: icon(for: group.kind))
                         .font(.headline)
+                        .lineLimit(1)
                     Spacer()
                     Text("\(group.fileIDs.count) items")
                         .font(.caption.monospacedDigit())
@@ -683,12 +828,18 @@ private struct SmartGroupCard: View {
                 Text(group.subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if group.kind != .category {
-                    Text("confidence \(String(format: "%.0f%%", group.confidence * 100))")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Text(group.kind == .category ? "Category" : "Relationship")
+                    if group.kind != .category {
+                        Text("confidence \(String(format: "%.0f%%", group.confidence * 100))")
+                    }
                 }
-                ForEach(Array(group.fileIDs.prefix(6)), id: \.self) { id in
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+                Divider()
+
+                ForEach(Array(group.fileIDs.prefix(previewLimit)), id: \.self) { id in
                     HStack(spacing: 8) {
                         Image(systemName: "doc")
                             .foregroundStyle(.secondary)
@@ -698,30 +849,23 @@ private struct SmartGroupCard: View {
                     .font(.caption)
                     .opacity(model.filePath(for: id).isEmpty ? 0.5 : 1.0)
                 }
-                if group.fileIDs.count > 6 {
-                    Text("+ \(group.fileIDs.count - 6) more")
+                if group.fileIDs.count > previewLimit {
+                    Text("+ \(group.fileIDs.count - previewLimit) more · search above to find them")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-                HStack(spacing: 10) {
+
+                HStack {
                     Button {
                         model.prepareApply(group: group)
                     } label: {
-                        if model.isPreparingPlan {
-                            HStack(spacing: 6) {
-                                ProgressView().controlSize(.small)
-                                Text("Preparing…")
-                            }
-                        } else {
-                            Label("Apply to Finder…", systemImage: "folder.badge.gearshape")
-                        }
+                        Label("Review plan", systemImage: "checklist")
                     }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                     .disabled(!model.catalogReady || model.isPreparingPlan
                               || model.isApplyOperationInProgress || model.isReconciling)
-                    .help("Create a folder named after this group and move the member files into it. Nothing moves until you confirm.")
-                    Text("You confirm every move; originals are moved, never copied or deleted, and it is undoable.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    .help("Preview the proposed Finder moves. Nothing changes until you confirm the plan.")
                     Spacer()
                 }
             }
@@ -893,62 +1037,64 @@ private struct SimilarityMapView: View {
                 if clusters.isEmpty {
                     Text("Families will appear after analysis and refreshing.").foregroundStyle(.secondary)
                 } else {
-                    ForEach(clusters, id: \.id) { cluster in
-                        DisclosureGroup(isExpanded: expandedBinding(for: cluster.id)) {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(alignment: .top, spacing: 10) {
-                                    RepresentativeThumbnailView(
-                                        request: previewRequest(cluster.representative),
-                                        fallbackSymbol: cluster.relation == .nearDuplicate
-                                            ? "photo.stack" : "square.stack.3d.up")
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text("Representative")
-                                            .font(.caption.bold())
-                                        Text(filePath(cluster.representative))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(2)
-                                    }
-                                }
-                                Text("Reason: \(cluster.reason) · confidence \(String(format: "%.0f%%", cluster.confidence * 100))")
-                                    .font(.caption2).foregroundStyle(.secondary)
-                                ForEach(cluster.members, id: \.self) { member in
-                                    HStack(spacing: 8) {
-                                        Image(systemName: member == cluster.representative
-                                              ? "star.fill" : "photo")
-                                            .foregroundStyle(member == cluster.representative ? .yellow : .secondary)
-                                        Text(filePath(member))
-                                            .font(.caption2)
-                                            .lineLimit(2)
-                                        if member == cluster.representative {
-                                            Text("representative")
-                                                .font(.caption2)
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(clusters, id: \.id) { cluster in
+                            DisclosureGroup(isExpanded: expandedBinding(for: cluster.id)) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(alignment: .top, spacing: 10) {
+                                        RepresentativeThumbnailView(
+                                            request: previewRequest(cluster.representative),
+                                            fallbackSymbol: cluster.relation == .nearDuplicate
+                                                ? "photo.stack" : "square.stack.3d.up")
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text("Representative")
+                                                .font(.caption.bold())
+                                            Text(filePath(cluster.representative))
+                                                .font(.caption)
                                                 .foregroundStyle(.secondary)
+                                                .lineLimit(2)
+                                        }
+                                    }
+                                    Text("Reason: \(cluster.reason) · confidence \(String(format: "%.0f%%", cluster.confidence * 100))")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                    ForEach(cluster.members, id: \.self) { member in
+                                        HStack(spacing: 8) {
+                                            Image(systemName: member == cluster.representative
+                                                  ? "star.fill" : "photo")
+                                                .foregroundStyle(member == cluster.representative ? .yellow : .secondary)
+                                            Text(filePath(member))
+                                                .font(.caption2)
+                                                .lineLimit(2)
+                                            if member == cluster.representative {
+                                                Text("representative")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            .padding(.top, 4)
-                        } label: {
-                            HStack {
-                                Image(systemName: cluster.relation == .nearDuplicate
-                                      ? "square.on.square" : "point.3.connected.trianglepath.dotted")
-                                    .foregroundStyle(.tint)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(cluster.relation == .nearDuplicate
-                                         ? "Near-duplicate family" : "Semantic cluster")
-                                        .font(.headline)
-                                    Text("\(cluster.members.count) members · \(cluster.reason)")
-                                        .font(.caption)
+                                .padding(.top, 4)
+                            } label: {
+                                HStack {
+                                    Image(systemName: cluster.relation == .nearDuplicate
+                                          ? "square.on.square" : "point.3.connected.trianglepath.dotted")
+                                        .foregroundStyle(.tint)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(cluster.relation == .nearDuplicate
+                                             ? "Near-duplicate family" : "Semantic cluster")
+                                            .font(.headline)
+                                        Text("\(cluster.members.count) members · \(cluster.reason)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Text(String(format: "%.0f%%", cluster.confidence * 100))
+                                        .font(.caption.monospacedDigit())
                                         .foregroundStyle(.secondary)
                                 }
-                                Spacer()
-                                Text(String(format: "%.0f%%", cluster.confidence * 100))
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
                             }
+                            Divider()
                         }
-                        Divider()
                     }
                 }
             }.frame(maxWidth: .infinity, alignment: .leading)
@@ -1053,41 +1199,43 @@ private struct ReviewInboxView: View {
             if model.reviewItems.isEmpty {
                 ContentUnavailableView("Inbox clear", systemImage: "checkmark.seal", description: Text("No low-confidence items are waiting."))
             } else {
-                ForEach(model.reviewItems) { item in
-                    GroupBox {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text((item.path as NSString).lastPathComponent).font(.headline)
-                                Spacer()
-                                Text(String(format: "%.0f%%", item.confidence * 100)).font(.caption).foregroundStyle(.secondary)
-                            }
-                            Text(item.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                            Text(item.reasonCodes.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
-                            HStack {
-                                TextField("Category", text: Binding(
-                                    get: { categoryDrafts[item.fileID] ?? "" },
-                                    set: { categoryDrafts[item.fileID] = $0 }))
-                                    .textFieldStyle(.roundedBorder)
-                                if let candidate = item.categories.first {
-                                    Button("Accept \(candidate)") {
-                                        apply(item: item, category: candidate, action: .addCategory)
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(model.reviewItems) { item in
+                        GroupBox {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text((item.path as NSString).lastPathComponent).font(.headline)
+                                    Spacer()
+                                    Text(String(format: "%.0f%%", item.confidence * 100)).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Text(item.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                Text(item.reasonCodes.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
+                                HStack {
+                                    TextField("Category", text: Binding(
+                                        get: { categoryDrafts[item.fileID] ?? "" },
+                                        set: { categoryDrafts[item.fileID] = $0 }))
+                                        .textFieldStyle(.roundedBorder)
+                                    if let candidate = item.categories.first {
+                                        Button("Accept \(candidate)") {
+                                            apply(item: item, category: candidate, action: .addCategory)
+                                        }
                                     }
+                                    Button("Add") {
+                                        let name = (categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces)
+                                        guard !name.isEmpty else { return }
+                                        apply(item: item, category: name, action: .addCategory)
+                                    }
+                                    .disabled((categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
+                                    .help("Type a category name first")
+                                    Button("Remove") {
+                                        let name = (categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces)
+                                        guard !name.isEmpty else { return }
+                                        apply(item: item, category: name, action: .removeCategory)
+                                    }
+                                    .disabled((categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
+                                    .help("Type the category to remove first")
+                                    Button("Unknown") { apply(item: item, category: "", action: .markUnknown) }
                                 }
-                                Button("Add") {
-                                    let name = (categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces)
-                                    guard !name.isEmpty else { return }
-                                    apply(item: item, category: name, action: .addCategory)
-                                }
-                                .disabled((categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
-                                .help("Type a category name first")
-                                Button("Remove") {
-                                    let name = (categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces)
-                                    guard !name.isEmpty else { return }
-                                    apply(item: item, category: name, action: .removeCategory)
-                                }
-                                .disabled((categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
-                                .help("Type the category to remove first")
-                                Button("Unknown") { apply(item: item, category: "", action: .markUnknown) }
                             }
                         }
                     }

@@ -1,5 +1,21 @@
 # Codex turn log
 
+## 2026-09-04 — repair the library workspace UI
+
+- `scope`: inspect the installed Advanced Library screen through native accessibility/source review, without enumerating or opening user folders, then repair the concrete UI defects visible in the supplied state.
+- `project`: `git@github.com:tverma101/private-librarian.git`; canonical checkout `/Users/tejas/Projects/private-librarian`; branch `fix/app-does-not-work-as-intended`; no push, merge, PR mutation, default-app change, or Actions execution.
+- `findings`: the window title was overly technical; the sidebar repeated full paths and safety copy on every source; Smart Groups rendered a long wall of eager cards with repeated Finder warnings and no filter; detail views used non-lazy stacks for potentially large catalog results; the page hierarchy did not identify the selected section clearly.
+- `changed_files`: `Sources/LibrarianApp/Library/AppEntryPoint.swift`, `Sources/LibrarianApp/Library/LibraryViews.swift`, and this turn log.
+- `implementation`: renamed the advanced window to `Library`, improved minimum/default sizing, compacted source rows behind an actions menu, moved exclusions into a managed menu, added a dynamic section header and counts, added Smart Groups category/relationship filters with a lazy adaptive grid and one safety callout, changed the destructive-looking action label to `Review plan`, and converted file/review/similarity result lists to lazy containers.
+- `validation`: strict Swift 6 warnings-as-errors build passed; full Swift suite passed 225 tests with 0 failures; local E2E passed all ten checks; Xcode archive/package/install passed; installed hardened entitlement audit, deep signature verification, universal `x86_64 arm64` audit, and DMG verification passed; final DMG SHA-256 is `9a92330aeb353470264fa5b24e107d8e3c9a84c7ddd3aa003771a7a0b8a4b782`.
+- `live_evidence`: `/Applications/PrivateLibrarian.app` was relaunched by exact bundle path with `open -n -g`; PID `73048` remained alive and recent logs contained only normal sandbox Keychain initialization, with no crash, `errSec` error, or prompt-loop evidence. Computer Use state found the app, but the native accessibility pipe closed on two bounded post-install AX reads; no screenshot or guessed live UI state is claimed.
+- `evidence_state`: implementation=yes; local tests=yes; packaged=yes; installed=yes; live launch/log check=yes; post-change AX inspection=no because the native pipe closed; folder-by-folder inspection=no; user-confirmed folder/bookmark/index/apply/undo=no; public notarization=no.
+- `residual_gap`: the UI was not interactively clicked after packaging because Computer Use's native pipe failed twice; real Finder Apply/Undo and user-folder bookmark persistence remain explicit user-confirmed boundaries; only Apple Development signing is available for this machine.
+- `cleanup`: no user folder, catalog, model runtime, Keychain item, default association, or LaunchServices state was deleted or changed; temporary E2E fixtures were cleaned by the test script.
+- `next`: review and commit the exact UI/documentation paths locally; leave publication separate.
+- `memory_decision`: existing canonical-checkout and Private Librarian release memory was consulted; no memory update was made because the user did not explicitly request one.
+- `rollout_refs`: current Codex turn, 2026-09-04.
+
 ## 2026-09-04 — complete local model, Keychain, packaging, and launch pass
 
 - `scope`: finish the canonical `fix/app-does-not-work-as-intended` checkout end to end after the local fast-forward to `bb3cf46e89305f17bca21b07a47f4551daae853a`; repair concrete failures found in the packaged macOS app and local model lifecycle.

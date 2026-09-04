@@ -32,12 +32,12 @@ struct PrivateLibrarianApp: App {
         // A `Window` (not WindowGroup) presents exactly one instance: repeated
         // openWindow(id:) calls focus the existing library instead of stacking
         // duplicate windows every time the user taps Library/Review/Duplicates.
-        Window("Advanced Library", id: "advanced-library") {
+        Window("Library", id: "advanced-library") {
             MagicContentView()
                 .environmentObject(model)
-                .frame(minWidth: 900, minHeight: 560)
+                .frame(minWidth: 980, minHeight: 620)
         }
-        .defaultSize(width: 1100, height: 720)
+        .defaultSize(width: 1180, height: 760)
 
         Settings {
             SimpleSettingsView()
