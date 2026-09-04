@@ -8,6 +8,11 @@ models remain available as explicit advanced ``--model`` installs; credentials
 for those may be supplied over stdin so a Keychain token never needs to enter
 argv, shell history, or a child-process environment.
 
+Balanced is deliberately optimized for large screenshot libraries: it uses the
+smaller SigLIP2 Base NaFlex semantic encoder. Quality swaps that semantic space
+for So400m and adds the larger bounded fallback; the two embedding spaces are
+never mixed in one profile.
+
 Examples:
   python3 scripts/provision_specialist_models.py --list
   python3 scripts/provision_specialist_models.py --profile embeddings
@@ -38,12 +43,19 @@ MODELS_ROOT = Path(os.environ.get("LIBRARIAN_SPECIALIST_MODELS_DIR", ROOT / "Mod
 # Keep this table in lock-step with Sources/LibrarianCore/LocalModels/LocalModelRouter.swift.
 # revision_prefix is an immutable commit prefix verified against the Hub before download.
 MODELS = {
+    "siglip2-base-naflex": {
+        "hf_id": "google/siglip2-base-patch16-naflex",
+        "revision_prefix": "b53b807",
+        "license": "Apache-2.0",
+        "profile": "embeddings",
+        "note": "balanced semantic image/text space; NaFlex 256-patch default",
+    },
     "siglip2-so400m-naflex": {
         "hf_id": "google/siglip2-so400m-patch16-naflex",
         "revision_prefix": "cc24074",
         "license": "Apache-2.0",
-        "profile": "embeddings",
-        "note": "semantic image/text joint space",
+        "profile": "quality",
+        "note": "quality semantic image/text space",
     },
     # DINOv3 remains supported for an explicit advanced install, but it is
     # deliberately excluded from consumer profiles because upstream access is
@@ -52,7 +64,7 @@ MODELS = {
         "hf_id": "facebook/dinov3-vitb16-pretrain-lvd1689m",
         "revision_prefix": "5931719",
         "license": "DINOv3 License",
-        "profile": "embeddings",
+        "profile": "advanced",
         "gated": True,
         "note": "optional advanced visual clustering representation",
     },
@@ -80,6 +92,22 @@ MODELS = {
 }
 
 PROFILE_ORDER = {"embeddings": 0, "balanced": 1, "quality": 2}
+PROFILE_MODELS = {
+    "embeddings": [
+        "siglip2-base-naflex",
+    ],
+    "balanced": [
+        "siglip2-base-naflex",
+        "paddleocr-vl-1.6",
+        "minicpm-v-4.6",
+    ],
+    "quality": [
+        "siglip2-so400m-naflex",
+        "paddleocr-vl-1.6",
+        "minicpm-v-4.6",
+        "lfm2.5-vl-3b",
+    ],
+}
 
 
 def unsupported_reason(name: str) -> str | None:
@@ -106,18 +134,14 @@ def regular_files(root: Path) -> Iterable[Path]:
 
 
 def selected_for_profile(profile: str) -> list[str]:
-    """Return the public models in a consumer quality profile.
+    """Return the exact public models in a consumer quality profile.
 
-    A profile is the one-click product path, so it must never suddenly require
-    an external account or license-approval workflow. Gated checkpoints remain
-    individually installable through ``--model`` for advanced users.
+    The semantic encoder is profile-specific rather than cumulative: Balanced
+    stores Base vectors; Quality stores So400m vectors. This prevents one
+    catalog/search session from silently mixing incompatible SigLIP spaces.
+    Gated checkpoints remain individually installable through ``--model``.
     """
-    ceiling = PROFILE_ORDER[profile]
-    return [
-        name
-        for name, spec in MODELS.items()
-        if PROFILE_ORDER[spec["profile"]] <= ceiling and not spec.get("gated", False)
-    ]
+    return list(PROFILE_MODELS[profile])
 
 
 def resolve_full_revision(hf, spec: dict, *, token: str | None = None) -> str:
@@ -343,7 +367,7 @@ def main() -> int:
             continue
         names.append(name)
     if args.profile == "quality" and not args.verify_only:
-        print("Quality adds LFM2.5-VL-3B; models above the 11.50 GB Mac ceiling are not offered.", file=sys.stderr)
+        print("Quality uses SigLIP2 So400m + LFM2.5-VL-3B; models above the 11.50 GB Mac ceiling are not offered.", file=sys.stderr)
 
     token: str | None = None
     if args.hf_token_stdin:
