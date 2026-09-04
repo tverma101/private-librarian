@@ -41,7 +41,7 @@ struct ModelSetupView: View {
 
             VStack(alignment: .leading, spacing: 11) {
                 setupPromise("Your files are not uploaded", icon: "lock.shield")
-                setupPromise("Models are stored inside Private Librarian's app data", icon: "internaldrive")
+                setupPromise("Private Librarian prepares its own local AI runtime", icon: "internaldrive")
                 setupPromise("You can use Fast immediately with no model download", icon: "bolt")
             }
             .padding(14)
@@ -50,7 +50,7 @@ struct ModelSetupView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("Hugging Face access")
+                Text("Model access")
                     .font(.headline)
 
                 if checkingToken {
@@ -59,14 +59,26 @@ struct ModelSetupView: View {
                         Text("Checking saved access…")
                             .foregroundStyle(.secondary)
                     }
+                } else if !needsGatedAccessToken {
+                    HStack(spacing: 9) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("DINOv3 access is already installed")
+                                .font(.subheadline.weight(.medium))
+                            Text("No Hugging Face token is required for the remaining setup.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 } else if hasSavedToken, !showTokenField {
                     HStack(spacing: 9) {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Access token ready")
+                            Text("Hugging Face access ready")
                                 .font(.subheadline.weight(.medium))
-                            Text("Stored in macOS Keychain")
+                            Text("Token stored in macOS Keychain")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -98,7 +110,7 @@ struct ModelSetupView: View {
                     ProgressView()
                     Text("Preparing local AI and downloading the selected models…")
                         .font(.subheadline.weight(.medium))
-                    Text("You can leave this window open while setup finishes.")
+                    Text("No Homebrew, Xcode, or separate Python installation is required on Apple-silicon Macs.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -162,8 +174,12 @@ struct ModelSetupView: View {
         .onAppear { refreshTokenState() }
     }
 
+    private var needsGatedAccessToken: Bool {
+        profile != .fast && !model.specialistProvisionedIDs.contains(LocalModelStack.dinov3.id)
+    }
+
     private var canInstall: Bool {
-        hasSavedToken || !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !needsGatedAccessToken || hasSavedToken || !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func setupPromise(_ title: String, icon: String) -> some View {
@@ -176,11 +192,11 @@ struct ModelSetupView: View {
         checkingToken = true
         do {
             hasSavedToken = try HuggingFaceTokenStore.load() != nil
-            showTokenField = !hasSavedToken
+            showTokenField = needsGatedAccessToken && !hasSavedToken
             statusMessage = nil
         } catch {
             hasSavedToken = false
-            showTokenField = true
+            showTokenField = needsGatedAccessToken
             statusMessage = "Keychain access failed: \(error.localizedDescription)"
         }
         checkingToken = false
@@ -191,7 +207,7 @@ struct ModelSetupView: View {
         guard !installing else { return }
 
         let typedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedToken: String
+        let resolvedToken: String?
         do {
             if !typedToken.isEmpty {
                 try HuggingFaceTokenStore.save(typedToken)
@@ -201,10 +217,12 @@ struct ModelSetupView: View {
                 showTokenField = false
             } else if let stored = try HuggingFaceTokenStore.load() {
                 resolvedToken = stored
-            } else {
+            } else if needsGatedAccessToken {
                 statusMessage = "Paste a Hugging Face token to continue, or use Fast with no download."
                 showTokenField = true
                 return
+            } else {
+                resolvedToken = nil
             }
         } catch {
             statusMessage = error.localizedDescription
@@ -240,11 +258,13 @@ struct ModelSetupView: View {
             combined.contains("agreement") || combined.contains("access denied") {
             return "DINOv3 access is not approved for this Hugging Face account yet. Approve access in the link above, then try again."
         }
-        if combined.contains("python3 is required") || combined.contains("python") && combined.contains("required") {
+        if combined.contains("automatic local-ai runtime") || combined.contains("checksum mismatch") ||
+            combined.contains("model python") {
             return "Private Librarian could not prepare its local AI runtime on this Mac. Open Technical details for the exact failure."
         }
-        if combined.contains("network") || combined.contains("could not resolve") || combined.contains("timed out") {
-            return "The model download could not reach Hugging Face. Check your connection and try again."
+        if combined.contains("network") || combined.contains("could not resolve") || combined.contains("timed out") ||
+            combined.contains("curl:") {
+            return "The model download could not reach its download servers. Check your connection and try again."
         }
         return "Setup did not finish. Try again, or use Fast now and finish model setup later."
     }
