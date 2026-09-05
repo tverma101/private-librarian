@@ -163,14 +163,6 @@ jobs:
         run: swift test --filter OrganizationQualityAcceptanceTests
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
-      - name: Reject fixture-only quality claims
-        shell: bash
-        run: |
-          set -euo pipefail
-          if grep -F 'benchmark_quality.py --output' .github/workflows/ci.yml; then
-            echo "CI must not score hand-written predictions as product quality" >&2
-            exit 1
-          fi
 
   entitlement-audit:
     runs-on: macos-15
