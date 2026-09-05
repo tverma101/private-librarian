@@ -1,5 +1,6 @@
 import XCTest
 @testable import LibrarianCore
+@testable import LibrarianAppSupport
 
 final class SortingDecisionTests: XCTestCase {
     func testSpecialistAdjudicationReplacesConflictingExclusiveLabels() {
@@ -104,5 +105,12 @@ final class SortingDecisionTests: XCTestCase {
 
         XCTAssertFalse(relation.canApplyToFinder)
         XCTAssertFalse(duplicate.canApplyToFinder)
+
+        XCTAssertThrowsError(try OrganizationApplier.plan(
+            group: relation,
+            pathFor: { _ in "/tmp/example.txt" },
+            sourceRoots: ["/tmp"])) { error in
+                XCTAssertEqual(error as? OrganizationApplier.ApplyError, .relationshipOnly)
+            }
     }
 }
