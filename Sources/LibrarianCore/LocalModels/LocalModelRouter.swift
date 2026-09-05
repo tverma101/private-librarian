@@ -199,13 +199,17 @@ public struct LocalModelRouter: Sendable {
             && !context.nativeOCRSucceeded
         if profile != .fast, needsSpecialistOCR { append(LocalModelStack.paddleOCR) }
 
-        // Generative models are escalation, never the baseline. Manual cleanup can tolerate uncertainty,
-        // so 0.55 is intentionally loose: below it we ask a specialist rather than creating folder spam.
-        let ambiguous = context.confidence < 0.55
-        if profile != .fast, context.kind == .image, ambiguous {
+        // Generative models are escalation, never the baseline. The cheap
+        // deterministic classifier's kind-only image result is exactly 0.55;
+        // treating only values *below* that as ambiguous accidentally made the
+        // VLM fallback unreachable for the most important unresolved case.
+        // Specific Vision/screenshot evidence raises confidence above 0.55, so
+        // this boundary catches generic images without running a VLM on every image.
+        let unresolvedBaselineImage = context.confidence <= 0.55
+        if profile != .fast, context.kind == .image, unresolvedBaselineImage {
             append(LocalModelStack.miniCPM)
         }
-        if profile == .quality, ambiguous, context.kind == .image {
+        if profile == .quality, unresolvedBaselineImage, context.kind == .image {
             // LFM2.5-VL-3B is the largest supported fallback. Larger candidates
             // were removed rather than relying on swap/offload to hide a RAM violation.
             append(LocalModelStack.lfm)
