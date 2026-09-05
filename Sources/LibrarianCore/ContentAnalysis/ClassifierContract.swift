@@ -12,43 +12,90 @@ public struct Classification: Codable, Sendable, Equatable {
 
     public init(fileID: String, categories: [String], description: String, confidence: Double, reasonCodes: [String]) {
         self.fileID = fileID
-        // Indexer appends specialist categories after deterministic categories.
-        // Once a specialist has actually run, mutually-exclusive semantic lanes
-        // must be adjudicated instead of blindly accumulated forever. Keeping
-        // this normalization at the inert Classification boundary means the
-        // catalog, review UI, and organizer all see the same resolved result
-        // without giving the model any filesystem authority.
-        self.categories = reasonCodes.contains(where: { $0.hasPrefix("specialist:") })
-            ? ClassificationCategoryPolicy.specialistResolved(categories)
-            : categories
+
+        // A specialist may adjudicate a mutually-exclusive lane only when its
+        // validated response explicitly selected a category in that lane. A
+        // generic specialist success must never erase a deterministic conflict
+        // merely because one of the old labels happened to be last in an array.
+        let hasSpecialist = reasonCodes.contains { $0.hasPrefix("specialist:") }
+        var resolvedCategories = hasSpecialist
+            ? ClassificationCategoryPolicy.specialistResolved(categories, reasonCodes: reasonCodes)
+            : ClassificationCategoryPolicy.deduplicated(categories)
+        var resolvedConfidence = confidence
+
+        // If the specialist did not actually settle the conflict, keep the file
+        // ambiguous and visibly reviewable. This also prevents a high generic
+        // specialist confidence from closing Review while contradictory labels
+        // still exist.
+        if hasSpecialist,
+           ClassificationCategoryPolicy.hasExclusiveConflict(resolvedCategories) {
+            if !resolvedCategories.contains("Review") { resolvedCategories.append("Review") }
+            resolvedConfidence = min(resolvedConfidence, 0.55)
+        }
+
+        self.categories = resolvedCategories
         self.description = description
-        self.confidence = confidence
+        self.confidence = resolvedConfidence
         self.reasonCodes = reasonCodes
     }
 }
 
 /// Categories are deliberately multi-label, but a few lanes represent one
-/// mutually-exclusive answer. Specialist output is appended after the cheap
-/// classifier, so the last member of one of these lanes is the specialist's
-/// adjudication and replaces the earlier conflicting guess.
+/// mutually-exclusive answer. Specialist choices are carried as inert reason
+/// markers (`model:pick:<category>`) so the contract can distinguish an actual
+/// adjudication from a model that merely returned a description/confidence.
 public enum ClassificationCategoryPolicy {
     private static let imageSubjects: Set<String> = [
         "Image/Animals", "Image/Vehicles", "Image/Scenery", "Image/Food", "Image/Documents"
     ]
 
-    public static func specialistResolved(_ categories: [String]) -> [String] {
-        var lastIndexByLane: [String: Int] = [:]
-        for (index, category) in categories.enumerated() {
+    public static func specialistResolved(_ categories: [String],
+                                          reasonCodes: [String]) -> [String] {
+        var selectedByLane: [String: String] = [:]
+        let markerPrefix = "model:pick:"
+        for reason in reasonCodes where reason.hasPrefix(markerPrefix) {
+            let category = String(reason.dropFirst(markerPrefix.count))
             if let lane = exclusiveLane(for: category) {
-                lastIndexByLane[lane] = index
+                // Reason order is execution order; the latest successful
+                // specialist in a lane is the final bounded adjudicator.
+                selectedByLane[lane] = category
             }
         }
+
+        var output: [String] = []
         var seen = Set<String>()
-        return categories.enumerated().compactMap { index, category in
-            guard seen.insert(category).inserted else { return nil }
-            guard let lane = exclusiveLane(for: category) else { return category }
-            return lastIndexByLane[lane] == index ? category : nil
+        for category in categories {
+            guard seen.insert(category).inserted else { continue }
+            if let lane = exclusiveLane(for: category),
+               let selected = selectedByLane[lane], selected != category {
+                continue
+            }
+            output.append(category)
         }
+        // A selected category should normally already be in `categories`, but
+        // append it defensively if a future merge path carries only the marker.
+        for selected in selectedByLane.values.sorted() where !output.contains(selected) {
+            output.append(selected)
+        }
+        return output
+    }
+
+    public static func hasExclusiveConflict(_ categories: [String]) -> Bool {
+        var valuesByLane: [String: Set<String>] = [:]
+        for category in categories {
+            guard let lane = exclusiveLane(for: category) else { continue }
+            valuesByLane[lane, default: []].insert(category)
+        }
+        return valuesByLane.values.contains { $0.count > 1 }
+    }
+
+    public static func isExclusiveCategory(_ category: String) -> Bool {
+        exclusiveLane(for: category) != nil
+    }
+
+    public static func deduplicated(_ categories: [String]) -> [String] {
+        var seen = Set<String>()
+        return categories.filter { seen.insert($0).inserted }
     }
 
     private static func exclusiveLane(for category: String) -> String? {
