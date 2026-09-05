@@ -16,6 +16,10 @@ public struct RuleBasedClassifier: Sendable {
         "package.swift", "pom.xml", "pyproject.toml", "requirements.txt"
     ]
 
+    private static let exclusiveImageSubjects: Set<String> = [
+        "Image/Animals", "Image/Vehicles", "Image/Scenery", "Image/Food", "Image/Documents"
+    ]
+
     public init() {}
 
     /// Multi-label classification (plan §26): kind / domain / course / purpose
@@ -139,9 +143,27 @@ public struct RuleBasedClassifier: Sendable {
             confidence = max(confidence, Double(screenshot.confidence))
         }
 
-        // Dedupe while preserving order; cap categories via the contract.
+        // Dedupe while preserving order.
         var seen = Set<String>()
         cats = cats.filter { seen.insert($0).inserted }
+
+        // Conflicting high-value evidence must not become a confident wrong
+        // Finder move. Course-vs-course conflicts stay in Review. Conflicting
+        // image-subject signals are lowered to the exact unresolved baseline so
+        // Balanced/Quality can ask the bounded VLM fallback to adjudicate them.
+        let courseCategories = cats.filter(Self.isCourseCategory)
+        if Set(courseCategories).count > 1 {
+            if !cats.contains("Review") { cats.append("Review") }
+            reasons.append("conflict:course")
+            confidence = min(confidence, 0.55)
+        }
+        let imageSubjects = cats.filter { exclusiveImageSubjects.contains($0) }
+        if Set(imageSubjects).count > 1 {
+            if !cats.contains("Review") { cats.append("Review") }
+            reasons.append("conflict:image-subject")
+            confidence = min(confidence, 0.55)
+        }
+
         if cats.count > ClassifierContract.maxCategories {
             cats = Array(cats.prefix(ClassifierContract.maxCategories))
             reasons.append("categories-capped")
@@ -204,5 +226,16 @@ public struct RuleBasedClassifier: Sendable {
         if l.contains("screenshot") || l.contains("screen") { return "Screenshots" }
         if l.contains("text") || l.contains("document") || l.contains("paper") { return "Image/Documents" }
         return nil
+    }
+
+    private static func isCourseCategory(_ category: String) -> Bool {
+        let prefix = "School/"
+        guard category.hasPrefix(prefix) else { return false }
+        let course = String(category.dropFirst(prefix.count))
+        let parts = course.split(separator: "-", omittingEmptySubsequences: false)
+        return parts.count == 2
+            && parts[0].allSatisfy(\.isLetter)
+            && (3...4).contains(parts[1].count)
+            && parts[1].allSatisfy(\.isNumber)
     }
 }
