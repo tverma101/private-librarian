@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Deterministic organization-quality metrics for Private Librarian.
+"""Score measured organization-quality results for Private Librarian.
 
-This module is intentionally model-agnostic: agents can feed predictions from any
-classifier/provider and compare commits without changing the metric definitions.
+This module is intentionally model-agnostic: callers feed predictions produced
+by an actual app/provider run. It never manufactures predictions internally,
+so its output cannot be mistaken for evidence that the product sorted files
+correctly.
 """
 
 from __future__ import annotations
@@ -197,7 +199,7 @@ def evaluate(payload: dict) -> dict:
 
     result = {
         "schema": 2,
-        "golden_library": payload.get("golden_library", "synthetic-golden-v1"),
+        "golden_library": payload.get("golden_library", "measured-run"),
         "screenshot_subtype_accuracy": accuracy(screenshot_rows, "truth", "predicted"),
         "screenshot_subtype_macro_f1": macro_f1(screenshot_rows),
         "screenshot_control_accuracy": accuracy(
@@ -209,7 +211,6 @@ def evaluate(payload: dict) -> dict:
         "near_duplicate_precision": near_scores["precision"],
         "near_duplicate_recall": near_scores["recall"],
         "near_duplicate_f1": near_scores["f1"],
-        # Compatibility aliases for consumers of schema 1.
         "duplicate_precision": exact_scores["precision"],
         "duplicate_recall": exact_scores["recall"],
         "duplicate_f1": exact_scores["f1"],
@@ -228,9 +229,9 @@ def evaluate(payload: dict) -> dict:
         ),
         "identity": {
             "commit": payload.get("commit", "unknown"),
-            "provider": payload.get("provider", "multi-provider-golden-fixture"),
-            "model": payload.get("model", "provider-records"),
-            "preprocessing": payload.get("preprocessing", "provider-records"),
+            "provider": payload.get("provider", "unknown"),
+            "model": payload.get("model", "unknown"),
+            "preprocessing": payload.get("preprocessing", "unknown"),
         },
     }
     comparisons = []
@@ -255,94 +256,13 @@ def evaluate(payload: dict) -> dict:
     return result
 
 
-def built_in_fixture() -> dict:
-    quality = {
-        "screenshots": [
-            {"truth": "code", "predicted": "code"},
-            {"truth": "school", "predicted": "school"},
-            {"truth": "lms", "predicted": "lms"},
-            {"truth": "receipt", "predicted": "receipt"},
-            {"truth": "error", "predicted": "error"},
-            {"truth": "conversation", "predicted": "conversation"},
-            {"truth": "social", "predicted": "social"},
-            {"truth": "map", "predicted": "school"},
-            {"truth": "meme", "predicted": "meme"},
-            {"truth": "reference", "predicted": "reference"},
-            {"truth": "unknown", "predicted": "reference"},
-        ],
-        "screenshot_controls": [
-            {"id": "plain-photo", "truth": "not-screenshot", "predicted": "not-screenshot"},
-            {"id": "document-pdf", "truth": "not-screenshot", "predicted": "not-screenshot"},
-        ],
-        "exact_duplicates": [
-            {"truth": ["a", "b", "c"], "predicted": ["a", "b", "c"]},
-            {"truth": ["d", "e"], "predicted": ["d", "e"]},
-        ],
-        "near_duplicates": [
-            {"truth": ["crop-a", "crop-b"], "predicted": ["crop-a", "crop-b", "lookalike"]},
-        ],
-        "semantic_search": [
-            {"relevant": ["cat1", "cat2"], "ranked": ["cat1", "cat2", "dog1"]},
-            {"relevant": ["code1"], "ranked": ["code1", "notes1"]},
-        ],
-        "clusters": [
-            {"cluster": "c1", "label": "cats"},
-            {"cluster": "c1", "label": "cats"},
-            {"cluster": "c2", "label": "code"},
-            {"cluster": "c3", "label": "code"},
-        ],
-        "ocr": [
-            {"id": "receipt", "recovered": True, "latency_ms": 18.4},
-            {"id": "scan", "recovered": False, "latency_ms": 41.8},
-        ],
-        "course_topic_classification": [
-            {"truth": "CSC-151", "predicted": "CSC-151"},
-            {"truth": "MAT-171", "predicted": "MAT-171"},
-            {"truth": "ENG-112", "predicted": "CSC-151"},
-        ],
-        "review": [
-            {"id": "ambiguous-1", "reviewed": True, "correct": True},
-            {"id": "ambiguous-2", "reviewed": True, "correct": False},
-        ],
-        "correction_runs": [
-            {"run": 1, "manual_corrections": 6},
-            {"run": 2, "manual_corrections": 4},
-            {"run": 3, "manual_corrections": 2},
-        ],
-    }
-    return {
-        **quality,
-        "golden_library": "synthetic-golden-v1",
-        "commit": None,
-        "providers": [
-            {
-                "provider_id": "python-transformers",
-                "model": "clip-vit-base-patch32 + all-MiniLM-L6-v2",
-                "preprocessing": "resize224-centerCrop-normalize;truncate4000-normalize",
-                "runtime": {"status": "fixture-only", "warm_calls": 0},
-                "quality_payload": quality,
-            },
-            {
-                "provider_id": "fileid-openclip-compat",
-                "model": "openai/clip-vit-base-patch32@3d74acf9",
-                "preprocessing": "resize224-centerCrop-normalize",
-                "runtime": {"status": "fixture-only", "warm_calls": 0},
-                "quality_payload": quality,
-            },
-            {
-                "provider_id": "apple-coreml-mobileclip",
-                "model": "apple/coreml-mobileclip@3e0a7bfb",
-                "preprocessing": "CoreML-256x256-ARGB-tokenBPE77",
-                "runtime": {"status": "unavailable", "reason": "No artifact-backed runtime fixture supplied", "warm_calls": 0},
-                "quality_payload": quality,
-            },
-        ],
-    }
-
-
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", type=Path)
+    ap = argparse.ArgumentParser(
+        description="Score predictions captured from an actual Private Librarian/provider run"
+    )
+    ap.add_argument(
+        "--input", type=Path, required=True,
+        help="JSON containing measured truth/prediction rows; there is no built-in prediction fixture")
     ap.add_argument("--output", type=Path, default=Path("quality-result.json"))
     ap.add_argument("--commit")
     ap.add_argument("--provider")
@@ -350,7 +270,9 @@ def main() -> int:
     ap.add_argument("--preprocessing")
     args = ap.parse_args()
 
-    payload = json.loads(args.input.read_text()) if args.input else built_in_fixture()
+    payload = json.loads(args.input.read_text())
+    if not isinstance(payload, dict):
+        raise SystemExit("quality input must be a JSON object from a measured run")
     if args.commit:
         payload["commit"] = args.commit
     if args.provider:
