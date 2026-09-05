@@ -22,13 +22,22 @@ final class OrganizationQualityAcceptanceTests: XCTestCase {
         try write("MAT-171 Homework 4.txt", "MAT-171 homework 4: polynomial and rational functions")
         try write("MAT-171 Exam Review.txt", "MAT-171 exam review: functions, zeros, graphs, inequalities")
 
+        // Hostile ambiguity: filename says MAT-171 while the actual content says
+        // CSC-151. A sorter that merely picks the highest/global label is unsafe.
+        // The real pipeline must retain it for Review and exclude it from every
+        // Finder move until a human or specialist resolves the contradiction.
+        try write("MAT-171 mystery notes.txt", "CSC-151 assignment: Java classes, methods, Scanner, arrays")
+
         // Generic PDFs should still fall back to the broad PDF destination.
         try write("Apartment Lease.pdf", "%PDF-1.4\nlease document alpha\n%%EOF")
         try write("Insurance Statement.pdf", "%PDF-1.4\ninsurance statement beta\n%%EOF")
 
-        // Real source files should land together as code projects.
+        // Real source files should land together as code projects. The third
+        // intentionally contains words that used to cause false school/LMS
+        // labels when programming vocabulary was treated as document meaning.
         try write("main.swift", "import Foundation\nfunc main() { print(\"hello\") }\n")
         try write("Utilities.swift", "import Foundation\nfunc clamp(_ x: Int) -> Int { x }\n")
+        try write("CanvasAssignment.swift", "struct Canvas { let assignment = \"screenshot module course\" }\n")
 
         // Downloads-style installer/archive clutter should collapse into one
         // destination rather than one folder per extension.
@@ -38,9 +47,11 @@ final class OrganizationQualityAcceptanceTests: XCTestCase {
         let catalog = try TestSupport.makeCatalog()
         let indexer = Indexer(broker: SourceBroker(), catalog: catalog, scheduler: Scheduler())
         let indexed = try indexer.indexRoot(root)
-        XCTAssertEqual(indexed, 8, "the acceptance corpus itself must be fully indexed")
+        XCTAssertEqual(indexed, 10, "the acceptance corpus itself must be fully indexed")
 
         let groups = try catalog.smartOrganizationGroups(limit: 18, roots: [root.path])
+        XCTAssertTrue(groups.allSatisfy(\.canApplyToFinder),
+                      "the human Smart Groups surface must contain organization destinations only")
         let destinations = groups.filter(\.canApplyToFinder)
         let rows = try catalog.allFiles(statuses: ["indexed"], roots: [root.path])
         let idByName = Dictionary(uniqueKeysWithValues: rows.map {
@@ -57,8 +68,9 @@ final class OrganizationQualityAcceptanceTests: XCTestCase {
         }
 
         let mathIDs = try ids(["MAT-171 Homework 4.txt", "MAT-171 Exam Review.txt"])
+        let conflictID = try XCTUnwrap(idByName["MAT-171 mystery notes.txt"])
         let pdfIDs = try ids(["Apartment Lease.pdf", "Insurance Statement.pdf"])
-        let codeIDs = try ids(["main.swift", "Utilities.swift"])
+        let codeIDs = try ids(["main.swift", "Utilities.swift", "CanvasAssignment.swift"])
         let archiveIDs = try ids(["old-export.zip", "project-backup.zip"])
 
         XCTAssertEqual(Set(destinations.first { $0.title == "MAT-171" }?.fileIDs ?? []), mathIDs)
@@ -76,11 +88,22 @@ final class OrganizationQualityAcceptanceTests: XCTestCase {
         }
         XCTAssertTrue(destinationCountByFile.values.allSatisfy { $0 == 1 },
                       "a file appeared in competing Finder destinations: \(destinationCountByFile)")
+        XCTAssertNil(destinationCountByFile[conflictID],
+                     "unresolved contradictory evidence must never produce a Finder move")
+
+        let reviewIDs = Set(try catalog.reviewItems(limit: 100, roots: [root.path]).map(\.fileID))
+        XCTAssertTrue(reviewIDs.contains(conflictID),
+                      "contradictory course evidence must be visible in Review rather than silently sorted")
 
         XCTAssertFalse(destinations.contains { $0.title == "Assignments" && !$0.fileIDs.isDisjoint(with: mathIDs) },
                        "course files must not simultaneously be offered as an Assignments move")
         XCTAssertFalse(destinations.contains { $0.title == "PDFs" && !$0.fileIDs.isDisjoint(with: mathIDs) },
                        "course files must not simultaneously be offered as a PDFs move")
+
+        let codeMemberships = try catalog.categoryMemberships(roots: [root.path])
+            .filter { codeIDs.contains($0.fileID) }
+        XCTAssertFalse(codeMemberships.contains { $0.categoryPath == "Assignment" || $0.categoryPath == "School" },
+                       "ordinary programming vocabulary must not turn source files into school material")
     }
 }
 
