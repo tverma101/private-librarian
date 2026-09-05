@@ -51,6 +51,28 @@ final class LocalModelRouterTests: XCTestCase {
         XCTAssertEqual(clear.map(\.id), [LocalModelStack.siglip2Base.id, LocalModelStack.dinov3.id])
     }
 
+    func testKindOnlyImageAtExactBaselineConfidenceEscalates() {
+        let router = LocalModelRouter(profile: .balanced)
+        let available: Set<String> = [LocalModelStack.siglip2Base.id, LocalModelStack.miniCPM.id]
+        let baseline = router.route(
+            context: LocalModelRouteContext(kind: .image, confidence: 0.55,
+                                            hasUsefulText: false,
+                                            nativeOCRSucceeded: true,
+                                            isDocumentLikeImage: false),
+            availableModelIDs: available)
+        XCTAssertEqual(baseline.map(\.id), [LocalModelStack.siglip2Base.id, LocalModelStack.miniCPM.id],
+                       "the deterministic kind-only image result is exactly 0.55 and must reach the VLM fallback")
+
+        let specific = router.route(
+            context: LocalModelRouteContext(kind: .image, confidence: 0.60,
+                                            hasUsefulText: false,
+                                            nativeOCRSucceeded: true,
+                                            isDocumentLikeImage: false),
+            availableModelIDs: available)
+        XCTAssertEqual(specific.map(\.id), [LocalModelStack.siglip2Base.id],
+                       "specific cheap evidence must prevent routine VLM execution")
+    }
+
     func testQualityHeavyFallbacksOnlyAppearForAmbiguity() {
         let router = LocalModelRouter(profile: .quality)
         let available = Set(LocalModelStack.all.map(\.id))
