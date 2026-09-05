@@ -6,9 +6,9 @@ public enum SmartOrganizationGroupKind: String, Codable, Sendable {
     case semantic
 }
 
-/// A compact, human-facing virtual group. These are intentionally *not*
-/// Finder folders: a file can appear in several groups while its source path
-/// remains untouched.
+/// A compact, human-facing virtual group. Relationship groups may overlap by
+/// design, but Finder organization groups are mutually exclusive: one file
+/// gets one primary destination proposal.
 public struct SmartOrganizationGroup: Identifiable, Sendable, Equatable {
     public let id: String
     public let title: String
@@ -27,16 +27,29 @@ public struct SmartOrganizationGroup: Identifiable, Sendable, Equatable {
         self.fileIDs = fileIDs
         self.confidence = confidence
     }
+
+    /// Only category groups describe a Finder destination. Duplicate and
+    /// semantic groups are evidence/navigation relationships, not move plans.
+    public var canApplyToFinder: Bool { kind == .category }
 }
 
 /// Turns low-level catalog memberships and similarity components into a small
-/// set of useful groups. The planner deliberately drops singleton taxonomy
-/// leaves and caps the number of groups so a large library cannot become a
-/// wall of thousands of AI-generated pseudo-folders.
+/// set of useful groups. Raw memberships remain multi-label evidence, while
+/// materializable category groups choose one primary destination per file.
+/// This prevents a MAT-171 PDF from being offered for MAT-171, Assignments,
+/// and PDFs as three competing Finder moves.
 public struct SmartOrganizationPlanner: Sendable {
     public let maxGroups: Int
     public let minimumGroupSize: Int
     public let minimumSemanticConfidence: Float
+
+    private struct DestinationDescriptor: Sendable {
+        let id: String
+        let title: String
+        let subtitle: String
+        let priority: Int
+        let members: Set<String>
+    }
 
     private static let allowedCourseDepartments: Set<String> = [
         "ART", "BIO", "BUS", "CHM", "COM", "CSC", "ECO", "ENG",
@@ -68,58 +81,99 @@ public struct SmartOrganizationPlanner: Sendable {
             categoriesByFile[membership.fileID, default: []].insert(path)
         }
 
-        var candidates: [(priority: Int, group: SmartOrganizationGroup)] = []
-
+        var destinations: [DestinationDescriptor] = []
         for (path, members) in membersByCategory {
             guard members.count >= minimumGroupSize,
                   let spec = Self.categorySpec(path) else { continue }
-            candidates.append((
-                spec.priority,
-                SmartOrganizationGroup(
-                    id: "category:\(path)",
-                    title: spec.title,
-                    subtitle: "\(members.count) items · \(spec.subtitle)",
-                    kind: .category,
-                    fileIDs: members.sorted()
-                )
-            ))
+            destinations.append(DestinationDescriptor(
+                id: "category:\(path)",
+                title: spec.title,
+                subtitle: spec.subtitle,
+                priority: spec.priority,
+                members: members))
         }
 
-        // Downloads/Desktop chaos is usually useful at a *concept* level, not
-        // one pseudo-folder per extension. Merge installer-ish source kinds and
-        // media kinds into two broad human buckets while keeping their lower-
-        // level catalog evidence intact.
+        // Downloads/Desktop chaos is useful at a concept level, not one folder
+        // per extension. These composite destinations participate in the same
+        // primary-destination election as every other materializable group.
         let installerMembers = Self.unionMembers(
             ["Applications", "DiskImages", "Packages", "Archives"],
-            from: membersByCategory
-        )
+            from: membersByCategory)
         if installerMembers.count >= minimumGroupSize {
-            candidates.append((
-                96,
-                SmartOrganizationGroup(
-                    id: "composite:installers-archives",
-                    title: "Installers & archives",
-                    subtitle: "\(installerMembers.count) items · apps, disk images & archives",
-                    kind: .category,
-                    fileIDs: installerMembers.sorted()
-                )
-            ))
+            destinations.append(DestinationDescriptor(
+                id: "composite:installers-archives",
+                title: "Installers & archives",
+                subtitle: "apps, disk images & archives",
+                priority: 96,
+                members: installerMembers))
         }
 
         let mediaMembers = Self.unionMembers(["Audio", "Video"], from: membersByCategory)
         if mediaMembers.count >= minimumGroupSize {
-            candidates.append((
-                92,
-                SmartOrganizationGroup(
-                    id: "composite:media",
-                    title: "Recordings & media",
-                    subtitle: "\(mediaMembers.count) items · audio & video",
-                    kind: .category,
-                    fileIDs: mediaMembers.sorted()
-                )
-            ))
+            destinations.append(DestinationDescriptor(
+                id: "composite:media",
+                title: "Recordings & media",
+                subtitle: "audio & video",
+                priority: 92,
+                members: mediaMembers))
         }
 
+        // Highest-value specific destination wins. If assigning higher-priority
+        // files causes a lower-priority folder to fall below the minimum useful
+        // size, remove that folder and re-elect those files into their next-best
+        // viable destination. This keeps the one-file/one-folder invariant
+        // without stranding useful generic groups.
+        let orderedDestinations = destinations.sorted(by: Self.destinationPrecedes)
+        let destinationByID = Dictionary(uniqueKeysWithValues: orderedDestinations.map { ($0.id, $0) })
+        var choicesByFile: [String: [String]] = [:]
+        for destination in orderedDestinations {
+            for fileID in destination.members {
+                choicesByFile[fileID, default: []].append(destination.id)
+            }
+        }
+
+        var activeDestinationIDs = Set(orderedDestinations.map(\.id))
+        var ownerByFile: [String: String] = [:]
+        while true {
+            ownerByFile.removeAll(keepingCapacity: true)
+            var counts: [String: Int] = [:]
+            for (fileID, choices) in choicesByFile {
+                guard let owner = choices.first(where: { activeDestinationIDs.contains($0) }) else { continue }
+                ownerByFile[fileID] = owner
+                counts[owner, default: 0] += 1
+            }
+            let undersized = activeDestinationIDs.filter {
+                counts[$0, default: 0] < minimumGroupSize
+            }
+            if undersized.isEmpty { break }
+            activeDestinationIDs.subtract(undersized)
+            if activeDestinationIDs.isEmpty {
+                ownerByFile.removeAll()
+                break
+            }
+        }
+
+        var primaryMembersByDestination: [String: Set<String>] = [:]
+        for (fileID, destinationID) in ownerByFile {
+            primaryMembersByDestination[destinationID, default: []].insert(fileID)
+        }
+
+        var candidates: [(priority: Int, group: SmartOrganizationGroup)] = []
+        for destination in orderedDestinations where activeDestinationIDs.contains(destination.id) {
+            guard let members = primaryMembersByDestination[destination.id],
+                  members.count >= minimumGroupSize else { continue }
+            candidates.append((
+                destination.priority,
+                SmartOrganizationGroup(
+                    id: destination.id,
+                    title: destination.title,
+                    subtitle: "\(members.count) items · \(destination.subtitle)",
+                    kind: .category,
+                    fileIDs: members.sorted())))
+        }
+
+        // Relationships stay useful for discovery/review, but are intentionally
+        // not Finder destinations and therefore may overlap primary groups.
         for cluster in similarityClusters {
             let members = Array(Set(cluster.members)).sorted()
             guard members.count >= 2 else { continue }
@@ -130,12 +184,10 @@ public struct SmartOrganizationPlanner: Sendable {
                     SmartOrganizationGroup(
                         id: "duplicate:\(cluster.familyID)",
                         title: "Near-duplicate family",
-                        subtitle: "\(members.count) almost-identical files",
+                        subtitle: "\(members.count) almost-identical files · relationship only",
                         kind: .nearDuplicate,
                         fileIDs: members,
-                        confidence: Double(cluster.confidence)
-                    )
-                ))
+                        confidence: Double(cluster.confidence))))
             case .semantic:
                 guard members.count >= max(3, minimumGroupSize),
                       cluster.confidence >= minimumSemanticConfidence else { continue }
@@ -145,18 +197,13 @@ public struct SmartOrganizationPlanner: Sendable {
                     SmartOrganizationGroup(
                         id: "semantic:\(cluster.familyID)",
                         title: title,
-                        subtitle: "\(members.count) related items",
+                        subtitle: "\(members.count) related items · relationship only",
                         kind: .semantic,
                         fileIDs: members,
-                        confidence: Double(cluster.confidence)
-                    )
-                ))
+                        confidence: Double(cluster.confidence))))
             }
         }
 
-        // A stable sort makes the home screen predictable. Per-lane limits then
-        // prevent a noisy signal (for example dozens of duplicate families) from
-        // consuming every visible smart group.
         let sorted = candidates.sorted {
             if $0.priority != $1.priority { return $0.priority > $1.priority }
             if $0.group.fileIDs.count != $1.group.fileIDs.count {
@@ -177,6 +224,14 @@ public struct SmartOrganizationPlanner: Sendable {
             if selected.count == maxGroups { break }
         }
         return selected
+    }
+
+    private static func destinationPrecedes(_ lhs: DestinationDescriptor,
+                                            _ rhs: DestinationDescriptor) -> Bool {
+        if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
+        if lhs.members.count != rhs.members.count { return lhs.members.count > rhs.members.count }
+        if lhs.title != rhs.title { return lhs.title < rhs.title }
+        return lhs.id < rhs.id
     }
 
     private static func unionMembers(
@@ -340,8 +395,7 @@ public extension Catalog {
         }
         return SmartOrganizationPlanner(maxGroups: limit).build(
             memberships: activeMemberships,
-            similarityClusters: activeClusters
-        )
+            similarityClusters: activeClusters)
     }
 
     /// Remove category rows that no longer lead to any membership. This is
