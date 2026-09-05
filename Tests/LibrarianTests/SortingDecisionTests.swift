@@ -3,7 +3,7 @@ import XCTest
 @testable import LibrarianAppSupport
 
 final class SortingDecisionTests: XCTestCase {
-    func testSpecialistAdjudicationReplacesConflictingExclusiveLabels() {
+    func testExplicitSpecialistAdjudicationReplacesConflictingExclusiveLabels() {
         let classification = Classification(
             fileID: "file_specialist",
             categories: [
@@ -18,7 +18,12 @@ final class SortingDecisionTests: XCTestCase {
             ],
             description: "",
             confidence: 0.84,
-            reasonCodes: ["specialist:minicpm-v-4.6"])
+            reasonCodes: [
+                "specialist:minicpm-v-4.6",
+                "model:pick:Image/Scenery",
+                "model:pick:Screenshots/code",
+                "model:pick:School/CSC-151",
+            ])
 
         XCTAssertEqual(classification.categories, [
             "Image",
@@ -30,6 +35,22 @@ final class SortingDecisionTests: XCTestCase {
         XCTAssertFalse(classification.categories.contains("Image/Animals"))
         XCTAssertFalse(classification.categories.contains("Screenshots/school"))
         XCTAssertFalse(classification.categories.contains("School/MAT-171"))
+        XCTAssertEqual(classification.confidence, 0.84, accuracy: 0.000_001)
+    }
+
+    func testGenericSpecialistSuccessCannotEraseAnUnresolvedConflict() {
+        let classification = Classification(
+            fileID: "file_unresolved",
+            categories: ["School/MAT-171", "School/CSC-151", "Documents/PDF"],
+            description: "specialist described the file but did not choose a course",
+            confidence: 0.94,
+            reasonCodes: ["conflict:course", "specialist:minicpm-v-4.6", "model:useful-description"])
+
+        XCTAssertTrue(classification.categories.contains("School/MAT-171"))
+        XCTAssertTrue(classification.categories.contains("School/CSC-151"))
+        XCTAssertTrue(classification.categories.contains("Review"))
+        XCTAssertEqual(classification.confidence, 0.55, accuracy: 0.000_001,
+                       "unresolved contradictory evidence must stay reviewable even after a high-confidence generic specialist response")
     }
 
     func testDeterministicEvidenceStaysMultiLabelUntilAnAdjudicatorRuns() {
