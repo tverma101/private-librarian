@@ -12,10 +12,66 @@ public struct Classification: Codable, Sendable, Equatable {
 
     public init(fileID: String, categories: [String], description: String, confidence: Double, reasonCodes: [String]) {
         self.fileID = fileID
-        self.categories = categories
+        // Indexer appends specialist categories after deterministic categories.
+        // Once a specialist has actually run, mutually-exclusive semantic lanes
+        // must be adjudicated instead of blindly accumulated forever. Keeping
+        // this normalization at the inert Classification boundary means the
+        // catalog, review UI, and organizer all see the same resolved result
+        // without giving the model any filesystem authority.
+        self.categories = reasonCodes.contains(where: { $0.hasPrefix("specialist:") })
+            ? ClassificationCategoryPolicy.specialistResolved(categories)
+            : categories
         self.description = description
         self.confidence = confidence
         self.reasonCodes = reasonCodes
+    }
+}
+
+/// Categories are deliberately multi-label, but a few lanes represent one
+/// mutually-exclusive answer. Specialist output is appended after the cheap
+/// classifier, so the last member of one of these lanes is the specialist's
+/// adjudication and replaces the earlier conflicting guess.
+public enum ClassificationCategoryPolicy {
+    private static let imageSubjects: Set<String> = [
+        "Image/Animals", "Image/Vehicles", "Image/Scenery", "Image/Food", "Image/Documents"
+    ]
+
+    public static func specialistResolved(_ categories: [String]) -> [String] {
+        var lastIndexByLane: [String: Int] = [:]
+        for (index, category) in categories.enumerated() {
+            if let lane = exclusiveLane(for: category) {
+                lastIndexByLane[lane] = index
+            }
+        }
+        var seen = Set<String>()
+        return categories.enumerated().compactMap { index, category in
+            guard seen.insert(category).inserted else { return nil }
+            guard let lane = exclusiveLane(for: category) else { return category }
+            return lastIndexByLane[lane] == index ? category : nil
+        }
+    }
+
+    private static func exclusiveLane(for category: String) -> String? {
+        if isCourseCategory(category) { return "school-course" }
+        if isScreenshotSubtype(category) { return "screenshot-subtype" }
+        if imageSubjects.contains(category) { return "image-subject" }
+        return nil
+    }
+
+    private static func isScreenshotSubtype(_ category: String) -> Bool {
+        let prefix = "Screenshots/"
+        return category.hasPrefix(prefix) && category.count > prefix.count
+    }
+
+    private static func isCourseCategory(_ category: String) -> Bool {
+        let prefix = "School/"
+        guard category.hasPrefix(prefix) else { return false }
+        let course = String(category.dropFirst(prefix.count))
+        let parts = course.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 2, (3...4).contains(parts[1].count) else { return false }
+        return parts[0].count >= 2
+            && parts[0].allSatisfy(\.isLetter)
+            && parts[1].allSatisfy(\.isNumber)
     }
 }
 
