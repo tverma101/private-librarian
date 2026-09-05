@@ -108,6 +108,39 @@ final class SortingDecisionTests: XCTestCase {
         XCTAssertFalse(groups.contains { $0.title == "PDFs" })
     }
 
+    func testLaneCapReassignsOverflowFilesToUsefulFallback() {
+        let courses = ["MAT-171", "CSC-151", "ENG-112", "BIO-111", "PSY-150", "COM-120"]
+        var memberships: [(categoryPath: String, fileID: String)] = []
+        var allIDs = Set<String>()
+        for course in courses {
+            for index in 0..<2 {
+                let id = "\(course)-\(index)"
+                allIDs.insert(id)
+                memberships.append(("School/\(course)", id))
+                memberships.append(("Documents/PDF", id))
+            }
+        }
+
+        let groups = SmartOrganizationPlanner(maxGroups: 5).build(
+            memberships: memberships,
+            similarityClusters: [])
+        let destinations = groups.filter(\.canApplyToFinder)
+
+        XCTAssertLessThanOrEqual(destinations.filter { $0.id.hasPrefix("category:School/") }.count, 4)
+        let pdfs = destinations.first { $0.id == "category:Documents/PDF" }
+        XCTAssertNotNil(pdfs,
+                        "files from course destinations hidden by the lane cap must fall back to PDFs instead of disappearing")
+
+        var counts: [String: Int] = [:]
+        for group in destinations {
+            for id in group.fileIDs { counts[id, default: 0] += 1 }
+        }
+        XCTAssertEqual(Set(counts.keys), allIDs,
+                       "every file with a viable fallback should remain represented after destination caps")
+        XCTAssertTrue(counts.values.allSatisfy { $0 == 1 },
+                      "fallback re-election must preserve one Finder destination per file")
+    }
+
     func testRelationshipGroupsCannotRepresentFinderDestinations() {
         let relation = SmartOrganizationGroup(
             id: "semantic:test",
