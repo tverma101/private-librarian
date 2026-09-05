@@ -20,7 +20,7 @@ extension SecurityScopedBookmarkLease: OrganizationLease {}
 /// the encrypted catalog so the batch can be undone, and the catalog row's
 /// recorded path is updated so virtual groups stay coherent afterwards.
 ///
-/// The appler only ever moves regular files that the catalog already knows
+/// The applier only ever moves regular files that the catalog already knows
 /// about, only within a root the user explicitly authorized, and never
 /// follows symlinks out of that scope.
 public enum OrganizationApplier {
@@ -94,6 +94,7 @@ public enum OrganizationApplier {
     }
 
     public enum ApplyError: Error, LocalizedError, Equatable {
+        case relationshipOnly
         case noMembers
         case noAuthorizedRoot
         case destinationCreateFailed(path: String, reason: String)
@@ -101,6 +102,8 @@ public enum OrganizationApplier {
 
         public var errorDescription: String? {
             switch self {
+            case .relationshipOnly:
+                return "Similarity and duplicate groups are for review only and cannot move files."
             case .noMembers:
                 return "This group has no movable files."
             case .noAuthorizedRoot:
@@ -126,6 +129,7 @@ public enum OrganizationApplier {
         sourceRoots: [String],
         destinationRootPath requestedDestinationRoot: String? = nil
     ) throws -> Plan {
+        guard group.canApplyToFinder else { throw ApplyError.relationshipOnly }
         let members = group.fileIDs.map { (fileID: $0, path: pathFor($0)) }
             .filter { !$0.path.isEmpty }
         guard !members.isEmpty else { throw ApplyError.noMembers }
@@ -159,16 +163,7 @@ public enum OrganizationApplier {
             throw ApplyError.noAuthorizedRoot
         }
 
-        // Every near-duplicate family shares the same title; without a suffix,
-        // applying two families into one root would silently merge both into
-        // a single "Near-duplicate family" folder.
-        var folderName = sanitizedFolderName(from: group.title)
-        if group.kind == .nearDuplicate {
-            let compact = group.id.filter { $0.isLetter || $0.isNumber }
-            if !compact.isEmpty {
-                folderName = String(folderName.prefix(72)) + " " + String(compact.suffix(6))
-            }
-        }
+        let folderName = sanitizedFolderName(from: group.title)
         let destinationMembers = byRoot[destinationRoot] ?? []
         var missingPaths: [String] = []
         var items: [Plan.Item] = []
@@ -488,7 +483,7 @@ public enum OrganizationApplier {
 
 private extension SourceBroker {
     /// Pure-path containment check with the broker's no-symlink-escape rules.
-    /// The appler never opens anything through this — moves go through the
+    /// The applier never opens anything through this — moves go through the
     /// lease — it just double-checks that a catalog path still belongs to the
     /// authorized root before touching it.
     func pathIsInsideScope(_ path: String, under root: String) -> Bool {
