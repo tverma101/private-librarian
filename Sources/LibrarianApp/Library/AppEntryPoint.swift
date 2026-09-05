@@ -36,8 +36,12 @@ struct PrivateLibrarianApp: App {
             MagicContentView()
                 .environmentObject(model)
                 .frame(minWidth: 980, minHeight: 620)
+                .background(LibraryWindowRestorationGuard())
         }
         .defaultSize(width: 1180, height: 760)
+        // Library is an on-demand workspace, not a second launch surface.
+        // Restoring it alongside Home made a normal relaunch look like a
+        // duplicate app/window and obscured the single source of truth.
 
         Settings {
             SimpleSettingsView()
@@ -56,10 +60,78 @@ final class PrivateLibrarianAppDelegate: NSObject, NSApplicationDelegate {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
         }
+
+        // A pre-fix restoration archive can be decoded before SwiftUI has
+        // attached the Library content guard. Give AppKit a short bounded
+        // window to finish creating restored scenes, then remove only that
+        // transient auxiliary window. Later user-opened Library windows are
+        // left alone.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.removeRestoredLibraryWindows()
+        }
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func application(_ app: NSApplication, didDecodeRestorableState coder: NSCoder) {
+        // macOS 14 has no SwiftUI restorationBehavior modifier. If an older
+        // build left an auxiliary Library window in the restoration archive,
+        // remove that one stale surface after AppKit has decoded it. The
+        // primary Home window remains untouched.
+        DispatchQueue.main.async {
+            let restoredLibraryWindows = app.windows.filter(Self.isLibraryWindow)
+            for window in restoredLibraryWindows {
+                Self.disableRestoration(for: window)
+                window.close()
+            }
+            app.invalidateRestorableState()
+        }
+    }
+
+    func application(_ app: NSApplication, willEncodeRestorableState coder: NSCoder) {
+        // Prevent a Library window opened during this session from becoming
+        // the next stale launch surface. Home may retain normal macOS frame
+        // restoration; this only targets the transient workspace.
+        for window in app.windows where Self.isLibraryWindow(window) {
+            Self.disableRestoration(for: window)
+        }
+    }
+
+    private func removeRestoredLibraryWindows() {
+        let restoredLibraryWindows = NSApp.windows.filter(Self.isLibraryWindow)
+        for window in restoredLibraryWindows {
+            Self.disableRestoration(for: window)
+            window.close()
+        }
+        NSApp.invalidateRestorableState()
+    }
+
+    fileprivate static func isLibraryWindow(_ window: NSWindow) -> Bool {
+        window.identifier?.rawValue == "advanced-library" || window.title == "Library"
+    }
+
+    fileprivate static func disableRestoration(for window: NSWindow) {
+        window.isRestorable = false
+        window.restorationClass = nil
+    }
+}
+
+/// AppKit bridge for the macOS 14 deployment target. SwiftUI's per-scene
+/// `.restorationBehavior(.disabled)` is macOS 15+, so the transient Library
+/// workspace opts out as soon as its NSWindow exists instead.
+private struct LibraryWindowRestorationGuard: NSViewRepresentable {
+    func makeNSView(context: Context) -> GuardView { GuardView() }
+
+    func updateNSView(_ nsView: GuardView, context: Context) {}
+
+    final class GuardView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            PrivateLibrarianAppDelegate.disableRestoration(for: window)
+        }
     }
 }
 
@@ -79,6 +151,24 @@ final class LibrarianModel: ObservableObject {
         let path: String
         let snippet: String
         let modeLabel: String
+    }
+
+    /// The last user-visible operation status, including when it happened.
+    /// The history remains available for diagnostics, but surfaces should not
+    /// make a bare, untimestamped status string look current forever.
+    struct StatusEvent: Sendable, Equatable {
+        let message: String
+        let timestamp: Date
+
+        var isWarning: Bool {
+            let lowercased = message.lowercased()
+            return lowercased.contains("error")
+                || lowercased.contains("failed")
+                || lowercased.contains("warning")
+                || lowercased.contains("unavailable")
+                || lowercased.contains("blocked")
+                || lowercased.contains("could not")
+        }
     }
 
     struct PreviewRequest: Sendable, Equatable {
@@ -145,15 +235,27 @@ final class LibrarianModel: ObservableObject {
 
         var headline: String {
             if !ranCleanly { return "Analysis finished with warnings" }
+            return (totalProcessed > 0 || totalMissing > 0) ? "Analysis complete" : "Already up to date"
+        }
+
+        var summaryLine: String {
+            var parts = ["\(totalScanned) files checked"]
             if totalProcessed > 0 {
-                return "Analysis complete · \(totalProcessed) new or changed"
+                parts.append("\(totalProcessed) analyzed")
+            } else {
+                parts.append("nothing new")
             }
-            return "Up to date · nothing new to analyze"
+            if totalMissing > 0 {
+                parts.append("\(totalMissing) missing")
+            }
+            parts.append("\(folders.count) folder" + (folders.count == 1 ? "" : "s"))
+            return parts.joined(separator: " · ")
         }
     }
 
     @Published var sources: [SourceFolder] = []
     @Published var statusLines: [String] = []
+    @Published private(set) var latestStatusEvent: StatusEvent?
     @Published var searchResults: [SearchResult] = []
     @Published var query: String = "" {
         didSet {
@@ -164,6 +266,7 @@ final class LibrarianModel: ObservableObject {
     }
     @Published var isIndexing = false
     @Published var selectedSection: LibrarySection = .overview
+    @Published var libraryScope: LibraryScope = .allAuthorized
     @Published var excludedPaths: [String] = []
     @Published var dashboard: CatalogDashboard = .empty
     @Published var reviewItems: [ReviewItem] = []
@@ -253,6 +356,58 @@ final class LibrarianModel: ObservableObject {
     var isLocalTranscriptionAvailable: Bool { AppLocalTranscription.isAvailable }
     var localTranscriptionStatus: String { AppLocalTranscription.statusText }
     var isUsingFreshCatalog: Bool { activeCatalogFilename == Self.freshCatalogFilename }
+
+    var libraryScopeSource: SourceFolder? {
+        guard case .source(let id) = libraryScope else { return nil }
+        return sources.first(where: { $0.id == id })
+    }
+
+    /// Roots passed into scoped catalog queries. `[]` is intentional when no
+    /// source is authorized: the explicit aggregate view should not resurrect
+    /// stale rows from a removed folder.
+    var libraryScopeRoots: [String] {
+        switch libraryScope {
+        case .allAuthorized:
+            return sources.map(\.path)
+        case .source:
+            return libraryScopeSource.map { [$0.path] } ?? []
+        }
+    }
+
+    var libraryScopeLabel: String {
+        if let source = libraryScopeSource {
+            let name = (source.path as NSString).lastPathComponent
+            return name.isEmpty ? source.path : name
+        }
+        return "All authorized folders"
+    }
+
+    var libraryScopeDescription: String {
+        if let source = libraryScopeSource {
+            return "Showing only catalog records under \(source.path)."
+        }
+        return sources.isEmpty
+            ? "No authorized folders are currently included."
+            : "Showing the combined catalog for \(sources.count) authorized folder" + (sources.count == 1 ? "." : "s.")
+    }
+
+    func selectLibraryScope(_ source: SourceFolder?) {
+        let next: LibraryScope = source.map { .source($0.id) } ?? .allAuthorized
+        guard next != libraryScope else {
+            refreshDashboard()
+            return
+        }
+        libraryScope = next
+        // Results from another folder are more dangerous than stale: they
+        // look like evidence for the selected folder. Clear them immediately,
+        // then rerun the current query against the new scope if one exists.
+        searchResults = []
+        searchFoundNothing = false
+        refreshDashboard()
+        if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            runSearch()
+        }
+    }
 
     private var catalog: Catalog?
     private var bookmarkDataByPath: [String: Data] = [:]
@@ -617,6 +772,9 @@ final class LibrarianModel: ObservableObject {
 
     func removeSource(_ source: SourceFolder) {
         if isIndexing { activeIndexCancellation?.cancel(reason: .removed) }
+        if libraryScopeSource?.id == source.id {
+            libraryScope = .allAuthorized
+        }
         do {
             try catalog?.markRootUnscoped(root: source.path)
         } catch {
@@ -843,18 +1001,21 @@ final class LibrarianModel: ObservableObject {
 
     /// Verify known catalog rows against the live authorized folders without
     /// re-running extraction or local models. Full analysis remains explicit.
-    func reconcileAuthorizedSources() {
+    func reconcileAuthorizedSources(source scopedSource: SourceFolder? = nil) {
         guard catalogReady, let catalog, !isReconciling, !isIndexing else { return }
-        let authorized: [(sourcePath: String, lease: SecurityScopedBookmarkLease)] = sources
+        let candidateSources = scopedSource.map { [$0] } ?? sources
+        let authorized: [(sourcePath: String, lease: SecurityScopedBookmarkLease)] = candidateSources
             .filter { !pausedPaths.contains($0.path) && !sourcesNeedingReauthorization.contains($0.path) }
             .compactMap { source in sourceLease(for: source).map { (source.path, $0) } }
         guard !authorized.isEmpty else { return }
 
         isReconciling = true
-        log("checking known catalog paths under authorized folders…")
+        let scopeLabel = scopedSource.map { ($0.path as NSString).lastPathComponent }
+            .flatMap { $0.isEmpty ? nil : $0 } ?? "authorized folders"
+        log("checking known catalog paths under \(scopeLabel)…")
         Task.detached(priority: .utility) { [weak self, catalog, authorized] in
             let broker = SourceBroker()
-            let rows = (try? catalog.allFiles(statuses: ["indexed"])) ?? []
+            let rows = (try? catalog.allFiles(statuses: ["indexed"], roots: authorized.map(\.sourcePath))) ?? []
             var markedMissing = 0
             var skippedInaccessible = 0
             for row in rows {
@@ -1250,6 +1411,7 @@ final class LibrarianModel: ObservableObject {
 
     func refreshDashboard() {
         guard let catalog else { return }
+        let scopeRoots = libraryScopeRoots
         // "· just updated" chips stop being true once the data has moved on.
         if let updated = changedGroupIDsUpdatedAt,
            Date().timeIntervalSince(updated) > 600,
@@ -1261,13 +1423,13 @@ final class LibrarianModel: ObservableObject {
             // The dashboard only needs aggregate graph counts. Do not load the
             // full organization graph or every similarity family onto the main
             // actor just to refresh counters on a huge catalog.
-            dashboard = try catalog.dashboard()
-            reviewItems = try catalog.reviewItems(limit: 200)
+            dashboard = try catalog.dashboard(roots: scopeRoots)
+            reviewItems = try catalog.reviewItems(limit: 200, roots: scopeRoots)
             learnedRules = try catalog.listRules()
-            similarityClusters = try catalog.boundedSimilarityClusters(limit: 200)
-            smartGroups = try catalog.smartOrganizationGroups()
-            projectSummaries = try catalog.projectSemanticSummaries(limit: 128)
-            coverage = try catalog.coverage(roots: sources.map(\.path),
+            similarityClusters = try catalog.boundedSimilarityClusters(roots: scopeRoots, limit: 200)
+            smartGroups = try catalog.smartOrganizationGroups(roots: scopeRoots)
+            projectSummaries = try catalog.projectSemanticSummaries(limit: 128, roots: scopeRoots)
+            coverage = try catalog.coverage(roots: scopeRoots,
                                             excludedPaths: effectiveExcludedPaths)
             liveIndexRunning = liveCoordinator?.running ?? false
             livePendingEvents = liveCoordinator?.pendingCount ?? 0
@@ -1282,42 +1444,44 @@ final class LibrarianModel: ObservableObject {
     /// actor and only publish results for the still-selected section.
     func reloadSectionFiles() {
         let section = selectedSection
+        let scope = libraryScope
+        let scopeRoots = libraryScopeRoots
         guard let catalog else {
             sectionFiles = []
             return
         }
-        Task.detached(priority: .userInitiated) { [weak self, catalog, section] in
-            let files = Self.sectionFileSummaries(catalog: catalog, section: section)
+        Task.detached(priority: .userInitiated) { [weak self, catalog, section, scope, scopeRoots] in
+            let files = Self.sectionFileSummaries(catalog: catalog, section: section, roots: scopeRoots)
             await MainActor.run { [weak self] in
-                guard let self, self.selectedSection == section else { return }
+                guard let self, self.selectedSection == section, self.libraryScope == scope else { return }
                 self.sectionFiles = files
             }
         }
     }
 
     private nonisolated static func sectionFileSummaries(
-        catalog: Catalog, section: LibrarySection
+        catalog: Catalog, section: LibrarySection, roots: [String]
     ) -> [Catalog.FileSummary] {
         switch section {
         case .screenshots:
-            let plural = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshots", limit: 200)) ?? []
-            let singular = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshot", limit: 200)) ?? []
+            let plural = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshots", roots: roots, limit: 200)) ?? []
+            let singular = (try? catalog.boundedFileSummaries(categoryPrefix: "Screenshot", roots: roots, limit: 200)) ?? []
             return Array(Dictionary((plural + singular).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                 .values.sorted { $0.path < $1.path }.prefix(200))
         case .school:
-            return (try? catalog.boundedFileSummaries(categoryPrefix: "School", limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(categoryPrefix: "School", roots: roots, limit: 200)) ?? []
         case .projects:
-            return (try? catalog.boundedFileSummaries(categoryPrefix: "Projects", limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(categoryPrefix: "Projects", roots: roots, limit: 200)) ?? []
         case .documents:
-            return (try? catalog.boundedFileSummaries(categoryPrefix: "Documents", limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(categoryPrefix: "Documents", roots: roots, limit: 200)) ?? []
         case .media:
-            return (try? catalog.boundedFileSummaries(kinds: [.audio, .video], limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(kinds: [.audio, .video], roots: roots, limit: 200)) ?? []
         case .duplicates:
-            return (try? catalog.boundedFileSummaries(duplicateOnly: true, limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(duplicateOnly: true, roots: roots, limit: 200)) ?? []
         case .missing:
-            return (try? catalog.boundedFileSummaries(status: "missing", limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(status: "missing", roots: roots, limit: 200)) ?? []
         default:
-            return (try? catalog.boundedFileSummaries(limit: 200)) ?? []
+            return (try? catalog.boundedFileSummaries(roots: roots, limit: 200)) ?? []
         }
     }
 
@@ -1405,10 +1569,11 @@ final class LibrarianModel: ObservableObject {
         let profile = localModelProfile
         let mode = searchMode
         let providerKind = CoreMLMobileCLIPProvider.isAvailable ? "coreml-mobileclip" : nil
+        let scopeRoots = libraryScopeRoots
         let work = Task.detached(priority: .userInitiated) {
             Self.searchResults(catalog: catalog, query: normalizedQuery, mode: mode,
                                enableLocalEmbeddings: enabled, localModelProfile: profile,
-                               embeddingProviderKind: providerKind)
+                               embeddingProviderKind: providerKind, roots: scopeRoots)
         }
         searchTask = Task { @MainActor [weak self] in
             let results = await work.value
@@ -1417,6 +1582,16 @@ final class LibrarianModel: ObservableObject {
             self.searchFoundNothing = results.isEmpty
             self.searchResults = results
         }
+    }
+
+    func clearSearch() {
+        searchTask?.cancel()
+        searchTask = nil
+        searchGeneration += 1
+        query = ""
+        searchResults = []
+        isSearching = false
+        searchFoundNothing = false
     }
 
     /// Reveal a cataloged file in Finder with it selected. Read-only — Finder
@@ -1431,7 +1606,8 @@ final class LibrarianModel: ObservableObject {
         mode: String,
         enableLocalEmbeddings: Bool,
         localModelProfile: LocalModelProfile,
-        embeddingProviderKind: String?
+        embeddingProviderKind: String?,
+        roots: [String]
     ) -> [SearchResult] {
         let service = SearchService(
             catalog: catalog,
@@ -1439,20 +1615,24 @@ final class LibrarianModel: ObservableObject {
             localModelProfile: localModelProfile,
             embeddingProviderKind: embeddingProviderKind)
         func exactResults() -> [SearchResult] {
-            ((try? service.search(query)) ?? []).map { hit in
+            ((try? service.search(query, roots: roots)) ?? []).map { hit in
                 SearchResult(id: hit.fileID, path: hit.path,
                              snippet: (hit.snippet ?? "").replacingOccurrences(of: "\n", with: " "),
                              modeLabel: "match")
             }
         }
         func semanticResults() -> [SearchResult] {
-            ((try? service.semanticSearch(query: query)) ?? []).map { hit in
+            ((try? service.semanticSearch(query: query, limit: 200, roots: roots)) ?? [])
+                .filter { Self.pathIsInScope($0.path, roots: roots) }
+                .prefix(20).map { hit in
                 SearchResult(id: hit.fileID, path: hit.path, snippet: "",
                              modeLabel: String(format: "semantic %.0f%%", hit.score * 100))
             }
         }
         func clipResults() -> [SearchResult] {
-            ((try? service.clipTextToImageSearch(query: query)) ?? []).map { hit in
+            ((try? service.clipTextToImageSearch(query: query, limit: 200, roots: roots)) ?? [])
+                .filter { Self.pathIsInScope($0.path, roots: roots) }
+                .prefix(20).map { hit in
                 SearchResult(id: hit.fileID, path: hit.path, snippet: "",
                              modeLabel: String(format: "visual %.0f%%", hit.score * 100))
             }
@@ -1479,6 +1659,17 @@ final class LibrarianModel: ObservableObject {
             let clip = clipResults()
             if !clip.isEmpty { return clip }
             return exactResults()
+        }
+    }
+
+    private nonisolated static func pathIsInScope(_ path: String, roots: [String]) -> Bool {
+        guard !path.isEmpty, !roots.isEmpty else { return false }
+        return roots.contains { root in
+            let normalized = root.count > 1 && root.hasSuffix("/")
+                ? String(root.dropLast()) : root
+            return normalized == "/"
+                ? path.hasPrefix("/")
+                : path == normalized || path.hasPrefix(normalized + "/")
         }
     }
 
@@ -1518,6 +1709,7 @@ final class LibrarianModel: ObservableObject {
     private func log(_ s: String) {
         statusLines.append(s)
         if statusLines.count > 200 { statusLines.removeFirst(statusLines.count - 200) }
+        latestStatusEvent = StatusEvent(message: s, timestamp: Date())
     }
 
     // MARK: - Bookmark persistence

@@ -67,6 +67,27 @@ struct SearchResultRow: View {
     }
 }
 
+struct LibraryStatusLine: View {
+    let event: LibrarianModel.StatusEvent
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Label(event.message, systemImage: event.isWarning ? "exclamationmark.triangle" : "info.circle")
+                .foregroundStyle(event.isWarning ? .orange : .secondary)
+                .lineLimit(2)
+                .textSelection(.enabled)
+            Spacer(minLength: 8)
+            Text(event.timestamp.formatted(date: .omitted, time: .shortened))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .accessibilityLabel("at \(event.timestamp.formatted(date: .omitted, time: .shortened))")
+        }
+        .font(.caption)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Latest status: \(event.message), \(event.timestamp.formatted(date: .omitted, time: .shortened))")
+    }
+}
+
 enum LibrarySection: String, CaseIterable, Identifiable {
     case overview
     case smart
@@ -113,6 +134,14 @@ enum LibrarySection: String, CaseIterable, Identifiable {
     }
 }
 
+/// The library is either an explicit aggregate of authorized roots or one
+/// selected root. Keeping this as shared model state prevents the Home and
+/// Library windows from displaying different meanings for the same numbers.
+enum LibraryScope: Equatable, Sendable {
+    case allAuthorized
+    case source(UUID)
+}
+
 struct MagicContentView: View {
     private enum PendingAnalysis: Equatable {
         case all
@@ -120,6 +149,7 @@ struct MagicContentView: View {
     }
 
     @EnvironmentObject private var model: LibrarianModel
+    @Environment(\.openWindow) private var openWindow
     @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
     @State private var showModelSetup = false
     @State private var pendingAnalysis: PendingAnalysis?
@@ -169,22 +199,62 @@ struct MagicContentView: View {
                         Text("No folders authorized yet")
                             .foregroundStyle(.secondary)
                     } else {
+                        Button {
+                            model.selectLibraryScope(nil)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "square.grid.2x2")
+                                    .frame(width: 18)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("All authorized folders")
+                                    Text("Aggregate view · \(model.sources.count) folder" + (model.sources.count == 1 ? "" : "s"))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 0)
+                                if model.libraryScope == .allAuthorized {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
+                                        .accessibilityHidden(true)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help("Show the combined catalog for every authorized folder")
+                        .accessibilityLabel("All authorized folders, aggregate view")
+                        .listRowBackground(model.libraryScope == .allAuthorized ? Color.accentColor.opacity(0.12) : nil)
+
                         ForEach(model.sources) { source in
                             let name = (source.path as NSString).lastPathComponent
                             let unavailable = model.needsReauthorization(source)
                             let paused = model.isPaused(source)
                             HStack(spacing: 8) {
-                                Image(systemName: unavailable ? "exclamationmark.triangle.fill" : paused ? "pause.circle" : "folder.fill")
-                                    .foregroundStyle(unavailable ? .orange : .secondary)
-                                    .frame(width: 18)
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(name.isEmpty ? source.path : name)
-                                        .lineLimit(1)
-                                    Text(unavailable ? "Needs permission" : paused ? "Paused" : "Ready")
-                                        .font(.caption2)
-                                        .foregroundStyle(unavailable || paused ? .orange : .secondary)
+                                Button {
+                                    model.selectLibraryScope(source)
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: unavailable ? "exclamationmark.triangle.fill" : paused ? "pause.circle" : "folder.fill")
+                                            .foregroundStyle(unavailable ? .orange : .secondary)
+                                            .frame(width: 18)
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(name.isEmpty ? source.path : name)
+                                                .lineLimit(1)
+                                            Text(unavailable ? "Needs permission" : paused ? "Paused" : "Ready")
+                                                .font(.caption2)
+                                                .foregroundStyle(unavailable || paused ? .orange : .secondary)
+                                        }
+                                        Spacer(minLength: 0)
+                                        if model.libraryScope == .source(source.id) {
+                                            Image(systemName: "checkmark")
+                                                .foregroundStyle(.tint)
+                                                .accessibilityHidden(true)
+                                        }
+                                    }
                                 }
-                                .help(source.path)
+                                .buttonStyle(.plain)
+                                .help("Show only \(name.isEmpty ? source.path : name) in the Library")
+                                .accessibilityLabel("Open \(name.isEmpty ? source.path : name) library")
+                                .accessibilityHint("Filters counts, groups, review, missing, and search to this folder")
                                 Spacer(minLength: 0)
                                 Menu {
                                     if !unavailable {
@@ -192,7 +262,7 @@ struct MagicContentView: View {
                                             model.togglePaused(source)
                                         }
                                     }
-                                    Button("Re-authorize…") { model.reauthorizeSource(source) }
+                                    Button("Re-authorize \(name)…") { model.reauthorizeSource(source) }
                                     Divider()
                                     Button("Remove from Library", role: .destructive) {
                                         sourcePendingRemoval = source
@@ -205,6 +275,7 @@ struct MagicContentView: View {
                                 .accessibilityLabel("Actions for " + (name.isEmpty ? source.path : name))
                             }
                             .padding(.vertical, 3)
+                            .listRowBackground(model.libraryScope == .source(source.id) ? Color.accentColor.opacity(0.12) : nil)
                         }
                     }
                     HStack(spacing: 8) {
@@ -237,18 +308,18 @@ struct MagicContentView: View {
                         Button("Stop Analysis") { model.cancelIndexing() }
                     } else {
                         Menu {
-                            Button("All Authorized Folders") { requestAnalysis(nil) }
+                            Button("Analyze all authorized folders") { requestAnalysis(nil) }
                             Divider()
                             ForEach(eligibleSources) { source in
                                 let name = (source.path as NSString).lastPathComponent
-                                Button(name.isEmpty ? source.path : name) {
+                                Button("Analyze \(name.isEmpty ? source.path : name)") {
                                     requestAnalysis(source)
                                 }
                             }
                         } label: {
                             Label(
                                 model.isLocalModelProfileReady(model.localModelProfile)
-                                    ? "Analyze" : "Set Up & Analyze",
+                                    ? "Choose what to analyze…" : "Set Up & Analyze…",
                                 systemImage: model.isLocalModelProfileReady(model.localModelProfile)
                                     ? "sparkles" : "arrow.down.circle")
                         }
@@ -258,7 +329,7 @@ struct MagicContentView: View {
                               : (eligibleSources.isEmpty
                                  ? "All folders are paused or need permission — resume or re-authorize one"
                                  : (model.isLocalModelProfileReady(model.localModelProfile)
-                                    ? "Read and understand files without moving them"
+                                    ? "Choose an authorized scope to read and understand without moving files"
                                     : "Set up the selected local quality level, then analyze the folder you chose")))
                     }
                 } header: {
@@ -282,7 +353,7 @@ struct MagicContentView: View {
                         Text(sectionSubtitle)
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
                     if model.selectedSection == .smart {
@@ -295,14 +366,44 @@ struct MagicContentView: View {
                 .padding(.top, 16)
                 .padding(.bottom, 10)
 
+                HStack(spacing: 8) {
+                    Image(systemName: model.libraryScopeSource == nil ? "square.grid.2x2" : "folder.fill")
+                        .foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(model.libraryScopeLabel)
+                            .font(.subheadline.weight(.semibold))
+                        Text(model.libraryScopeDescription)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 8)
+                    if model.libraryScopeSource != nil {
+                        Button("Show all folders") {
+                            model.selectLibraryScope(nil)
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Return to the combined catalog")
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 4)
+
                 HStack(spacing: 10) {
-                    TextField("Search everything…", text: $model.query)
+                    TextField(model.libraryScopeSource == nil ? "Search all authorized folders…" : "Search this folder…", text: $model.query)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { model.runSearch() }
                         .disabled(!model.catalogReady)
                         .accessibilityLabel("Search library")
                     Button("Search") { model.runSearch() }
                         .disabled(model.isSearching || !model.catalogReady)
+                    if !model.query.isEmpty || !model.searchResults.isEmpty {
+                        Button("Clear") { model.clearSearch() }
+                            .keyboardShortcut(.cancelAction)
+                    }
                     if model.isSearching {
                         ProgressView()
                             .controlSize(.small)
@@ -319,16 +420,10 @@ struct MagicContentView: View {
                 .padding(12)
 
                 Divider()
-                if let latestStatus = model.statusLines.last {
-                    Label(latestStatus,
-                          systemImage: latestStatus.localizedCaseInsensitiveContains("error")
-                            ? "exclamationmark.triangle" : "info.circle")
-                        .font(.caption)
-                        .foregroundStyle(latestStatus.localizedCaseInsensitiveContains("error") ? .orange : .secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                if let status = model.latestStatusEvent {
+                    LibraryStatusLine(event: status)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
-                        .textSelection(.enabled)
                 }
                 if model.catalogMigrationRequired {
                     CatalogMigrationBanner()
@@ -340,7 +435,7 @@ struct MagicContentView: View {
                         .padding(20)
                 } else {
                     if !model.searchResults.isEmpty {
-                        GroupBox("Search results · \(model.searchResults.count)") {
+                        GroupBox("Search results for “\(model.query)” · \(model.searchResults.count)") {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 0) {
                                     ForEach(Array(model.searchResults.prefix(50).enumerated()), id: \.element.id) { index, result in
@@ -379,6 +474,10 @@ struct MagicContentView: View {
                             proxy.scrollTo("detail-top", anchor: .top)
                             model.reloadSectionFiles()
                         }
+                        .onChange(of: model.libraryScope) { _, _ in
+                            proxy.scrollTo("detail-top", anchor: .top)
+                            model.reloadSectionFiles()
+                        }
                     }
                 }
                 Divider()
@@ -386,6 +485,14 @@ struct MagicContentView: View {
             }
         }
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    openWindow(id: "main")
+                } label: {
+                    Label("Home", systemImage: "house")
+                }
+                .help("Return to the main cleanup workflow")
+            }
             ToolbarItem(placement: .primaryAction) {
                 SettingsLink {
                     Label("Settings", systemImage: "gearshape")
@@ -443,9 +550,11 @@ struct MagicContentView: View {
         switch request {
         case .all:
             guard !eligibleSources.isEmpty else { return }
+            model.selectLibraryScope(nil)
             model.startIndexing()
         case .source(let id):
             guard let source = eligibleSources.first(where: { $0.id == id }) else { return }
+            model.selectLibraryScope(source)
             model.startIndexing(source: source)
         }
     }
@@ -485,6 +594,7 @@ struct MagicContentView: View {
 private struct OverviewView: View {
     @EnvironmentObject private var model: LibrarianModel
     let onAnalyze: () -> Void
+    @State private var showRootCoverage = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -502,7 +612,7 @@ private struct OverviewView: View {
                         } label: {
                             Label(
                                 model.isLocalModelProfileReady(model.localModelProfile)
-                                    ? "Analyze Folders" : "Set Up & Analyze",
+                                    ? "Analyze all authorized folders" : "Set Up & Analyze all authorized folders",
                                 systemImage: model.isLocalModelProfileReady(model.localModelProfile)
                                     ? "sparkles" : "arrow.down.circle")
                         }
@@ -511,43 +621,53 @@ private struct OverviewView: View {
                 .padding(.top, 40)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 12)], spacing: 12) {
-                MetricCard(title: "Cataloged", value: model.dashboard.total, icon: "books.vertical")
-                MetricCard(title: "Indexed", value: model.dashboard.indexed, icon: "checkmark.circle")
-                MetricCard(title: "Review", value: model.dashboard.review, icon: "questionmark.folder")
-                MetricCard(title: "Missing", value: model.dashboard.missing, icon: "exclamationmark.triangle")
-                MetricCard(title: "Duplicate groups", value: model.dashboard.duplicateGroups, icon: "square.on.square")
-                MetricCard(title: "Graph links", value: model.dashboard.graphEdges, icon: "point.3.connected.trianglepath.dotted")
-                MetricCard(title: "Smart groups", value: model.smartGroups.count, icon: "sparkles.rectangle.stack")
+                MetricCard(title: "Cataloged", value: model.dashboard.total, icon: "books.vertical", destination: nil)
+                MetricCard(title: "Indexed", value: model.dashboard.indexed, icon: "checkmark.circle", destination: nil)
+                MetricCard(title: "Review", value: model.dashboard.review, icon: "questionmark.folder", destination: .review)
+                MetricCard(title: "Missing", value: model.dashboard.missing, icon: "exclamationmark.triangle", destination: .missing)
+                MetricCard(title: "Duplicate groups", value: model.dashboard.duplicateGroups, icon: "square.on.square", destination: .duplicates)
+                MetricCard(title: "Graph links", value: model.dashboard.graphEdges, icon: "point.3.connected.trianglepath.dotted", destination: .similarity)
+                MetricCard(title: "Smart groups", value: model.smartGroups.count, icon: "sparkles.rectangle.stack", destination: .smart)
             }
             HStack(spacing: 8) {
                 Image(systemName: model.liveIndexRunning ? "dot.radiowaves.left.and.right" : "pause.circle")
                     .foregroundStyle(model.liveIndexRunning ? .green : .secondary)
-                Text(model.liveIndexRunning ? "Live indexing on" : "Live indexing unavailable")
+                Text(model.liveIndexRunning ? "Live monitoring on" : "Live monitoring off")
                 if model.livePendingEvents > 0 {
                     Text("· \(model.livePendingEvents) pending").foregroundStyle(.secondary)
                 }
             }
             .font(.caption)
+            .help(model.liveIndexRunning
+                  ? "Changes in authorized folders are monitored and folded into the local catalog."
+                  : "Live monitoring is off; run analysis or restore folder access to continue.")
             GroupBox("Coverage") {
                 VStack(alignment: .leading, spacing: 8) {
                     ProgressView(value: Double(model.coverage.indexedFiles), total: Double(max(1, model.coverage.catalogedFiles)))
                     Text("\(model.coverage.indexedFiles) of \(model.coverage.catalogedFiles) eligible files indexed")
                     Text("\(model.coverage.reviewFiles) need review · \(model.coverage.excludedCatalogRows) intentionally excluded catalog rows")
                         .font(.caption).foregroundStyle(.secondary)
-                    ForEach(model.coverage.roots) { root in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text((root.root as NSString).lastPathComponent.isEmpty
-                                 ? root.root : (root.root as NSString).lastPathComponent)
-                                .font(.caption.bold())
-                            Text("\(root.indexedFiles)/\(root.eligibleFiles) indexed · \(root.reviewFiles) review · \(root.missingFiles) missing · \(root.skippedFiles) skipped")
-                                .font(.caption2).foregroundStyle(.secondary)
-                            if !root.exclusionReasons.isEmpty {
-                                Text(root.exclusionReasons.keys.sorted().map {
-                                    "\($0) \(root.exclusionReasons[$0] ?? 0)"
-                                }.joined(separator: " · "))
-                                    .font(.caption2).foregroundStyle(.secondary)
+                    if !model.coverage.roots.isEmpty {
+                        DisclosureGroup(
+                            "Show coverage by authorized folder (\(model.coverage.roots.count))",
+                            isExpanded: $showRootCoverage) {
+                                ForEach(model.coverage.roots) { root in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text((root.root as NSString).lastPathComponent.isEmpty
+                                             ? root.root : (root.root as NSString).lastPathComponent)
+                                            .font(.caption.bold())
+                                        Text("\(root.indexedFiles)/\(root.eligibleFiles) indexed · \(root.reviewFiles) review · \(root.missingFiles) missing · \(root.skippedFiles) skipped")
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                        if !root.exclusionReasons.isEmpty {
+                                            Text(root.exclusionReasons.keys.sorted().map {
+                                                "\($0) \(root.exclusionReasons[$0] ?? 0)"
+                                            }.joined(separator: " · "))
+                                                .font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .padding(.top, 4)
+                                }
                             }
-                        }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -573,11 +693,28 @@ private struct OverviewView: View {
 }
 
 private struct MetricCard: View {
+    @EnvironmentObject private var model: LibrarianModel
     let title: String
     let value: Int
     let icon: String
+    let destination: LibrarySection?
 
+    @ViewBuilder
     var body: some View {
+        if let destination {
+            Button {
+                model.selectedSection = destination
+            } label: {
+                cardContent
+            }
+            .buttonStyle(.plain)
+            .help("Open \(destination.title)")
+        } else {
+            cardContent
+        }
+    }
+
+    private var cardContent: some View {
         GroupBox {
             HStack {
                 Image(systemName: icon).foregroundStyle(.tint)
@@ -587,6 +724,8 @@ private struct MetricCard: View {
             Text(title).font(.caption).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title), \(value)")
     }
 }
 
@@ -643,7 +782,7 @@ private struct FileExplorerView: View {
             HStack {
                 Label(title, systemImage: "square.grid.2x2")
                 Spacer()
-                Text("\(files.count)")
+                Text(files.count >= 200 ? "200+ shown" : "\(files.count)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -654,8 +793,13 @@ private struct FileExplorerView: View {
 private struct MissingFilesView: View {
     @EnvironmentObject private var model: LibrarianModel
 
+    private var scopedSources: [LibrarianModel.SourceFolder] {
+        if let source = model.libraryScopeSource { return [source] }
+        return model.sources
+    }
+
     private var hasCheckableSource: Bool {
-        model.sources.contains {
+        scopedSources.contains {
             !model.pausedPaths.contains($0.path)
                 && !model.sourcesNeedingReauthorization.contains($0.path)
         }
@@ -667,7 +811,9 @@ private struct MissingFilesView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Check only when you need it")
                         .font(.headline)
-                    Text("This checks the catalog's known paths under authorized folders. It does not discover new files or recursively analyze folders.")
+                    Text(model.libraryScopeSource == nil
+                         ? "This checks the catalog's known paths under authorized folders. It does not discover new files or recursively analyze folders."
+                         : "This checks only known catalog paths under \(model.libraryScopeLabel). It does not discover new files or recursively analyze folders.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -678,8 +824,8 @@ private struct MissingFilesView: View {
                         .controlSize(.small)
                         .font(.caption)
                 } else {
-                    Button("Check known paths") {
-                        model.reconcileAuthorizedSources()
+                    Button(model.libraryScopeSource == nil ? "Check known paths" : "Check this folder") {
+                        model.reconcileAuthorizedSources(source: model.libraryScopeSource)
                     }
                     .disabled(model.isIndexing || !hasCheckableSource)
                     .help("Check only catalog entries already known under the currently authorized folders")
@@ -857,6 +1003,7 @@ private struct SmartGroupCard: View {
     let group: SmartOrganizationGroup
 
     private let previewLimit = 4
+    @State private var showAllMembers = false
 
     var body: some View {
         GroupBox {
@@ -885,19 +1032,22 @@ private struct SmartGroupCard: View {
                 Divider()
 
                 ForEach(Array(group.fileIDs.prefix(previewLimit)), id: \.self) { id in
+                    let path = model.filePath(for: id)
                     HStack(spacing: 8) {
                         Image(systemName: "doc")
                             .foregroundStyle(.secondary)
-                        Text((model.filePath(for: id) as NSString).lastPathComponent)
+                        Text((path as NSString).lastPathComponent)
                             .lineLimit(1)
                     }
                     .font(.caption)
-                    .opacity(model.filePath(for: id).isEmpty ? 0.5 : 1.0)
+                    .opacity(path.isEmpty ? 0.5 : 1.0)
                 }
                 if group.fileIDs.count > previewLimit {
-                    Text("+ \(group.fileIDs.count - previewLimit) more · search above to find them")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    Button("View all \(group.fileIDs.count) items") {
+                        showAllMembers = true
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption2)
                 }
 
                 HStack {
@@ -908,6 +1058,7 @@ private struct SmartGroupCard: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .accessibilityLabel("Review plan for \(group.title)")
                     .disabled(!model.catalogReady || model.isPreparingPlan
                               || model.isApplyOperationInProgress || model.isReconciling)
                     .help("Preview the proposed Finder moves. Nothing changes until you confirm the plan.")
@@ -915,6 +1066,10 @@ private struct SmartGroupCard: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .sheet(isPresented: $showAllMembers) {
+            SmartGroupMembersView(group: group)
+                .environmentObject(model)
         }
     }
 
@@ -927,11 +1082,71 @@ private struct SmartGroupCard: View {
     }
 }
 
+private struct SmartGroupMembersView: View {
+    @EnvironmentObject private var model: LibrarianModel
+    @Environment(\.dismiss) private var dismiss
+    let group: SmartOrganizationGroup
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(group.title)
+                        .font(.title3.bold())
+                    Text("\(group.fileIDs.count) catalog memberships · originals stay where they are")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(group.fileIDs, id: \.self) { id in
+                        let path = model.filePath(for: id)
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "doc")
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text((path as NSString).lastPathComponent)
+                                    .font(.callout.weight(.medium))
+                                Text(path.isEmpty ? "Catalog entry unavailable" : path)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                    .lineLimit(2)
+                            }
+                            Spacer(minLength: 8)
+                            if !path.isEmpty {
+                                Button {
+                                    model.revealInFinder(path)
+                                } label: {
+                                    Image(systemName: "arrow.up.forward.app")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Reveal in Finder")
+                                .accessibilityLabel("Reveal \((path as NSString).lastPathComponent) in Finder")
+                            }
+                        }
+                        .padding(.vertical, 7)
+                        Divider()
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 680, height: 540)
+    }
+}
+
 private struct ApplyPlanConfirmationSheet: View {
     @EnvironmentObject private var model: LibrarianModel
     let plan: OrganizationApplier.Plan
     @State private var selectedRootPath = ""
     @State private var excludedFileIDs: Set<String> = []
+    @State private var showApplyConfirmation = false
 
     private var selectedCount: Int { plan.items.count - excludedFileIDs.count }
 
@@ -993,6 +1208,10 @@ private struct ApplyPlanConfirmationSheet: View {
             .font(.subheadline)
             .opacity(model.isPreparingPlan ? 0.5 : 1.0)
 
+            Text("\(selectedCount) selected file" + (selectedCount == 1 ? "" : "s") + " will move into \((plan.destinationFolderPath as NSString).lastPathComponent).")
+                .font(.subheadline.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
+
             if model.isPreparingPlan {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
@@ -1049,12 +1268,12 @@ private struct ApplyPlanConfirmationSheet: View {
                 Spacer()
                 Button("Cancel") { model.cancelApply() }
                     .keyboardShortcut(.cancelAction)
-                Button("Move \(selectedCount) Files") {
-                    model.confirmApply(excluding: excludedFileIDs)
+                Button("Apply plan · \(selectedCount) file" + (selectedCount == 1 ? "" : "s")) {
+                    showApplyConfirmation = true
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(selectedCount == 0 || model.isPreparingPlan)
-                .keyboardShortcut(.defaultAction)
+                .accessibilityLabel("Apply plan for \(plan.groupTitle), \(selectedCount) file" + (selectedCount == 1 ? "" : "s"))
             }
         }
         .padding(24)
@@ -1065,6 +1284,18 @@ private struct ApplyPlanConfirmationSheet: View {
             // match an item in the new plan would silently skew every count.
             excludedFileIDs.formIntersection(Set(plan.items.map(\.fileID)))
         }
+        .confirmationDialog(
+            "Apply “\(plan.groupTitle)” plan?",
+            isPresented: $showApplyConfirmation,
+            titleVisibility: .visible) {
+                Button("Move \(selectedCount) file" + (selectedCount == 1 ? "" : "s"), role: .destructive) {
+                    model.confirmApply(excluding: excludedFileIDs)
+                    showApplyConfirmation = false
+                }
+                Button("Keep reviewing", role: .cancel) { showApplyConfirmation = false }
+            } message: {
+                Text("The selected originals will move into \(plan.destinationFolderPath). Nothing will be copied or deleted, and successful moves can be undone.")
+            }
     }
 }
 
@@ -1193,6 +1424,7 @@ private struct RepresentativeThumbnailView: View {
 
 private struct LearnedRulesView: View {
     @EnvironmentObject private var model: LibrarianModel
+    @State private var rulePendingDeletion: LearnedRule?
 
     var body: some View {
         GroupBox("Learned rules") {
@@ -1217,12 +1449,12 @@ private struct LearnedRulesView: View {
                                 set: { _ in model.toggleLearnedRule(rule) }
                             ))
                             .toggleStyle(.checkbox)
-                            Button { model.deleteLearnedRule(rule) } label: {
+                            Button { rulePendingDeletion = rule } label: {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
-                            .help("Delete rule")
-                            .accessibilityLabel("Delete learned rule")
+                            .help("Delete rule…")
+                            .accessibilityLabel("Delete learned rule \(rule.targetCategory)")
                         }
                         Divider()
                     }
@@ -1230,6 +1462,22 @@ private struct LearnedRulesView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .confirmationDialog(
+            "Delete this learned rule?",
+            isPresented: Binding(
+                get: { rulePendingDeletion != nil },
+                set: { if !$0 { rulePendingDeletion = nil } }),
+            titleVisibility: .visible) {
+                Button("Delete rule", role: .destructive) {
+                    if let rulePendingDeletion {
+                        model.deleteLearnedRule(rulePendingDeletion)
+                    }
+                    rulePendingDeletion = nil
+                }
+                Button("Cancel", role: .cancel) { rulePendingDeletion = nil }
+            } message: {
+                Text("This removes the catalog rule and stops it from influencing future analysis. Existing files are not changed.")
+            }
     }
 }
 
@@ -1254,32 +1502,35 @@ private struct ReviewInboxView: View {
                                     Text(String(format: "%.0f%%", item.confidence * 100)).font(.caption).foregroundStyle(.secondary)
                                 }
                                 Text(item.path).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                Text(item.reasonCodes.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
+                                Text("Why this needs review: \(humanReasons(item.reasonCodes))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                                 HStack {
-                                    TextField("Category", text: Binding(
+                                    TextField("Category to add or remove", text: Binding(
                                         get: { categoryDrafts[item.fileID] ?? "" },
                                         set: { categoryDrafts[item.fileID] = $0 }))
                                         .textFieldStyle(.roundedBorder)
                                     if let candidate = item.categories.first {
-                                        Button("Accept \(candidate)") {
+                                        Button("Accept suggested category") {
                                             apply(item: item, category: candidate, action: .addCategory)
                                         }
+                                        .help("Add the suggested category \(candidate)")
                                     }
-                                    Button("Add") {
+                                    Button("Add category") {
                                         let name = (categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces)
                                         guard !name.isEmpty else { return }
                                         apply(item: item, category: name, action: .addCategory)
                                     }
                                     .disabled((categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
-                                    .help("Type a category name first")
-                                    Button("Remove") {
+                                        .help("Type a category name first")
+                                    Button("Remove category") {
                                         let name = (categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces)
                                         guard !name.isEmpty else { return }
                                         apply(item: item, category: name, action: .removeCategory)
                                     }
                                     .disabled((categoryDrafts[item.fileID] ?? "").trimmingCharacters(in: .whitespaces).isEmpty)
-                                    .help("Type the category to remove first")
-                                    Button("Unknown") { apply(item: item, category: "", action: .markUnknown) }
+                                        .help("Type the category to remove first")
+                                    Button("Mark as unknown") { apply(item: item, category: "", action: .markUnknown) }
                                 }
                             }
                         }
@@ -1293,12 +1544,23 @@ private struct ReviewInboxView: View {
         model.applyReviewCorrection(item: item, category: category, action: action)
         categoryDrafts.removeValue(forKey: item.fileID)
     }
+
+    private func humanReasons(_ codes: [String]) -> String {
+        guard !codes.isEmpty else { return "the classifier did not find enough evidence" }
+        return codes.map { code in
+            switch code {
+            case "weak-signal": return "not enough evidence"
+            case "unknown": return "no confident category"
+            case "strong-signal": return "conflicting evidence"
+            default: return code.replacingOccurrences(of: "-", with: " ").capitalized
+            }
+        }.joined(separator: " · ")
+    }
 }
 
 private struct CatalogBlockedView: View {
     @EnvironmentObject private var model: LibrarianModel
-    @State private var confirmReset = false
-    @State private var confirmStartFresh = false
+    @State private var recoveryAction: CatalogRecoveryAction?
 
     var body: some View {
         ContentUnavailableView {
@@ -1315,38 +1577,52 @@ private struct CatalogBlockedView: View {
             if !model.catalogMigrationRequired {
                 Button("Retry Catalog") { model.retryCatalogOpen() }
                 if model.catalogError != nil {
-                    Button(confirmReset ? "Confirm: Lock Old Catalog Aside and Start Fresh" : "Key Still Blocked? Reset Catalog Key…") {
-                        if confirmReset {
-                            model.resetCatalogKeyAndStartFresh()
-                            confirmReset = false
-                        } else {
-                            confirmReset = true
-                        }
-                    }
-                    .foregroundStyle(.red)
-                    .help("Moves the old encrypted catalog files aside (they are never deleted), removes the unreadable key, and creates a new encrypted catalog. Use this when every launch asks for keychain access and then fails.")
+                    Button("Move blocked library aside…") { recoveryAction = .resetKey }
+                        .help("Move the unreadable encrypted catalog aside without deleting it, then create a new one")
                 }
             } else if !model.catalogMigrationAttempted {
-                Button(confirmStartFresh
-                       ? "Confirm: Switch to an Empty Catalog"
-                       : "Start New Catalog") {
-                    if confirmStartFresh {
-                        model.startFreshCatalog()
-                        confirmStartFresh = false
-                    } else {
-                        confirmStartFresh = true
-                    }
-                }
-                .help("Your existing library will no longer open in the app (it stays safe on disk). Use only when you know you want a blank start.")
+                Button("Start empty catalog…") { recoveryAction = .startFresh }
+                    .help("Keep the existing encrypted library on disk and open a new empty catalog")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .confirmationDialog(
+            recoveryAction?.title ?? "Catalog recovery",
+            isPresented: Binding(
+                get: { recoveryAction != nil },
+                set: { if !$0 { recoveryAction = nil } }),
+            titleVisibility: .visible) {
+                switch recoveryAction {
+                case .startFresh:
+                    Button("Start empty catalog", role: .destructive) {
+                        model.startFreshCatalog()
+                        recoveryAction = nil
+                    }
+                case .resetKey:
+                    Button("Move old catalog aside and continue", role: .destructive) {
+                        model.resetCatalogKeyAndStartFresh()
+                        recoveryAction = nil
+                    }
+                case nil:
+                    EmptyView()
+                }
+                Button("Cancel", role: .cancel) { recoveryAction = nil }
+            } message: {
+                switch recoveryAction {
+                case .startFresh:
+                    Text("The existing encrypted catalog will stay on disk, but this app will open a new empty catalog. Your source files are not touched.")
+                case .resetKey:
+                    Text("The unreadable catalog and its key will be moved aside, never deleted. A new encrypted catalog will be created.")
+                case nil:
+                    Text("")
+                }
+            }
     }
 }
 
 private struct CatalogMigrationBanner: View {
     @EnvironmentObject private var model: LibrarianModel
-    @State private var confirmStartFresh = false
+    @State private var recoveryAction: CatalogRecoveryAction?
 
     var body: some View {
         GroupBox {
@@ -1358,33 +1634,26 @@ private struct CatalogMigrationBanner: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("One-time catalog migration required")
                         .font(.headline)
-                    Text("Private Librarian found an existing encrypted catalog. Migrate it with one macOS Keychain approval, or start a separate fresh catalog without approval. The existing catalog is never overwritten.")
+                    Text("Private Librarian found an older encrypted library. Migrate it once, or start a separate empty catalog without changing source files. The existing catalog is never overwritten.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack {
-                        Button(model.catalogMigrationAttempted ? "Migration attempted" : "Migrate Existing Catalog") {
+                        Button(model.catalogMigrationAttempted ? "Migration attempted" : "Migrate existing library") {
                             model.migrateCatalog()
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(model.catalogMigrationAttempted)
-                        .accessibilityHint("Reads the legacy catalog key once and does not modify source files")
+                        .accessibilityHint("Reads the older catalog once and does not modify source files")
                         if !model.catalogMigrationAttempted {
-                            Button(confirmStartFresh ? "Confirm: Switch to an Empty Catalog" : "Start New Catalog") {
-                                if confirmStartFresh {
-                                    model.startFreshCatalog()
-                                    confirmStartFresh = false
-                                } else {
-                                    confirmStartFresh = true
-                                }
-                            }
+                            Button("Start empty catalog…") { recoveryAction = .startFresh }
                             .buttonStyle(.bordered)
                             .help("Your existing library will no longer open in the app (it stays safe on disk). Use only when you know you want a blank start.")
                             .accessibilityHint("Creates a separate encrypted catalog and leaves the existing catalog untouched")
                         }
                     }
                     if model.catalogMigrationAttempted {
-                        Text("If access was denied, relaunch and try again after choosing Always Allow.")
+                        Text("If the one-time migration was denied, reopen the app and retry it. Normal launches do not need this migration step.")
                             .font(.caption2)
                             .foregroundStyle(.orange)
                     }
@@ -1393,6 +1662,20 @@ private struct CatalogMigrationBanner: View {
             }
         }
         .tint(.orange)
+        .confirmationDialog(
+            recoveryAction?.title ?? "Catalog recovery",
+            isPresented: Binding(
+                get: { recoveryAction != nil },
+                set: { if !$0 { recoveryAction = nil } }),
+            titleVisibility: .visible) {
+                Button("Start empty catalog", role: .destructive) {
+                    model.startFreshCatalog()
+                    recoveryAction = nil
+                }
+                Button("Cancel", role: .cancel) { recoveryAction = nil }
+            } message: {
+                Text("The existing encrypted catalog will stay on disk, but this app will open a new empty catalog. Your source files are not touched.")
+            }
     }
 }
 
@@ -1400,16 +1683,22 @@ private struct MagicPrivacyBar: View {
     let indicators: [(String, Bool)]
 
     var body: some View {
-        HStack(spacing: 10) {
-            ForEach(indicators, id: \.0) { item in
-                Label(item.0, systemImage: item.1 ? "checkmark.seal.fill" : "xmark.seal.fill")
-                    .foregroundStyle(item.1 ? .green : .red)
-                    .font(.caption)
+        VStack(alignment: .leading, spacing: 6) {
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 170), alignment: .leading)],
+                alignment: .leading,
+                spacing: 6) {
+                ForEach(indicators, id: \.0) { item in
+                    Label(item.0, systemImage: item.1 ? "checkmark.seal.fill" : "xmark.seal.fill")
+                        .foregroundStyle(item.1 ? .green : .red)
+                        .font(.caption)
+                }
             }
-            Spacer()
-            Text("LOCAL · ENCRYPTED · MOVES ONLY WHEN YOU APPLY")
+            Text("Local · encrypted · originals move only after you apply a reviewed plan")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 }

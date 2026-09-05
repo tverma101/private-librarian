@@ -318,13 +318,14 @@ public struct SmartOrganizationPlanner: Sendable {
 }
 
 public extension Catalog {
-    func smartOrganizationGroups(limit: Int = 18) throws -> [SmartOrganizationGroup] {
+    func smartOrganizationGroups(limit: Int = 18,
+                                 roots: [String]? = nil) throws -> [SmartOrganizationGroup] {
         // Smart Groups are actionable cleanup suggestions, not historical
         // views. Missing/unscoped rows remain in their dedicated catalog views
         // but must not be offered for a new Finder move.
-        let activeIDs = Set(try allFiles(statuses: ["indexed"]).map(\.id))
-        let activeMemberships = try categoryMemberships().filter { activeIDs.contains($0.fileID) }
-        let activeClusters = try similarityClusters().compactMap { cluster -> SimilarityCluster? in
+        let activeIDs = Set(try allFiles(statuses: ["indexed"], roots: roots).map(\.id))
+        let activeMemberships = try categoryMemberships(roots: roots).filter { activeIDs.contains($0.fileID) }
+        let activeClusters = try similarityClusters(roots: roots).compactMap { cluster -> SimilarityCluster? in
             let members = cluster.members.filter { activeIDs.contains($0) }
             guard members.count >= 2 else { return nil }
             return SimilarityCluster(

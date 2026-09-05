@@ -1,6 +1,20 @@
 import SwiftUI
 import LibrarianCore
 
+enum CatalogRecoveryAction: String, Identifiable {
+    case startFresh
+    case resetKey
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .startFresh: return "Start with an empty catalog?"
+        case .resetKey: return "Create a new encrypted catalog?"
+        }
+    }
+}
+
 /// The default product surface: one cleanup action, a small amount of state,
 /// and progressive disclosure into the advanced catalog when the user asks.
 /// Analysis is read-only; Finder changes happen only through the separately
@@ -9,11 +23,11 @@ struct CleanerHomeView: View {
     @EnvironmentObject private var model: LibrarianModel
     @Environment(\.openWindow) private var openWindow
     @State private var selectedSourceID: UUID?
-    @State private var confirmCatalogReset = false
-    @State private var confirmStartFresh = false
+    @State private var catalogRecoveryAction: CatalogRecoveryAction?
     @State private var sourcePendingRemoval: LibrarianModel.SourceFolder?
     @State private var showModelSetup = false
     @State private var resumeAnalysisAfterSetup = false
+    @State private var showFolderDetails = false
     @FocusState private var searchFocused: Bool
 
     private var eligibleSources: [LibrarianModel.SourceFolder] {
@@ -25,6 +39,14 @@ struct CleanerHomeView: View {
     private var analyzeDisabledReason: String? {
         if !model.catalogReady { return "The encrypted catalog is not open — see the message below." }
         if model.sources.isEmpty { return "Choose a folder first — Private Librarian only looks at folders you hand it." }
+        if let selectedSource, !selectedSourceIsEligible {
+            if model.needsReauthorization(selectedSource) {
+                return "\(scopeLabel) needs permission — use Allow or Re-authorize before analyzing it."
+            }
+            if model.isPaused(selectedSource) {
+                return "\(scopeLabel) is paused — resume it before analyzing this folder."
+            }
+        }
         if eligibleSources.isEmpty {
             return "All folders are paused or need permission — resume or re-authorize one to analyze."
         }
@@ -33,17 +55,18 @@ struct CleanerHomeView: View {
 
     private var selectedSource: LibrarianModel.SourceFolder? {
         guard let selectedSourceID else { return nil }
-        return eligibleSources.first { $0.id == selectedSourceID }
+        return model.sources.first { $0.id == selectedSourceID }
+    }
+
+    private var selectedSourceIsEligible: Bool {
+        guard let selectedSource else { return true }
+        return eligibleSources.contains { $0.id == selectedSource.id }
     }
 
     private var scopeLabel: String {
-        guard let source = selectedSource else { return "All folders" }
+        guard let source = selectedSource else { return "All authorized folders" }
         let name = (source.path as NSString).lastPathComponent
         return name.isEmpty ? source.path : name
-    }
-
-    private var imageJunkCount: Int {
-        model.smartGroups.first(where: { $0.id == "category:Image/Junk" })?.fileIDs.count ?? 0
     }
 
     private var selectedProfileReady: Bool {
@@ -55,14 +78,15 @@ struct CleanerHomeView: View {
         case .fast:
             return "Fast analysis uses deterministic rules and Apple Vision. No model download is required."
         case .balanced:
-            return "Balanced uses SigLIP2 Base and local fallbacks, then keeps uncertain files for review."
+            return "Recommended. Adds local visual understanding and keeps uncertain files for review."
         case .quality:
-            return "Quality uses SigLIP2 So400m and the stronger local fallback stack for harder images and documents."
+            return "For harder libraries. Uses stronger local visual understanding and fallback checks, with more disk and memory use."
         }
     }
 
     private var primaryAnalyzeTitle: String {
-        selectedProfileReady ? "Analyze Folder" : "Set Up & Analyze"
+        let scope = selectedSource == nil ? "all authorized folders" : scopeLabel
+        return selectedProfileReady ? "Analyze \(scope)" : "Set Up & Analyze \(scope)"
     }
 
     private var primaryAnalyzeIcon: String {
@@ -97,9 +121,9 @@ struct CleanerHomeView: View {
                     model.selectedSection = .smart
                     openWindow(id: "advanced-library")
                 } label: {
-                    Label("Library", systemImage: "books.vertical")
+                    Label("Open Library", systemImage: "books.vertical")
                 }
-                .help("Open the advanced library")
+                .help("Open the full library workspace for groups, review, search, and missing files")
 
                 SettingsLink {
                     Label("Settings", systemImage: "gearshape")
@@ -108,16 +132,19 @@ struct CleanerHomeView: View {
         }
         .onAppear {
             model.start()
-            if let selectedSourceID,
-               !eligibleSources.contains(where: { $0.id == selectedSourceID }) {
-                self.selectedSourceID = nil
-            }
+            syncSelectionToLibraryScope()
         }
         .onChange(of: model.sources.map(\.id)) { _, _ in
             if let selectedSourceID,
-               !eligibleSources.contains(where: { $0.id == selectedSourceID }) {
+               !model.sources.contains(where: { $0.id == selectedSourceID }) {
                 self.selectedSourceID = nil
             }
+        }
+        .onChange(of: model.libraryScope) { _, _ in
+            syncSelectionToLibraryScope()
+        }
+        .onChange(of: selectedSourceID) { _, _ in
+            model.selectLibraryScope(selectedSource)
         }
         .sheet(isPresented: $showModelSetup) {
             ModelSetupView(
@@ -152,6 +179,37 @@ struct CleanerHomeView: View {
         } message: {
             Text("The folder's files are never touched, but they disappear from search, groups, and duplicates until you add the folder again.")
         }
+        .confirmationDialog(
+            catalogRecoveryAction?.title ?? "Catalog recovery",
+            isPresented: Binding(
+                get: { catalogRecoveryAction != nil },
+                set: { if !$0 { catalogRecoveryAction = nil } }),
+            titleVisibility: .visible) {
+                switch catalogRecoveryAction {
+                case .startFresh:
+                    Button("Start empty catalog", role: .destructive) {
+                        model.startFreshCatalog()
+                        catalogRecoveryAction = nil
+                    }
+                case .resetKey:
+                    Button("Move old catalog aside and continue", role: .destructive) {
+                        model.resetCatalogKeyAndStartFresh()
+                        catalogRecoveryAction = nil
+                    }
+                case nil:
+                    EmptyView()
+                }
+                Button("Cancel", role: .cancel) { catalogRecoveryAction = nil }
+            } message: {
+                switch catalogRecoveryAction {
+                case .startFresh:
+                    Text("The existing encrypted catalog will stay on disk, but this app will open a new empty catalog. Your source files are not touched.")
+                case .resetKey:
+                    Text("The unreadable catalog and its key will be moved aside, never deleted. A new encrypted catalog will be created. Use this only after migration cannot open the old library.")
+                case nil:
+                    Text("")
+                }
+            }
     }
 
     private var header: some View {
@@ -242,22 +300,34 @@ struct CleanerHomeView: View {
                 .controlSize(.large)
             } else {
                 Menu {
-                    Button("All Authorized Folders") { selectedSourceID = nil }
-                    if !eligibleSources.isEmpty {
+                    Button("All authorized folders") { selectedSourceID = nil }
+                    if !model.sources.isEmpty {
                         Divider()
                     }
-                    ForEach(eligibleSources) { source in
+                    ForEach(model.sources) { source in
                         let name = (source.path as NSString).lastPathComponent
-                        Button(name.isEmpty ? source.path : name) {
+                        let status = model.needsReauthorization(source)
+                            ? "Needs permission"
+                            : model.isPaused(source) ? "Paused" : "Ready"
+                        Button {
                             selectedSourceID = source.id
+                        } label: {
+                            HStack {
+                                Text(name.isEmpty ? source.path : name)
+                                Spacer()
+                                Text(status)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 } label: {
                     Label(scopeLabel, systemImage: "folder")
-                        .frame(minWidth: 190)
+                        .frame(minWidth: 220)
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
+                .accessibilityLabel("Analysis scope: \(scopeLabel)")
+                .help("Choose one authorized folder or analyze all authorized folders")
 
                 if model.isIndexing {
                     ProgressView()
@@ -269,7 +339,7 @@ struct CleanerHomeView: View {
                     }
                     .keyboardShortcut(.cancelAction)
                 } else if model.isReconciling {
-                    ProgressView("Checking known files…")
+                    ProgressView("Checking known paths…")
                         .controlSize(.small)
                         .frame(maxWidth: 360)
                 } else {
@@ -283,10 +353,8 @@ struct CleanerHomeView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(!model.catalogReady || eligibleSources.isEmpty)
-                    .help(analyzeDisabledReason ?? (selectedProfileReady
-                        ? "Read and understand files without moving them"
-                        : "Complete one-time local model setup, then analyze automatically"))
+                    .disabled(!model.catalogReady || eligibleSources.isEmpty || !selectedSourceIsEligible)
+                    .help(analyzeDisabledReason ?? "Read \(scopeLabel) and understand files without moving them")
                 }
                 if !model.isIndexing, !model.isReconciling, let reason = analyzeDisabledReason,
                    !model.sources.isEmpty || !model.catalogReady {
@@ -298,13 +366,9 @@ struct CleanerHomeView: View {
                 }
             }
 
-            if let status = model.statusLines.last {
-                Text(status)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .textSelection(.enabled)
+            if let status = model.latestStatusEvent {
+                LibraryStatusLine(event: status)
+                    .frame(maxWidth: 520)
             }
         }
         .padding(26)
@@ -315,7 +379,7 @@ struct CleanerHomeView: View {
     private var foldersCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Folders")
+                Text("Authorized folders")
                     .font(.headline)
                 Spacer()
                 Button {
@@ -327,7 +391,7 @@ struct CleanerHomeView: View {
             }
 
             if model.sources.isEmpty {
-                Text("Choose Downloads, Desktop, Projects, or any folders you want Librarian to understand.")
+                Text("Only folders you add are included. Choose one to build your private library.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             } else {
@@ -367,14 +431,15 @@ struct CleanerHomeView: View {
             Spacer()
 
             if unavailable {
-                Button("Allow") { model.reauthorizeSource(source) }
+                Button("Allow \(name)") { model.reauthorizeSource(source) }
+                    .help("Allow Private Librarian to read \(source.path)")
             }
 
             Menu {
                 if !unavailable {
                     Button(paused ? "Resume" : "Pause") { model.togglePaused(source) }
                 }
-                Button("Re-authorize…") { model.reauthorizeSource(source) }
+                Button("Re-authorize \(name)…") { model.reauthorizeSource(source) }
                 Divider()
                 Button("Remove…", role: .destructive) { sourcePendingRemoval = source }
             } label: {
@@ -382,6 +447,8 @@ struct CleanerHomeView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .accessibilityLabel("Actions for \(name)")
+            .help("Folder actions for \(source.path)")
         }
         .padding(.vertical, 9)
     }
@@ -403,7 +470,7 @@ struct CleanerHomeView: View {
                 compactMetric("Groups", value: model.smartGroups.count, icon: "square.grid.2x2")
                 compactMetric("Review", value: model.dashboard.review, icon: "questionmark.circle")
                 compactMetric("Duplicates", value: model.dashboard.duplicateGroups, icon: "square.on.square")
-                compactMetric("Image junk", value: imageJunkCount, icon: "photo.badge.exclamationmark")
+                compactMetric("Missing", value: model.dashboard.missing, icon: "exclamationmark.triangle")
             }
 
             HStack(spacing: 10) {
@@ -424,6 +491,13 @@ struct CleanerHomeView: View {
                 }
                 .disabled(model.dashboard.duplicateGroups == 0)
 
+                Button("Review missing…") {
+                    model.selectedSection = .missing
+                    openWindow(id: "advanced-library")
+                }
+                .disabled(!model.catalogReady || model.isIndexing || model.isReconciling)
+                .help("Open Missing to check only catalog paths already known under your authorized folders")
+
                 Spacer()
             }
         }
@@ -431,8 +505,9 @@ struct CleanerHomeView: View {
         .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
-    /// The single place that answers "what just happened to my folder?" —
-    /// per-folder evidence, the groups that are ready, and the next step.
+    /// The single place that answers "what just happened?" at library scope.
+    /// Per-folder evidence is available on demand instead of becoming the
+    /// primary workflow for every multi-folder analysis.
     @ViewBuilder
     private var analysisResultCard: some View {
         if let report = model.lastCleanupReport {
@@ -448,36 +523,51 @@ struct CleanerHomeView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                ForEach(report.folders) { folder in
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "folder.fill")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .frame(width: 16)
-                            Text(folder.displayName)
-                                .font(.subheadline.weight(.medium))
-                                .lineLimit(1)
-                                .help(folder.rootPath)
-                            if folder.completion != "completed" {
-                                Text(folder.completion)
-                                    .font(.caption2.weight(.medium))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(.orange.opacity(0.15), in: Capsule())
+                Text(report.summaryLine)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+
+                DisclosureGroup(
+                    "Show details for \(report.folders.count) folder" + (report.folders.count == 1 ? "" : "s"),
+                    isExpanded: $showFolderDetails) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(report.folders) { folder in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "folder.fill")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 16)
+                                        Text(folder.displayName)
+                                            .font(.subheadline.weight(.medium))
+                                            .lineLimit(1)
+                                            .help(folder.rootPath)
+                                        if folder.completion != "completed" {
+                                            Text(folder.completion)
+                                                .font(.caption2.weight(.medium))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(.orange.opacity(0.15), in: Capsule())
+                                        }
+                                        Spacer()
+                                    }
+                                    Text(folder.detailLine)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .monospacedDigit()
+                                        .textSelection(.enabled)
+                                }
+                                if folder.id != report.folders.last?.id {
+                                    Divider()
+                                }
                             }
-                            Spacer()
                         }
-                        Text(folder.detailLine)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                            .textSelection(.enabled)
                     }
-                }
+                    .font(.caption)
 
                 if model.smartGroups.isEmpty {
-                    Text("No groups yet — check the Review section for files that need a second look.")
+                    Text("No smart groups were created from this run. Review can still contain uncertain files.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -608,6 +698,8 @@ struct CleanerHomeView: View {
                     }
                 }
                 .disabled(model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.catalogReady)
+                .accessibilityLabel(model.isSearching ? "Searching library" : "Search library")
+                .help("Search the private catalog")
             }
 
             if !model.searchResults.isEmpty {
@@ -616,12 +708,14 @@ struct CleanerHomeView: View {
                         SearchResultRow(result: result)
                     }
                     if model.searchResults.count > 6 {
-                        Button("Open all results") {
+                        Button("Open \(model.searchResults.count) results in Library") {
                             model.selectedSection = .overview
                             openWindow(id: "advanced-library")
                         }
                         .buttonStyle(.link)
                     }
+                    Button("Clear search") { model.clearSearch() }
+                        .buttonStyle(.link)
                 }
             } else if model.searchFoundNothing, !model.isSearching {
                 Text("No results for “\(model.query)”.")
@@ -639,24 +733,14 @@ struct CleanerHomeView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Label("One-time catalog upgrade", systemImage: "key.fill")
                     .font(.headline)
-                Text("Your existing encrypted library needs one Keychain migration. You can migrate it or start a fresh catalog; originals are untouched either way.")
+                Text("Private Librarian found an older encrypted library. Migrate it once, or start a separate empty catalog. Your source files are untouched either way.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 HStack {
-                    Button("Migrate Existing Catalog") { model.migrateCatalog() }
+                    Button("Migrate existing library") { model.migrateCatalog() }
                         .buttonStyle(.borderedProminent)
-                    Button(confirmStartFresh
-                           ? "Confirm: Switch to an Empty Catalog"
-                           : "Start Fresh") {
-                        if confirmStartFresh {
-                            model.startFreshCatalog()
-                            confirmStartFresh = false
-                        } else {
-                            confirmStartFresh = true
-                        }
-                    }
-                    .foregroundStyle(.red)
-                    .help("Your existing library will no longer open in the app. The old encrypted catalog stays safe on disk. Use only when you know you want a blank start.")
+                    Button("Start empty catalog…") { catalogRecoveryAction = .startFresh }
+                        .help("Keep the existing encrypted library on disk and open a new empty catalog")
                 }
             }
             .padding(16)
@@ -671,18 +755,8 @@ struct CleanerHomeView: View {
                 HStack {
                     Button("Try Again") { model.retryCatalogOpen() }
                     if model.catalogError != nil {
-                        Button(confirmCatalogReset
-                               ? "Confirm: Lock Old Catalog Aside and Start Fresh"
-                               : "Key Still Blocked? Reset Catalog Key…") {
-                            if confirmCatalogReset {
-                                model.resetCatalogKeyAndStartFresh()
-                                confirmCatalogReset = false
-                            } else {
-                                confirmCatalogReset = true
-                            }
-                        }
-                        .foregroundStyle(.red)
-                        .help("Moves the old encrypted catalog aside (never deleted), removes the unreadable key, and creates a new encrypted catalog. Use this when every launch asks for keychain access and then fails.")
+                        Button("Move blocked library aside…") { catalogRecoveryAction = .resetKey }
+                            .help("Move the unreadable encrypted catalog aside without deleting it, then create a new one")
                     }
                 }
             }
@@ -702,9 +776,21 @@ struct CleanerHomeView: View {
 
     private func startCleanup() {
         if let selectedSource {
+            guard selectedSourceIsEligible else { return }
+            model.selectLibraryScope(selectedSource)
             model.startIndexing(source: selectedSource)
         } else {
+            model.selectLibraryScope(nil)
             model.startIndexing()
+        }
+    }
+
+    private func syncSelectionToLibraryScope() {
+        switch model.libraryScope {
+        case .allAuthorized:
+            selectedSourceID = nil
+        case .source(let id):
+            selectedSourceID = model.sources.contains(where: { $0.id == id }) ? id : nil
         }
     }
 }

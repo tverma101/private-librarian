@@ -80,4 +80,30 @@ final class SearchScaleTests: XCTestCase {
         XCTAssertTrue(hits.contains { $0.fileID == "scale-1298" })
         XCTAssertLessThanOrEqual(hits.count, 3)
     }
+
+    func testSemanticSearchAppliesFolderScopeBeforeTopK() throws {
+        let catalog = try TestSupport.makeCatalog(tag: "search-scope")
+        let provider = ScaleProvider()
+        let now = Date()
+        for index in 0..<320 {
+            let inScope = index == 319
+            let id = "scope-\(index)"
+            let path = inScope ? "/alpha/target.txt" : "/other/file-\(index).txt"
+            let identity = FileIdentity(
+                path: path, volumeUUID: nil, fileID: UInt64(index + 1),
+                size: 32, mtime: now, ctime: now, kind: .text, isSymlink: false)
+            try catalog.upsertFile(identity: identity, id: id)
+            try catalog.setStatus(fileID: id, status: "indexed")
+            let vector = inScope ? ScaleProvider.vector(0.8, 0.6) : ScaleProvider.vector(1, 0)
+            try catalog.saveEmbedding(fileID: id, model: provider.textModelID, dim: 2, vector: vector)
+        }
+
+        let service = SearchService(catalog: catalog, enableLocalEmbeddings: true,
+                                    embeddingProvider: provider)
+        let hits = try service.semanticSearch(
+            query: "folder", limit: 5, threshold: 0.5, roots: ["/alpha"])
+
+        XCTAssertEqual(hits.map(\.fileID), ["scope-319"])
+        XCTAssertTrue(hits.allSatisfy { $0.path == "/alpha/target.txt" })
+    }
 }

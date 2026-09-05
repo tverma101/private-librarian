@@ -10,6 +10,7 @@ extension Catalog {
         kinds: [FileKind] = [],
         duplicateOnly: Bool = false,
         afterPath: String? = nil,
+        roots: [String]? = nil,
         limit: Int = 200
     ) throws -> [FileSummary] {
         let pageLimit = max(0, min(limit, 1_000))
@@ -64,6 +65,12 @@ extension Catalog {
             binds.append(.text(afterPath))
         }
 
+        let scope = scopedRootPredicate(column: "f.path", roots: roots)
+        if !scope.sql.isEmpty {
+            clauses.append(scope.sql)
+            binds.append(contentsOf: scope.binds)
+        }
+
         binds.append(.int(Int64(pageLimit)))
         let sql = """
         \(withClause)
@@ -87,6 +94,7 @@ extension Catalog {
     public func boundedSimilarityClusters(
         relation: SimilarityRelation? = nil,
         afterID: String? = nil,
+        roots: [String]? = nil,
         limit: Int = 200
     ) throws -> [SimilarityCluster] {
         let pageLimit = max(0, min(limit, 1_000))
@@ -102,13 +110,23 @@ extension Catalog {
             clauses.append("id>?")
             binds.append(.text(afterID))
         }
+        let scope = scopedRootPredicate(column: "f_scope.path", roots: roots)
+        let scopeJoin = scope.sql.isEmpty
+            ? ""
+            : " JOIN similarity_cluster_members scm_scope ON scm_scope.cluster_id=similarity_clusters.id JOIN files f_scope ON f_scope.id=scm_scope.file_id"
+        if !scope.sql.isEmpty {
+            clauses.append(scope.sql)
+            binds.append(contentsOf: scope.binds)
+        }
         let whereClause = clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")
         binds.append(.int(Int64(pageLimit)))
 
         let rows = try query("""
-            SELECT id,family_id,relation,representative,confidence,reason
-            FROM similarity_clusters\(whereClause)
-            ORDER BY id
+            SELECT DISTINCT similarity_clusters.id,similarity_clusters.family_id,
+                   similarity_clusters.relation,similarity_clusters.representative,
+                   similarity_clusters.confidence,similarity_clusters.reason
+            FROM similarity_clusters\(scopeJoin)\(whereClause)
+            ORDER BY similarity_clusters.id
             LIMIT ?
             """, binds: binds) { row in
             (id: row.text(0) ?? "",
@@ -121,25 +139,35 @@ extension Catalog {
         guard !rows.isEmpty else { return [] }
 
         let placeholders = Array(repeating: "?", count: rows.count).joined(separator: ",")
-        let memberBinds = rows.map { SQLValue.text($0.id) }
-        let members = try query("""
-            SELECT cluster_id,file_id
-            FROM similarity_cluster_members
-            WHERE cluster_id IN (\(placeholders))
-            ORDER BY cluster_id,file_id
-            """, binds: memberBinds) { ($0.text(0) ?? "", $0.text(1) ?? "") }
+        var memberBinds = rows.map { SQLValue.text($0.id) }
+        var memberSQL = """
+            SELECT scm.cluster_id,scm.file_id
+            FROM similarity_cluster_members scm
+            """
+        var memberClauses = ["scm.cluster_id IN (\(placeholders))"]
+        let memberScope = scopedRootPredicate(column: "f_scope.path", roots: roots)
+        if !memberScope.sql.isEmpty {
+            memberSQL += " JOIN files f_scope ON f_scope.id=scm.file_id"
+            memberClauses.append(memberScope.sql)
+            memberBinds.append(contentsOf: memberScope.binds)
+        }
+        memberSQL += " WHERE " + memberClauses.joined(separator: " AND ") + " ORDER BY scm.cluster_id,scm.file_id"
+        let members = try query(memberSQL, binds: memberBinds) { ($0.text(0) ?? "", $0.text(1) ?? "") }
         var membersByCluster: [String: [String]] = [:]
         for (clusterID, fileID) in members {
             membersByCluster[clusterID, default: []].append(fileID)
         }
-        return rows.map { row in
-            SimilarityCluster(id: row.id,
-                              members: membersByCluster[row.id] ?? [],
-                              representative: row.representative,
-                              relation: row.relation,
-                              familyID: row.family,
-                              confidence: row.confidence,
-                              reason: row.reason.isEmpty ? nil : row.reason)
+        return rows.compactMap { row in
+            let scopedMembers = membersByCluster[row.id] ?? []
+            guard scopedMembers.count >= 2 else { return nil }
+            return SimilarityCluster(id: row.id,
+                                     members: scopedMembers,
+                                     representative: scopedMembers.contains(row.representative)
+                                         ? row.representative : scopedMembers[0],
+                                     relation: row.relation,
+                                     familyID: row.family,
+                                     confidence: row.confidence,
+                                     reason: row.reason.isEmpty ? nil : row.reason)
         }
     }
 }

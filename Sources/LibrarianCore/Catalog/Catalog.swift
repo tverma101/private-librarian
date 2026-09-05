@@ -1001,25 +1001,56 @@ public final class Catalog: @unchecked Sendable {
         }
     }
 
-    public func similarityClusters(relation: SimilarityRelation? = nil) throws -> [SimilarityCluster] {
-        let sql = "SELECT id,family_id,relation,representative,confidence,reason FROM similarity_clusters" + (relation == nil ? "" : " WHERE relation=?") + " ORDER BY id"
-        let binds = relation.map { [SQLValue.text($0.rawValue)] } ?? []
+    public func similarityClusters(relation: SimilarityRelation? = nil,
+                                   roots: [String]? = nil) throws -> [SimilarityCluster] {
+        var clauses: [String] = []
+        var binds: [SQLValue] = []
+        if let relation {
+            clauses.append("sc.relation=?")
+            binds.append(.text(relation.rawValue))
+        }
+        let scope = scopedRootPredicate(column: "f.path", roots: roots)
+        if !scope.sql.isEmpty {
+            clauses.append(scope.sql)
+            binds.append(contentsOf: scope.binds)
+        }
+        let sql = """
+        SELECT DISTINCT sc.id,sc.family_id,sc.relation,sc.representative,sc.confidence,sc.reason
+        FROM similarity_clusters sc
+        \(scope.sql.isEmpty ? "" : "JOIN similarity_cluster_members scm_scope ON scm_scope.cluster_id=sc.id JOIN files f ON f.id=scm_scope.file_id")
+        \(clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND "))
+        ORDER BY sc.id
+        """
         let rows = try query(sql, binds: binds) { r in
             (r.text(0) ?? "", r.text(1) ?? "", SimilarityRelation(rawValue: r.text(2) ?? "") ?? .nearDuplicate,
              r.text(3) ?? "", Float(r.real(4)), r.text(5) ?? "")
         }
-        let members = try query("""
-            SELECT cluster_id, file_id
-            FROM similarity_cluster_members
-            ORDER BY cluster_id, file_id
-            """) { ($0.text(0) ?? "", $0.text(1) ?? "") }
+        guard !rows.isEmpty else { return [] }
+        let placeholders = Array(repeating: "?", count: rows.count).joined(separator: ",")
+        var memberBinds = rows.flatMap { [SQLValue.text($0.0)] }
+        var memberSQL = """
+            SELECT scm.cluster_id, scm.file_id
+            FROM similarity_cluster_members scm
+            """
+        var memberClauses = ["scm.cluster_id IN (\(placeholders))"]
+        let memberScope = scopedRootPredicate(column: "f.path", roots: roots)
+        if !memberScope.sql.isEmpty {
+            memberSQL += " JOIN files f ON f.id=scm.file_id"
+            memberClauses.append(memberScope.sql)
+            memberBinds.append(contentsOf: memberScope.binds)
+        }
+        memberSQL += " WHERE " + memberClauses.joined(separator: " AND ") + " ORDER BY scm.cluster_id, scm.file_id"
+        let members = try query(memberSQL, binds: memberBinds) { ($0.text(0) ?? "", $0.text(1) ?? "") }
         var membersByCluster: [String: [String]] = [:]
         for (clusterID, fileID) in members {
             membersByCluster[clusterID, default: []].append(fileID)
         }
-        return rows.map { row in
-            SimilarityCluster(id: row.0, members: membersByCluster[row.0] ?? [],
-                              representative: row.3, relation: row.2,
+        return rows.compactMap { row in
+            let members = membersByCluster[row.0] ?? []
+            guard members.count >= 2 else { return nil }
+            let representative = members.contains(row.3) ? row.3 : members[0]
+            return SimilarityCluster(id: row.0, members: members,
+                              representative: representative, relation: row.2,
                               familyID: row.1, confidence: row.4,
                               reason: row.5.isEmpty ? nil : row.5)
         }
@@ -1170,28 +1201,31 @@ public final class Catalog: @unchecked Sendable {
     }
 
     /// FTS5 full-text search over extracted content (inside the encrypted db).
-    public func searchExact(_ q: String, limit: Int = 50) throws -> [SearchHit] {
+    public func searchExact(_ q: String, limit: Int = 50,
+                            roots: [String]? = nil) throws -> [SearchHit] {
         guard limit > 0,
               !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         let match = Self.ftsMatchQuery(q)
         guard !match.isEmpty else { return [] }
+        let scope = scopedRootPredicate(column: "f.path", roots: roots)
+        let scopeClause = scope.sql.isEmpty ? "" : " AND \(scope.sql)"
         let textHits = try query("""
             SELECT f.id, f.path, snippet(text_fts, 1, '[', ']', '…', 12), bm25(text_fts)
             FROM text_fts JOIN files f ON f.id = text_fts.file_id
-            WHERE f.status = 'indexed' AND text_fts MATCH ?
+            WHERE f.status = 'indexed' AND text_fts MATCH ?\(scopeClause)
             ORDER BY bm25(text_fts)
             LIMIT ?
-            """, binds: [.text(match), .int(Int64(limit))]) { r in
+            """, binds: [.text(match)] + scope.binds + [.int(Int64(limit))]) { r in
             SearchHit(fileID: r.text(0) ?? "", path: r.text(1) ?? "",
                       snippet: r.text(2), rank: r.real(3))
         }
         let transcriptHits = try query("""
             SELECT f.id, f.path, snippet(transcripts_fts, 1, '[', ']', '…', 12), bm25(transcripts_fts)
             FROM transcripts_fts JOIN files f ON f.id = transcripts_fts.file_id
-            WHERE f.status = 'indexed' AND transcripts_fts MATCH ?
+            WHERE f.status = 'indexed' AND transcripts_fts MATCH ?\(scopeClause)
             ORDER BY bm25(transcripts_fts)
             LIMIT ?
-            """, binds: [.text(match), .int(Int64(limit))]) { r in
+            """, binds: [.text(match)] + scope.binds + [.int(Int64(limit))]) { r in
             SearchHit(fileID: r.text(0) ?? "", path: r.text(1) ?? "",
                       snippet: r.text(2), rank: r.real(3))
         }
@@ -1204,16 +1238,26 @@ public final class Catalog: @unchecked Sendable {
         return merged
     }
 
-    public func allFiles(statuses: [String]? = nil) throws -> [(id: String, path: String, size: Int64, mtime: Double, kind: String, status: String)] {
+    public func allFiles(statuses: [String]? = nil, roots: [String]? = nil) throws -> [(id: String, path: String, size: Int64, mtime: Double, kind: String, status: String)] {
+        var clauses: [String] = []
+        var binds: [SQLValue] = []
+        if let statuses, !statuses.isEmpty {
+            clauses.append("status IN (\(Array(repeating: "?", count: statuses.count).joined(separator: ",")))")
+            binds.append(contentsOf: statuses.map { .text($0) })
+        }
+        let scope = scopedRootPredicate(column: "path", roots: roots)
+        if !scope.sql.isEmpty {
+            clauses.append(scope.sql)
+            binds.append(contentsOf: scope.binds)
+        }
         let rows = try query("""
             SELECT id, path, size, mtime, kind, status FROM files
-            """) { r in
+            \(clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND "))
+            """, binds: binds) { r in
             (id: r.text(0) ?? "", path: r.text(1) ?? "", size: r.int(2),
              mtime: r.real(3), kind: r.text(4) ?? "", status: r.text(5) ?? "")
         }
-        guard let statuses else { return rows }
-        let set = Set(statuses)
-        return rows.filter { set.contains($0.status) }
+        return rows
     }
 
     public func fileSummaries(categoryPrefix: String? = nil, status: String? = nil,
@@ -1234,8 +1278,10 @@ public final class Catalog: @unchecked Sendable {
         }.prefix(max(0, limit)))
     }
 
-    public func categoryMemberships() throws -> [(categoryPath: String, fileID: String)] {
-        try query("""
+    public func categoryMemberships(roots: [String]? = nil) throws -> [(categoryPath: String, fileID: String)] {
+        let scope = scopedRootPredicate(column: "f.path", roots: roots)
+        let scopeClause = scope.sql.isEmpty ? "" : " WHERE \(scope.sql)"
+        return try query("""
             WITH RECURSIVE category_paths(id, path) AS (
                 SELECT id, name FROM virtual_categories WHERE parent_id IS NULL
                 UNION ALL
@@ -1243,9 +1289,12 @@ public final class Catalog: @unchecked Sendable {
                 FROM virtual_categories c JOIN category_paths ON c.parent_id = category_paths.id
             )
             SELECT category_paths.path, m.file_id
-            FROM category_membership m JOIN category_paths ON category_paths.id = m.category_id
+            FROM category_membership m
+            JOIN category_paths ON category_paths.id = m.category_id
+            JOIN files f ON f.id = m.file_id
+            \(scopeClause)
             ORDER BY category_paths.path, m.file_id
-            """) { r in (r.text(0) ?? "", r.text(1) ?? "") }
+            """, binds: scope.binds) { r in (r.text(0) ?? "", r.text(1) ?? "") }
     }
 
     public func categoryFileIDs(prefix: String) throws -> Set<String> {
@@ -1346,7 +1395,16 @@ public final class Catalog: @unchecked Sendable {
         return Set(rows)
     }
 
-    public func reviewItems(state: String = "open", limit: Int = 200) throws -> [ReviewItem] {
+    public func reviewItems(state: String = "open", limit: Int = 200,
+                            roots: [String]? = nil) throws -> [ReviewItem] {
+        var clauses = ["r.state=?", "f.status != 'unscoped'"]
+        var binds: [SQLValue] = [.text(state)]
+        let scope = scopedRootPredicate(column: "f.path", roots: roots)
+        if !scope.sql.isEmpty {
+            clauses.append(scope.sql)
+            binds.append(contentsOf: scope.binds)
+        }
+        binds.append(.int(Int64(max(1, limit))))
         let rows = try query("""
             SELECT r.file_id, f.path, COALESCE(c.confidence, 0),
                    COALESCE(c.categories_json, '[]'), COALESCE(c.reason_codes_json, '[]'),
@@ -1354,10 +1412,10 @@ public final class Catalog: @unchecked Sendable {
             FROM review_inbox r
             JOIN files f ON f.id = r.file_id
             LEFT JOIN classifications c ON c.file_id = r.file_id
-            WHERE r.state=? AND f.status != 'unscoped'
+            WHERE \(clauses.joined(separator: " AND "))
             ORDER BY r.updated DESC, r.file_id
             LIMIT ?
-            """, binds: [.text(state), .int(Int64(max(1, limit)))]) { r in
+            """, binds: binds) { r in
             let categories = (try? JSONDecoder().decode([String].self, from: Data((r.text(3) ?? "[]").utf8))) ?? []
             let reasons = (try? JSONDecoder().decode([String].self, from: Data((r.text(4) ?? "[]").utf8))) ?? []
             return ReviewItem(fileID: r.text(0) ?? "", path: r.text(1) ?? "",
@@ -1368,13 +1426,20 @@ public final class Catalog: @unchecked Sendable {
         return rows
     }
 
-    public func reviewSummary() throws -> ReviewSummary {
+    public func reviewSummary(roots: [String]? = nil) throws -> ReviewSummary {
+        var clauses = ["f.status != 'unscoped'"]
+        var binds: [SQLValue] = []
+        let scope = scopedRootPredicate(column: "f.path", roots: roots)
+        if !scope.sql.isEmpty {
+            clauses.append(scope.sql)
+            binds.append(contentsOf: scope.binds)
+        }
         let rows = try query("""
             SELECT r.state, count(*)
             FROM review_inbox r JOIN files f ON f.id=r.file_id
-            WHERE f.status != 'unscoped'
+            WHERE \(clauses.joined(separator: " AND "))
             GROUP BY r.state
-            """) { ($0.text(0) ?? "", Int($0.int(1))) }
+            """, binds: binds) { ($0.text(0) ?? "", Int($0.int(1))) }
         return ReviewSummary(open: rows.first(where: { $0.0 == "open" })?.1 ?? 0,
                              resolved: rows.first(where: { $0.0 == "resolved" })?.1 ?? 0)
     }
@@ -1527,7 +1592,7 @@ public final class Catalog: @unchecked Sendable {
         excludedPaths: [String] = [],
         excludedDirectoryNames: Set<String> = OnboardingExclusions.defaultDirectoryNames
     ) throws -> OnboardingCoverage {
-        let rows = try allFiles()
+        let rows = try allFiles(roots: roots)
         func normalized(_ path: String) -> String {
             guard path.count > 1, path.hasSuffix("/") else { return path }
             return String(path.dropLast())
@@ -1550,7 +1615,7 @@ public final class Catalog: @unchecked Sendable {
         let eligible = scoped.filter { row in
             !exclusions.contains { under(row.path, $0) } && !hasExcludedDirectory(row.path)
         }
-        let reviewIDs = Set(try reviewItems(limit: Int.max).map(\.fileID))
+        let reviewIDs = Set(try reviewItems(limit: Int.max, roots: roots).map(\.fileID))
         let rootCoverage = rootPrefixes.map { root in
             let rootRows = scoped.filter { row in under(row.path, root) }
             let skippedRows = rootRows.filter { row in
@@ -1604,19 +1669,43 @@ public final class Catalog: @unchecked Sendable {
         )
     }
 
-    public func dashboard() throws -> CatalogDashboard {
-        let counts = try counts()
-        let summary = try reviewSummary()
-        let categories = try query("SELECT count(*) FROM virtual_categories WHERE name != 'Review'") { Int($0.int(0)) }.first ?? 0
+    public func dashboard(roots: [String]? = nil) throws -> CatalogDashboard {
+        let counts = try counts(roots: roots)
+        let summary = try reviewSummary(roots: roots)
+        var categoryBinds: [SQLValue] = []
+        let categoryScope = scopedRootPredicate(column: "f.path", roots: roots)
+        let categoryJoin = categoryScope.sql.isEmpty ? "" : " JOIN category_membership cm ON cm.category_id=vc.id JOIN files f ON f.id=cm.file_id"
+        var categoryClauses = ["vc.name != 'Review'"]
+        if !categoryScope.sql.isEmpty {
+            categoryClauses.append(categoryScope.sql)
+            categoryBinds.append(contentsOf: categoryScope.binds)
+        }
+        let categories = try query("SELECT count(DISTINCT vc.id) FROM virtual_categories vc\(categoryJoin) WHERE \(categoryClauses.joined(separator: " AND "))", binds: categoryBinds) { Int($0.int(0)) }.first ?? 0
+        var duplicateBinds: [SQLValue] = []
+        let duplicateScope = scopedRootPredicate(column: "f.path", roots: roots)
+        var duplicateClauses = ["f.status='indexed'"]
+        if !duplicateScope.sql.isEmpty {
+            duplicateClauses.append(duplicateScope.sql)
+            duplicateBinds.append(contentsOf: duplicateScope.binds)
+        }
         let dupes = try query("""
             SELECT count(*) FROM (
                 SELECT h.size, h.sha256
                 FROM exact_hashes h JOIN files f ON f.id=h.file_id
-                WHERE f.status='indexed'
+                WHERE \(duplicateClauses.joined(separator: " AND "))
                 GROUP BY h.size, h.sha256 HAVING count(*) > 1
             )
-            """) { Int($0.int(0)) }.first ?? 0
-        let edgeCount = try query("SELECT count(*) FROM organization_edges") { Int($0.int(0)) }.first ?? 0
+            """, binds: duplicateBinds) { Int($0.int(0)) }.first ?? 0
+        var edgeBinds: [SQLValue] = []
+        let edgeScope = scopedRootPredicate(column: "fs.path", roots: roots)
+        let edgeScopeTarget = scopedRootPredicate(column: "ft.path", roots: roots)
+        var edgeClauses: [String] = []
+        if !edgeScope.sql.isEmpty && !edgeScopeTarget.sql.isEmpty {
+            edgeClauses.append("(EXISTS (SELECT 1 FROM files fs WHERE fs.id=organization_edges.source_id AND \(edgeScope.sql)) AND EXISTS (SELECT 1 FROM files ft WHERE ft.id=organization_edges.target_id AND \(edgeScopeTarget.sql)))")
+            edgeBinds.append(contentsOf: edgeScope.binds)
+            edgeBinds.append(contentsOf: edgeScopeTarget.binds)
+        }
+        let edgeCount = try query("SELECT count(*) FROM organization_edges\(edgeClauses.isEmpty ? "" : " WHERE " + edgeClauses.joined(separator: " AND "))", binds: edgeBinds) { Int($0.int(0)) }.first ?? 0
         return CatalogDashboard(total: counts["total"] ?? 0, indexed: counts["indexed"] ?? 0,
                                 review: summary.open, missing: counts["missing"] ?? 0,
                                 categories: categories, duplicateGroups: dupes,
@@ -1648,13 +1737,26 @@ public final class Catalog: @unchecked Sendable {
         return rows.first ?? nil
     }
 
-    public func counts() throws -> [String: Int] {
+    public func counts(roots: [String]? = nil) throws -> [String: Int] {
         var out: [String: Int] = [:]
+        let scope = scopedRootPredicate(column: "path", roots: roots)
         for status in ["pending", "indexed", "missing", "failed"] {
-            let rows = try query("SELECT count(*) FROM files WHERE status=?", binds: [.text(status)]) { $0.int(0) }
+            var binds: [SQLValue] = [.text(status)]
+            var clauses = ["status=?"]
+            if !scope.sql.isEmpty {
+                clauses.append(scope.sql)
+                binds.append(contentsOf: scope.binds)
+            }
+            let rows = try query("SELECT count(*) FROM files WHERE \(clauses.joined(separator: " AND "))", binds: binds) { $0.int(0) }
             out[status] = Int(rows.first ?? 0)
         }
-        let total = try query("SELECT count(*) FROM files WHERE status != 'unscoped'") { $0.int(0) }
+        var totalBinds: [SQLValue] = []
+        var totalClauses = ["status != 'unscoped'"]
+        if !scope.sql.isEmpty {
+            totalClauses.append(scope.sql)
+            totalBinds.append(contentsOf: scope.binds)
+        }
+        let total = try query("SELECT count(*) FROM files WHERE \(totalClauses.joined(separator: " AND "))", binds: totalBinds) { $0.int(0) }
         out["total"] = Int(total.first ?? 0)
         let embeddingRows = try query("SELECT count(*), COALESCE(sum(length(vector)), 0) FROM embeddings") {
             (Int($0.int(0)), Int($0.int(1)))

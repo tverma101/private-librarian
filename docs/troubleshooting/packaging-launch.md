@@ -41,6 +41,21 @@ The packager also compiles the checked-in `AppIcon` asset catalog into
 This keeps Finder/Dock resource resolution inside the signed bundle instead of
 falling back to an empty or stale app-icon registration.
 
+## Auxiliary Library window restoration
+
+The Library workspace is transient and should open only when requested from
+Home. A prior build let SwiftUI/AppKit persist its `advanced-library` scene,
+so a relaunch could restore both Home and Library and look like a duplicate
+app. SwiftUI's `.restorationBehavior(.disabled)` is only available on macOS
+15, while this package supports macOS 14.
+
+The macOS 14-compatible fix marks the Library `NSWindow` non-restorable as
+soon as it exists, disables restoration again before AppKit encodes state, and
+closes only an already-restored Library window during the bounded first-launch
+cleanup. The primary Home window and all Finder/default-app associations are
+left alone. The cleanup also invalidates the stale restoration archive so the
+old auxiliary entry does not recur.
+
 ## Validation
 
 The repaired bundle was rebuilt with `scripts/package_app.sh --xcode --install`.
@@ -49,6 +64,10 @@ entitlement audit, universal `arm64` + `x86_64` inspection, and DMG verification
 `open -n /Applications/PrivateLibrarian.app` returned success and the
 `LibrarianApp` process remained alive. Spotlight found only that installed
 bundle, and `dist/` contained only the versioned DMG.
+
+The final relaunch log restored only `main-AppWindow-1`; the stale
+`advanced-library` entry was absent. Exactly one `LibrarianApp` process
+remained alive.
 
 ## Residual boundary
 

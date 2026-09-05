@@ -56,7 +56,7 @@ struct ModelSetupView: View {
                     .foregroundStyle(.green)
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Ready to install")
+                    Text("Ready to set up")
                         .font(.headline)
                     Text(setupDescription)
                         .font(.subheadline)
@@ -74,7 +74,7 @@ struct ModelSetupView: View {
                         .foregroundStyle(.secondary)
                     Text(cancelling
                          ? "Private Librarian is stopping the active downloader or Python task before closing this setup run."
-                         : "This is live installer state, not a fake percentage. Large downloads can still take several minutes.")
+                         : "Progress is reported by stage because model files can resume independently. Large downloads can take several minutes, and verified files are kept if you cancel.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -152,9 +152,9 @@ struct ModelSetupView: View {
         case .fast:
             return "Fast itself works without downloads. You can close this setup and analyze immediately."
         case .balanced:
-            return "Downloads SigLIP2 Base NaFlex for fast screenshot meaning plus bounded ambiguity handling."
+            return "Downloads a moderate local image-understanding model plus fallback tools for ambiguous files. No account or token is required."
         case .quality:
-            return "Downloads the larger SigLIP2 So400m semantic encoder plus the bounded Quality fallback for difficult images."
+            return "Downloads a larger local image-understanding model plus fallback tools for difficult files. It uses more disk and memory; no account or token is required."
         }
     }
 

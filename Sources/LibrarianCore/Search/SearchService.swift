@@ -40,9 +40,9 @@ public struct SearchService: Sendable {
     }
 
     /// Exact search with optional filters.
-    public func search(_ q: String, filters: [Filter] = []) throws -> [Catalog.SearchHit] {
+    public func search(_ q: String, filters: [Filter] = [], roots: [String]? = nil) throws -> [Catalog.SearchHit] {
         guard !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
-        var hits = try catalog.searchExact(q)
+        var hits = try catalog.searchExact(q, roots: roots)
         for f in filters {
             switch f {
             case .kind(let k):
@@ -170,19 +170,21 @@ public struct SearchService: Sendable {
 
     private func scoreEmbeddingTable(
         table: String, alias: String, modelID: String, query: Data,
-        threshold: Float, limit: Int,
+        threshold: Float, limit: Int, roots: [String]? = nil,
         best: inout [String: (score: Float, path: String)]
     ) throws {
         precondition(table == "embeddings" || table == "embedding_chunks")
         precondition(alias == "e" || alias == "c")
+        let scope = catalog.scopedRootPredicate(column: "f.path", roots: roots)
+        let scopeClause = scope.sql.isEmpty ? "" : " AND \(scope.sql)"
         var lastRowID: Int64 = 0
         while true {
             let rows = try catalog.query("""
                 SELECT CAST(\(alias).rowid AS TEXT), \(alias).file_id, \(alias).vector, f.path
                 FROM \(table) \(alias) JOIN files f ON f.id=\(alias).file_id
-                WHERE f.status='indexed' AND \(alias).model=? AND \(alias).rowid>?
+                WHERE f.status='indexed' AND \(alias).model=? AND \(alias).rowid>?\(scopeClause)
                 ORDER BY \(alias).rowid LIMIT ?
-                """, binds: [.text(modelID), .int(lastRowID), .int(Self.vectorBatchSize)]) { row in
+                """, binds: [.text(modelID), .int(lastRowID)] + scope.binds + [.int(Self.vectorBatchSize)]) { row in
                     (Int64(row.text(0) ?? "0") ?? 0,
                      row.text(1) ?? "", row.blob(2) ?? Data(), row.text(3) ?? "")
                 }
@@ -200,7 +202,8 @@ public struct SearchService: Sendable {
     /// Semantic text search over local MiniLM embeddings (384-d, cosine).
     /// Chunk-aware: text can span chunks (score = max over chunks). Both tables
     /// are scanned in fixed batches while only the best K file IDs stay live.
-    public func semanticSearch(query text: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
+    public func semanticSearch(query text: String, limit: Int = 20, threshold: Float = 0.30,
+                               roots: [String]? = nil) throws -> [(fileID: String, path: String, score: Float)] {
         guard limit > 0 else { return [] }
         guard enableLocalEmbeddings else { return [] }
         guard embeddingProvider.preflight.available,
@@ -209,53 +212,58 @@ public struct SearchService: Sendable {
         try scoreEmbeddingTable(table: "embeddings", alias: "e",
                                 modelID: embeddingProvider.textModelID,
                                 query: q.data, threshold: threshold,
-                                limit: limit, best: &best)
+                                limit: limit, roots: roots, best: &best)
         try scoreEmbeddingTable(table: "embedding_chunks", alias: "c",
                                 modelID: embeddingProvider.textModelID,
                                 query: q.data, threshold: threshold,
-                                limit: limit, best: &best)
+                                limit: limit, roots: roots, best: &best)
         return best.map { ($0.key, $0.value.path, $0.value.score) }
             .sorted { $0.2 != $1.2 ? $0.2 > $1.2 : $0.1 < $1.1 }
     }
 
     private func scoreImageEmbeddingTable(
-        query: Data, modelID: String, threshold: Float, limit: Int
+        query: Data, modelID: String, threshold: Float, limit: Int,
+        roots: [String]? = nil
     ) throws -> [(fileID: String, path: String, score: Float)] {
         var best: [String: (score: Float, path: String)] = [:]
         try scoreEmbeddingTable(table: "embeddings", alias: "e", modelID: modelID,
                                 query: query, threshold: threshold,
-                                limit: limit, best: &best)
+                                limit: limit, roots: roots, best: &best)
         return best.map { ($0.key, $0.value.path, $0.value.score) }
             .sorted { $0.2 != $1.2 ? $0.2 > $1.2 : $0.1 < $1.1 }
     }
 
     /// Visual similarity via local CLIP embeddings (512-d, cosine) — higher quality than Vision feature-print.
     /// Requires Models/clip-vit-base-patch32 provisioned; otherwise returns [].
-    public func clipVisualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
+    public func clipVisualSearch(nearImagePath path: String, broker: SourceBroker, limit: Int = 20,
+                                 threshold: Float = 0.30, roots: [String]? = nil) throws -> [(fileID: String, path: String, score: Float)] {
         guard limit > 0 else { return [] }
         guard enableLocalEmbeddings else { return [] }
         guard let bytes = try? broker.completeSnapshot(path, maxBytes: VisionImageAnalyzer.maxImageContainerBytes),
               embeddingProvider.preflight.available,
               let q = embeddingProvider.embedImageBytes(bytes), !q.data.isEmpty else { return [] }
         return try scoreImageEmbeddingTable(query: q.data, modelID: embeddingProvider.imageModelID,
-                                            threshold: threshold, limit: limit)
+                                            threshold: threshold, limit: limit, roots: roots)
     }
 
     /// Compatibility wrapper for callers that do not provide a broker.
     /// It still uses SourceBroker's complete snapshot policy.
-    public func clipVisualSearch(nearImagePath path: String, limit: Int = 20, threshold: Float = 0.30) throws -> [(fileID: String, path: String, score: Float)] {
-        try clipVisualSearch(nearImagePath: path, broker: SourceBroker(), limit: limit, threshold: threshold)
+    public func clipVisualSearch(nearImagePath path: String, limit: Int = 20, threshold: Float = 0.30,
+                                 roots: [String]? = nil) throws -> [(fileID: String, path: String, score: Float)] {
+        try clipVisualSearch(nearImagePath: path, broker: SourceBroker(), limit: limit,
+                             threshold: threshold, roots: roots)
     }
 
     /// Cross-modal text → image search: encode the text query with CLIP's text encoder
     /// (same 512-d joint space as image vectors) and rank indexed CLIP image embeddings by cosine.
-    public func clipTextToImageSearch(query text: String, limit: Int = 20, threshold: Float = 0.22) throws -> [(fileID: String, path: String, score: Float)] {
+    public func clipTextToImageSearch(query text: String, limit: Int = 20, threshold: Float = 0.22,
+                                      roots: [String]? = nil) throws -> [(fileID: String, path: String, score: Float)] {
         guard limit > 0 else { return [] }
         guard enableLocalEmbeddings else { return [] }
         guard embeddingProvider.preflight.available,
               let q = embeddingProvider.embedJointText(text), !q.data.isEmpty else { return [] }
         return try scoreImageEmbeddingTable(query: q.data, modelID: embeddingProvider.imageModelID,
-                                            threshold: threshold, limit: limit)
+                                            threshold: threshold, limit: limit, roots: roots)
     }
 
     /// Unified visual search: prefers CLIP when provisioned, falls back to Vision feature-print.

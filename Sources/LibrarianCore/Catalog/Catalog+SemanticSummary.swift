@@ -149,15 +149,21 @@ extension Catalog {
             kindCounts: kindCounts, summary: summaryText, updated: now)
     }
 
-    public func projectSemanticSummaries(limit: Int = 128) throws -> [ProjectSemanticSummary] {
+    public func projectSemanticSummaries(limit: Int = 128,
+                                         roots: [String]? = nil) throws -> [ProjectSemanticSummary] {
+        let scope = scopedRootPredicate(column: "root", roots: roots)
+        let whereClause = scope.sql.isEmpty ? "" : " WHERE \(scope.sql)"
+        var binds = scope.binds
+        binds.append(.int(Int64(max(1, min(limit, 1_024)))))
         let rows = try query("""
             SELECT root,complete,file_count,indexed_file_count,text_file_count,
                    embedding_file_count,chunk_row_count,vector_bytes,
                    kind_counts_json,summary,updated
             FROM project_summaries
+            \(whereClause)
             ORDER BY root
             LIMIT ?
-            """, binds: [.int(Int64(max(1, min(limit, 1_024))))]) { row in
+            """, binds: binds) { row in
                 let kindJSON = row.text(8) ?? "{}"
                 let kindData = kindJSON.data(using: .utf8)
                 let kindCounts: [String: Int]

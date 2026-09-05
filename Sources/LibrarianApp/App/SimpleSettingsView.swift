@@ -69,18 +69,23 @@ struct SimpleSettingsView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text((source.path as NSString).lastPathComponent)
                                     .lineLimit(1)
+                                    .help(source.path)
                                 Text(model.needsReauthorization(source)
                                      ? "Permission needs refresh"
-                                     : model.isPaused(source) ? "Paused" : "Allowed for analysis and confirmed Apply")
+                                     : model.isPaused(source) ? "Paused"
+                                     : "Ready for analysis · Apply always asks first")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
+                            .accessibilityValue(source.path)
                             Spacer()
                             if model.needsReauthorization(source) {
-                                Button("Allow…") { model.reauthorizeSource(source) }
+                                Button("Allow \((source.path as NSString).lastPathComponent)…") { model.reauthorizeSource(source) }
+                                    .help("Allow Private Librarian to read \(source.path)")
                             } else {
-                                Button("Re-authorize…") { model.reauthorizeSource(source) }
+                                Button("Re-authorize \((source.path as NSString).lastPathComponent)…") { model.reauthorizeSource(source) }
                                     .buttonStyle(.borderless)
+                                    .help("Refresh access for \(source.path)")
                             }
                         }
                     }
@@ -116,9 +121,10 @@ struct SimpleSettingsView: View {
                     .disabled(!model.isLocalTranscriptionAvailable)
 
                 if !model.isLocalTranscriptionAvailable {
-                    Text(model.localTranscriptionStatus)
+                    Text("Optional audio transcription is not installed. Library analysis and search still work normally.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .help(model.localTranscriptionStatus)
                 }
             }
 
@@ -246,10 +252,11 @@ struct SimpleSettingsView: View {
                             Button("Open Models Folder") { openModelsFolder() }
                             if model.localModelProfile != .fast {
                                 Button {
-                                    copySetupCommand(openTerminal: true)
+                                    copySetupCommand(openTerminal: false)
                                 } label: {
-                                    Label(copiedCommand ? "Command Copied" : "Terminal Fallback", systemImage: "terminal")
+                                    Label(copiedCommand ? "Command Copied" : "Copy setup command", systemImage: "doc.on.clipboard")
                                 }
+                                .help("Copy a diagnostic setup command; normal setup stays inside the app")
                             }
                         }
 
@@ -309,7 +316,7 @@ struct SimpleSettingsView: View {
         case .balanced:
             return "Recommended. Better visual meaning and ambiguity handling with moderate memory use."
         case .quality:
-            return "For harder libraries. Uses more local AI when the cheaper stages are uncertain."
+            return "For harder libraries. Uses more local AI when cheaper stages are uncertain, with higher disk and memory use."
         }
     }
 
