@@ -119,11 +119,6 @@ public struct SmartOrganizationPlanner: Sendable {
                 members: mediaMembers))
         }
 
-        // Highest-value specific destination wins. If assigning higher-priority
-        // files causes a lower-priority folder to fall below the minimum useful
-        // size, remove that folder and re-elect those files into their next-best
-        // viable destination. This keeps the one-file/one-folder invariant
-        // without stranding useful generic groups.
         let orderedDestinations = destinations.sorted(by: Self.destinationPrecedes)
         var choicesByFile: [String: [String]] = [:]
         for destination in orderedDestinations {
@@ -135,8 +130,7 @@ public struct SmartOrganizationPlanner: Sendable {
         // Global group priority is only a fallback. The classifier records why
         // each file received a label, so a filename-backed course, user/learned
         // correction, or specialist adjudication can outrank a generic type
-        // bucket for that specific file. This is the key distinction between a
-        // useful sorter and a pretty view over unordered multi-label evidence.
+        // bucket for that specific file.
         for (fileID, preferredCategory) in preferredCategoryByFile {
             let preferredID = "category:\(Self.normalize(preferredCategory))"
             guard var choices = choicesByFile[fileID],
@@ -146,37 +140,85 @@ public struct SmartOrganizationPlanner: Sendable {
             choicesByFile[fileID] = choices
         }
 
+        // Elect one Finder owner per file, but enforce presentation caps as part
+        // of that election rather than after it. If a fifth/sixth course group
+        // is hidden by the school-lane cap, its files are re-elected into their
+        // next useful destination (for example PDFs) instead of silently
+        // disappearing from the actionable product surface.
         var activeDestinationIDs = Set(orderedDestinations.map(\.id))
         var ownerByFile: [String: String] = [:]
-        while true {
+        var counts: [String: Int] = [:]
+
+        func electOwners() {
             ownerByFile.removeAll(keepingCapacity: true)
-            var counts: [String: Int] = [:]
+            counts.removeAll(keepingCapacity: true)
             for (fileID, choices) in choicesByFile {
                 guard let owner = choices.first(where: { activeDestinationIDs.contains($0) }) else { continue }
                 ownerByFile[fileID] = owner
                 counts[owner, default: 0] += 1
             }
-            let undersized = activeDestinationIDs.filter {
-                counts[$0, default: 0] < minimumGroupSize
-            }
-            if undersized.isEmpty { break }
-            activeDestinationIDs.subtract(undersized)
-            if activeDestinationIDs.isEmpty {
-                ownerByFile.removeAll()
-                break
-            }
         }
+
+        while !activeDestinationIDs.isEmpty {
+            electOwners()
+
+            let populated = orderedDestinations
+                .filter { activeDestinationIDs.contains($0.id) && counts[$0.id, default: 0] >= minimumGroupSize }
+                .sorted {
+                    if $0.priority != $1.priority { return $0.priority > $1.priority }
+                    let leftCount = counts[$0.id, default: 0]
+                    let rightCount = counts[$1.id, default: 0]
+                    if leftCount != rightCount { return leftCount > rightCount }
+                    if $0.title != $1.title { return $0.title < $1.title }
+                    return $0.id < $1.id
+                }
+
+            var allowedVisibleIDs = Set<String>()
+            var laneCounts: [String: Int] = [:]
+            for destination in populated {
+                guard allowedVisibleIDs.count < maxGroups else { break }
+                let lane = Self.lane(forDestinationID: destination.id)
+                guard laneCounts[lane, default: 0] < Self.laneLimit(lane, maxGroups: maxGroups) else {
+                    continue
+                }
+                allowedVisibleIDs.insert(destination.id)
+                laneCounts[lane, default: 0] += 1
+            }
+
+            // Remove only populated destinations that the visible cap rejected.
+            // Zero-owner generic destinations stay latent so they can receive
+            // files after a higher-priority destination is removed.
+            let overflow = Set(populated.map(\.id)).subtracting(allowedVisibleIDs)
+            if !overflow.isEmpty {
+                activeDestinationIDs.subtract(overflow)
+                continue
+            }
+
+            // A destination with exactly one primary member is not useful as a
+            // folder. Remove it only after cap re-election has settled; its file
+            // gets another chance at the next fallback destination.
+            let positiveUndersized = activeDestinationIDs.filter {
+                let value = counts[$0, default: 0]
+                return value > 0 && value < minimumGroupSize
+            }
+            if !positiveUndersized.isEmpty {
+                activeDestinationIDs.subtract(positiveUndersized)
+                continue
+            }
+            break
+        }
+        electOwners()
 
         var primaryMembersByDestination: [String: Set<String>] = [:]
         for (fileID, destinationID) in ownerByFile {
             primaryMembersByDestination[destinationID, default: []].insert(fileID)
         }
 
-        var candidates: [(priority: Int, group: SmartOrganizationGroup)] = []
+        var categoryCandidates: [(priority: Int, group: SmartOrganizationGroup)] = []
         for destination in orderedDestinations where activeDestinationIDs.contains(destination.id) {
             guard let members = primaryMembersByDestination[destination.id],
                   members.count >= minimumGroupSize else { continue }
-            candidates.append((
+            categoryCandidates.append((
                 destination.priority,
                 SmartOrganizationGroup(
                     id: destination.id,
@@ -188,12 +230,13 @@ public struct SmartOrganizationPlanner: Sendable {
 
         // Relationships stay useful for discovery/review, but are intentionally
         // not Finder destinations and therefore may overlap primary groups.
+        var relationshipCandidates: [(priority: Int, group: SmartOrganizationGroup)] = []
         for cluster in similarityClusters {
             let members = Array(Set(cluster.members)).sorted()
             guard members.count >= 2 else { continue }
             switch cluster.relation {
             case .nearDuplicate:
-                candidates.append((
+                relationshipCandidates.append((
                     120,
                     SmartOrganizationGroup(
                         id: "duplicate:\(cluster.familyID)",
@@ -206,7 +249,7 @@ public struct SmartOrganizationPlanner: Sendable {
                 guard members.count >= max(3, minimumGroupSize),
                       cluster.confidence >= minimumSemanticConfidence else { continue }
                 let title = Self.semanticTitle(members: members, categoriesByFile: categoriesByFile)
-                candidates.append((
+                relationshipCandidates.append((
                     85,
                     SmartOrganizationGroup(
                         id: "semantic:\(cluster.familyID)",
@@ -218,24 +261,22 @@ public struct SmartOrganizationPlanner: Sendable {
             }
         }
 
-        let sorted = candidates.sorted {
-            if $0.priority != $1.priority { return $0.priority > $1.priority }
-            if $0.group.fileIDs.count != $1.group.fileIDs.count {
-                return $0.group.fileIDs.count > $1.group.fileIDs.count
-            }
-            if $0.group.title != $1.group.title { return $0.group.title < $1.group.title }
-            return $0.group.id < $1.group.id
-        }
-        var selected: [SmartOrganizationGroup] = []
+        // Actionable category destinations won their cap during owner election,
+        // so never drop them afterward. Relationship groups can fill whatever
+        // room remains for planner/internal callers. The production Smart Groups
+        // query intentionally supplies no relationship clusters.
+        let sortedCategories = categoryCandidates.sorted(by: Self.candidatePrecedes)
+        var selected = sortedCategories.prefix(maxGroups).map(\.group)
+        guard selected.count < maxGroups else { return selected }
+
         var laneCounts: [String: Int] = [:]
-        for candidate in sorted {
+        for group in selected { laneCounts[Self.lane(for: group), default: 0] += 1 }
+        for candidate in relationshipCandidates.sorted(by: Self.candidatePrecedes) {
+            guard selected.count < maxGroups else { break }
             let lane = Self.lane(for: candidate.group)
-            guard laneCounts[lane, default: 0] < Self.laneLimit(lane, maxGroups: maxGroups) else {
-                continue
-            }
+            guard laneCounts[lane, default: 0] < Self.laneLimit(lane, maxGroups: maxGroups) else { continue }
             selected.append(candidate.group)
             laneCounts[lane, default: 0] += 1
-            if selected.count == maxGroups { break }
         }
         return selected
     }
@@ -248,6 +289,18 @@ public struct SmartOrganizationPlanner: Sendable {
         return lhs.id < rhs.id
     }
 
+    private static func candidatePrecedes(
+        _ lhs: (priority: Int, group: SmartOrganizationGroup),
+        _ rhs: (priority: Int, group: SmartOrganizationGroup)
+    ) -> Bool {
+        if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
+        if lhs.group.fileIDs.count != rhs.group.fileIDs.count {
+            return lhs.group.fileIDs.count > rhs.group.fileIDs.count
+        }
+        if lhs.group.title != rhs.group.title { return lhs.group.title < rhs.group.title }
+        return lhs.group.id < rhs.group.id
+    }
+
     private static func unionMembers(
         _ paths: [String],
         from membersByCategory: [String: Set<String>]
@@ -257,6 +310,16 @@ public struct SmartOrganizationPlanner: Sendable {
         }
     }
 
+    private static func lane(forDestinationID id: String) -> String {
+        if id == "composite:installers-archives" { return "downloads" }
+        if id == "composite:media" { return "media" }
+        if id == "category:Image/Junk" { return "junk" }
+        if id.hasPrefix("category:Screenshots/") { return "screenshots" }
+        if id.hasPrefix("category:School/") { return "school" }
+        if id.hasPrefix("category:Projects/") { return "projects" }
+        return "general"
+    }
+
     private static func lane(for group: SmartOrganizationGroup) -> String {
         switch group.kind {
         case .nearDuplicate:
@@ -264,13 +327,7 @@ public struct SmartOrganizationPlanner: Sendable {
         case .semantic:
             return "semantic"
         case .category:
-            if group.id == "composite:installers-archives" { return "downloads" }
-            if group.id == "composite:media" { return "media" }
-            if group.id == "category:Image/Junk" { return "junk" }
-            if group.id.hasPrefix("category:Screenshots/") { return "screenshots" }
-            if group.id.hasPrefix("category:School/") { return "school" }
-            if group.id.hasPrefix("category:Projects/") { return "projects" }
-            return "general"
+            return lane(forDestinationID: group.id)
         }
     }
 
@@ -466,27 +523,11 @@ public extension Catalog {
             return result
         }
 
-        let exclusiveImageSubjects: Set<String> = [
-            "Image/Animals", "Image/Vehicles", "Image/Scenery", "Image/Food", "Image/Documents"
-        ]
-        func hasUnresolvedExclusiveConflict(_ categories: [String]) -> Bool {
-            let courses = categories.filter {
-                $0.hasPrefix("School/") && SmartOrganizationPlanner.categorySpec($0) != nil
-            }
-            if Set(courses).count > 1 { return true }
-            let screenshotSubtypes = categories.filter {
-                $0.hasPrefix("Screenshots/") && SmartOrganizationPlanner.categorySpec($0) != nil
-            }
-            if Set(screenshotSubtypes).count > 1 { return true }
-            if Set(categories.filter { exclusiveImageSubjects.contains($0) }).count > 1 { return true }
-            return false
-        }
-
         var preferredCategoryByFile: [String: String] = [:]
         var blockedFromFinder = Set<String>()
         for row in rows where activeIDs.contains(row.fileID) {
             let categories = decode(row.categories)
-            if hasUnresolvedExclusiveConflict(categories) {
+            if ClassificationCategoryPolicy.hasExclusiveConflict(categories) {
                 blockedFromFinder.insert(row.fileID)
                 continue
             }
