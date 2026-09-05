@@ -70,7 +70,8 @@ public struct SmartOrganizationPlanner: Sendable {
 
     public func build(
         memberships: [(categoryPath: String, fileID: String)],
-        similarityClusters: [SimilarityCluster]
+        similarityClusters: [SimilarityCluster],
+        preferredCategoryByFile: [String: String] = [:]
     ) -> [SmartOrganizationGroup] {
         var membersByCategory: [String: Set<String>] = [:]
         var categoriesByFile: [String: Set<String>] = [:]
@@ -124,12 +125,25 @@ public struct SmartOrganizationPlanner: Sendable {
         // viable destination. This keeps the one-file/one-folder invariant
         // without stranding useful generic groups.
         let orderedDestinations = destinations.sorted(by: Self.destinationPrecedes)
-        let destinationByID = Dictionary(uniqueKeysWithValues: orderedDestinations.map { ($0.id, $0) })
         var choicesByFile: [String: [String]] = [:]
         for destination in orderedDestinations {
             for fileID in destination.members {
                 choicesByFile[fileID, default: []].append(destination.id)
             }
+        }
+
+        // Global group priority is only a fallback. The classifier records why
+        // each file received a label, so a filename-backed course, user/learned
+        // correction, or specialist adjudication can outrank a generic type
+        // bucket for that specific file. This is the key distinction between a
+        // useful sorter and a pretty view over unordered multi-label evidence.
+        for (fileID, preferredCategory) in preferredCategoryByFile {
+            let preferredID = "category:\(Self.normalize(preferredCategory))"
+            guard var choices = choicesByFile[fileID],
+                  let index = choices.firstIndex(of: preferredID) else { continue }
+            choices.remove(at: index)
+            choices.insert(preferredID, at: 0)
+            choicesByFile[fileID] = choices
         }
 
         var activeDestinationIDs = Set(orderedDestinations.map(\.id))
@@ -296,6 +310,55 @@ public struct SmartOrganizationPlanner: Sendable {
         return "Related items"
     }
 
+    fileprivate static func preferredFinderCategory(
+        categories: [String],
+        baseCategories: [String],
+        reasons: [String]
+    ) -> String? {
+        let base = Set(baseCategories)
+        let hasSpecialist = reasons.contains { $0.hasPrefix("specialist:") }
+        var best: (category: String, score: Int, priority: Int)?
+
+        for category in categories {
+            guard let spec = categorySpec(category) else { continue }
+            var score = spec.priority
+
+            // Categories added after the deterministic baseline come from a
+            // learned/user correction or a schema-validated specialist. They
+            // are stronger than a generic base label by design.
+            if !base.contains(category) { score += 1_000 }
+
+            if category.hasPrefix("School/") {
+                let course = String(category.dropFirst("School/".count))
+                if reasons.contains("filename:\(course)") { score += 700 }
+                else if reasons.contains("text:\(course)") { score += 500 }
+            }
+            if category == "Projects/Code", reasons.contains("project:code") {
+                score += 650
+            }
+            if category.hasPrefix("Screenshots/"),
+               reasons.contains(where: { $0.hasPrefix("screenshot:") }) {
+                score += 675
+            }
+            if category == "Assignment", reasons.contains("text:assignment-word") {
+                score += 250
+            }
+            if hasSpecialist, !base.contains(category) { score += 250 }
+
+            if let current = best {
+                if score > current.score
+                    || (score == current.score && spec.priority > current.priority)
+                    || (score == current.score && spec.priority == current.priority
+                        && category < current.category) {
+                    best = (category, score, spec.priority)
+                }
+            } else {
+                best = (category, score, spec.priority)
+            }
+        }
+        return best?.category
+    }
+
     private static func normalize(_ path: String) -> String {
         path.split(separator: "/", omittingEmptySubsequences: true)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -307,7 +370,7 @@ public struct SmartOrganizationPlanner: Sendable {
     /// classifiers, imports, learned rules, or future model providers, so the
     /// dashboard must never assume that a repeated category string is safe or
     /// useful merely because more than one file has it.
-    private static func categorySpec(_ path: String) ->
+    fileprivate static func categorySpec(_ path: String) ->
         (title: String, subtitle: String, priority: Int)? {
         let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard let root = parts.first else { return nil }
@@ -375,27 +438,48 @@ public struct SmartOrganizationPlanner: Sendable {
 public extension Catalog {
     func smartOrganizationGroups(limit: Int = 18,
                                  roots: [String]? = nil) throws -> [SmartOrganizationGroup] {
-        // Smart Groups are actionable cleanup suggestions, not historical
-        // views. Missing/unscoped rows remain in their dedicated catalog views
-        // but must not be offered for a new Finder move.
+        // The Smart Groups product surface is for actionable Finder
+        // organization. Similarity and duplicate relationships have dedicated
+        // views and must never inherit a move button merely because the same
+        // presentation type can represent them in tests/internal tooling.
         let activeIDs = Set(try allFiles(statuses: ["indexed"], roots: roots).map(\.id))
         let activeMemberships = try categoryMemberships(roots: roots).filter { activeIDs.contains($0.fileID) }
-        let activeClusters = try similarityClusters(roots: roots).compactMap { cluster -> SimilarityCluster? in
-            let members = cluster.members.filter { activeIDs.contains($0) }
-            guard members.count >= 2 else { return nil }
-            return SimilarityCluster(
-                id: cluster.id,
-                members: members,
-                representative: activeIDs.contains(cluster.representative)
-                    ? cluster.representative : members[0],
-                relation: cluster.relation,
-                familyID: cluster.familyID,
-                confidence: cluster.confidence,
-                reason: cluster.reason)
+
+        let scope = scopedRootPredicate(column: "f.path", roots: roots)
+        var clauses = ["f.status='indexed'"]
+        if !scope.sql.isEmpty { clauses.append(scope.sql) }
+        let rows = try query("""
+            SELECT c.file_id, c.categories_json, c.base_categories_json, c.reason_codes_json
+            FROM classifications c
+            JOIN files f ON f.id=c.file_id
+            WHERE \(clauses.joined(separator: " AND "))
+            """, binds: scope.binds) { row in
+                (fileID: row.text(0) ?? "",
+                 categories: row.text(1) ?? "[]",
+                 baseCategories: row.text(2) ?? "[]",
+                 reasons: row.text(3) ?? "[]")
+            }
+
+        func decode(_ value: String) -> [String] {
+            guard let data = value.data(using: .utf8),
+                  let result = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+            return result
         }
+
+        var preferredCategoryByFile: [String: String] = [:]
+        for row in rows where activeIDs.contains(row.fileID) {
+            if let preferred = SmartOrganizationPlanner.preferredFinderCategory(
+                categories: decode(row.categories),
+                baseCategories: decode(row.baseCategories),
+                reasons: decode(row.reasons)) {
+                preferredCategoryByFile[row.fileID] = preferred
+            }
+        }
+
         return SmartOrganizationPlanner(maxGroups: limit).build(
             memberships: activeMemberships,
-            similarityClusters: activeClusters)
+            similarityClusters: [],
+            preferredCategoryByFile: preferredCategoryByFile)
     }
 
     /// Remove category rows that no longer lead to any membership. This is
