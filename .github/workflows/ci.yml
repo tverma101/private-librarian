@@ -6,6 +6,7 @@ on:
       - main
       - "fix/**"
       - "feat/**"
+      - A3
   pull_request:
   workflow_dispatch:
 
@@ -156,35 +157,20 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Run deterministic Golden Library quality subset
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+      - name: Test real organization output
+        run: swift test --filter OrganizationQualityAcceptanceTests
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+      - name: Reject fixture-only quality claims
+        shell: bash
         run: |
-          python3 -B scripts/benchmark_quality.py --output quality-result.json
-          python3 -B - <<'PY'
-          import json
-          from pathlib import Path
-
-          result = json.loads(Path("quality-result.json").read_text())
-          assert result["schema"] == 2
-          required = (
-              "screenshot_subtype_macro_f1",
-              "screenshot_control_accuracy",
-              "exact_duplicate_precision",
-              "near_duplicate_recall",
-              "semantic_recall_at_10",
-              "cluster_purity",
-              "cluster_completeness",
-              "ocr_recovery",
-              "ocr_latency_ms",
-              "course_topic_accuracy",
-              "review_precision",
-              "review_coverage",
-              "correction_reduction",
-          )
-          missing = [key for key in required if key not in result]
-          assert not missing, missing
-          assert result["identity"]["commit"] not in (None, "unknown")
-          print("Golden Library schema and metric gate: PASS")
-          PY
+          set -euo pipefail
+          if grep -F 'benchmark_quality.py --output' .github/workflows/ci.yml; then
+            echo "CI must not score hand-written predictions as product quality" >&2
+            exit 1
+          fi
 
   entitlement-audit:
     runs-on: macos-15
