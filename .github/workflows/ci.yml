@@ -99,7 +99,7 @@ jobs:
           grep -F 'BOOTSTRAP_PYTHON_SHA256="2e50ed6ec49d8714a83c093e9ce74e1b8b21a2c64a49c3b603471d9c4caac76b"' scripts/setup_models.sh >/dev/null
           grep -F '/usr/bin/shasum -a 256' scripts/setup_models.sh >/dev/null
           grep -F -- "--proto '=https'" scripts/setup_models.sh >/dev/null
-          if grep -E 'curl[^\n]*\|' scripts/setup_models.sh; then
+          if grep -E 'curl.*\|' scripts/setup_models.sh; then
             echo "Model runtime bootstrap must never execute curl output through a shell" >&2
             exit 1
           fi
@@ -161,6 +161,10 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.app
       - name: Test real organization output
         run: swift test --filter OrganizationQualityAcceptanceTests
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
+      - name: Test sorting decisions and conflict safety
+        run: swift test --filter SortingDecisionTests
         env:
           DEVELOPER_DIR: /Applications/Xcode_16.app/Contents/Developer
 
