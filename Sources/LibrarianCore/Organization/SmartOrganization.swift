@@ -466,18 +466,43 @@ public extension Catalog {
             return result
         }
 
+        let exclusiveImageSubjects: Set<String> = [
+            "Image/Animals", "Image/Vehicles", "Image/Scenery", "Image/Food", "Image/Documents"
+        ]
+        func hasUnresolvedExclusiveConflict(_ categories: [String]) -> Bool {
+            let courses = categories.filter {
+                $0.hasPrefix("School/") && SmartOrganizationPlanner.categorySpec($0) != nil
+            }
+            if Set(courses).count > 1 { return true }
+            let screenshotSubtypes = categories.filter {
+                $0.hasPrefix("Screenshots/") && SmartOrganizationPlanner.categorySpec($0) != nil
+            }
+            if Set(screenshotSubtypes).count > 1 { return true }
+            if Set(categories.filter { exclusiveImageSubjects.contains($0) }).count > 1 { return true }
+            return false
+        }
+
         var preferredCategoryByFile: [String: String] = [:]
+        var blockedFromFinder = Set<String>()
         for row in rows where activeIDs.contains(row.fileID) {
+            let categories = decode(row.categories)
+            if hasUnresolvedExclusiveConflict(categories) {
+                blockedFromFinder.insert(row.fileID)
+                continue
+            }
             if let preferred = SmartOrganizationPlanner.preferredFinderCategory(
-                categories: decode(row.categories),
+                categories: categories,
                 baseCategories: decode(row.baseCategories),
                 reasons: decode(row.reasons)) {
                 preferredCategoryByFile[row.fileID] = preferred
             }
         }
 
+        let actionableMemberships = activeMemberships.filter {
+            !blockedFromFinder.contains($0.fileID)
+        }
         return SmartOrganizationPlanner(maxGroups: limit).build(
-            memberships: activeMemberships,
+            memberships: actionableMemberships,
             similarityClusters: [],
             preferredCategoryByFile: preferredCategoryByFile)
     }
