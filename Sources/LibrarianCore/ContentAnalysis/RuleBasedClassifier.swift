@@ -157,7 +157,7 @@ public struct RuleBasedClassifier: Sendable {
             reasons.append("conflict:course")
             confidence = min(confidence, 0.55)
         }
-        let imageSubjects = cats.filter { exclusiveImageSubjects.contains($0) }
+        let imageSubjects = cats.filter { Self.exclusiveImageSubjects.contains($0) }
         if Set(imageSubjects).count > 1 {
             if !cats.contains("Review") { cats.append("Review") }
             reasons.append("conflict:image-subject")
