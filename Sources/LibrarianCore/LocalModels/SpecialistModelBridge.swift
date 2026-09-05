@@ -365,17 +365,34 @@ public final class SpecialistModelBridge: @unchecked Sendable {
 
     private static func parseClassification(_ object: [String: Any]?, modelID: String) -> SpecialistClassification? {
         guard let object, object["error"] == nil,
-              let categories = object["categories"] as? [String], !categories.isEmpty,
+              let rawCategories = object["categories"] as? [String], !rawCategories.isEmpty,
               let description = object["description"] as? String,
               let confidence = object["confidence"] as? Double,
-              let reasons = object["reasons"] as? [String],
+              let rawReasons = object["reasons"] as? [String],
               confidence.isFinite else { return nil }
+
+        let categories = Array(rawCategories.prefix(ClassifierContract.maxCategories))
+        // The Indexer preserves specialist reasons as `model:<reason>`. Emit a
+        // deterministic pick marker for every mutually-exclusive category the
+        // specialist actually returned. ClassificationCategoryPolicy can then
+        // replace only those lanes, including when the chosen category already
+        // existed in the deterministic result. Generic specialist success does
+        // not implicitly erase any conflict.
+        let pickReasons = categories
+            .filter { ClassificationCategoryPolicy.isExclusiveCategory($0) }
+            .map { "pick:\($0)" }
+        // Indexer prefixes these with `model:` and the classifier contract caps
+        // each reason at 64 characters. Keep raw model prose bounded to 58 so a
+        // long explanation cannot invalidate an otherwise useful result.
+        let modelReasons = rawReasons.map { String($0.prefix(58)) }
+        let reasons = Array((pickReasons + modelReasons).prefix(ClassifierContract.maxReasonCodes))
+
         return SpecialistClassification(
             modelID: modelID,
-            categories: Array(categories.prefix(ClassifierContract.maxCategories)),
+            categories: categories,
             description: String(description.prefix(512)),
             confidence: max(0, min(1, confidence)),
-            reasons: Array(reasons.prefix(ClassifierContract.maxReasonCodes)).map { String($0.prefix(96)) })
+            reasons: reasons)
     }
 
     /// Internal parser seam so contract tests can prove that a batch cannot
