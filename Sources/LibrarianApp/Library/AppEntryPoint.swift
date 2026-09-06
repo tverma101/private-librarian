@@ -81,7 +81,7 @@ final class PrivateLibrarianAppDelegate: NSObject, NSApplicationDelegate {
         // remove that one stale surface after AppKit has decoded it. The
         // primary Home window remains untouched.
         DispatchQueue.main.async {
-            let restoredLibraryWindows = app.windows.filter(Self.isLibraryWindow)
+            let restoredLibraryWindows = app.windows.filter { Self.isLibraryWindow($0) }
             for window in restoredLibraryWindows {
                 Self.disableRestoration(for: window)
                 window.close()
@@ -101,7 +101,7 @@ final class PrivateLibrarianAppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func removeRestoredLibraryWindows() {
-        let restoredLibraryWindows = NSApp.windows.filter(Self.isLibraryWindow)
+        let restoredLibraryWindows = NSApp.windows.filter { Self.isLibraryWindow($0) }
         for window in restoredLibraryWindows {
             Self.disableRestoration(for: window)
             window.close()
