@@ -500,7 +500,9 @@ public extension Catalog {
         // views and must never inherit a move button merely because the same
         // presentation type can represent them in tests/internal tooling.
         let activeIDs = Set(try allFiles(statuses: ["indexed"], roots: roots).map(\.id))
-        let activeMemberships = try categoryMemberships(roots: roots).filter { activeIDs.contains($0.fileID) }
+        let activeMemberships = try semanticOrganizationMemberships(
+            limit: max(384, min(2_048, activeIDs.count)), roots: roots
+        ).filter { activeIDs.contains($0.fileID) }
 
         let scope = scopedRootPredicate(column: "f.path", roots: roots)
         var clauses = ["f.status='indexed'"]

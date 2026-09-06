@@ -788,10 +788,14 @@ public final class Indexer: @unchecked Sendable {
             if stagedMiniLM?.data.isEmpty == true { stagedMiniLM = nil }
         }
 
-        // 3b. Classify (deterministic v1 + vision labels) under MEDIUM slot.
+        // 3b. Classify cheap evidence first, then add bounded context from already
+        // indexed siblings/corrections. Semantic-cluster context is also consumed
+        // at organization time after the current similarity graph is refreshed.
+        let semanticContext = (try? catalog.semanticResolutionContext(forFileID: id)) ?? .empty
         let classification = scheduler.perform(as: .medium) { [self] () -> Classification in
             classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent,
-                                visionLabels: visionLabels, screenshot: screenshotAssessment)
+                                visionLabels: visionLabels, screenshot: screenshotAssessment,
+                                semanticContext: semanticContext)
         }
         var validatedClass: Classification? = {
             guard let data = try? classification.jsonData() else { return nil }
