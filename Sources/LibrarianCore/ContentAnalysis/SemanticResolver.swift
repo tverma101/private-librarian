@@ -77,7 +77,24 @@ public struct SemanticResolver: Sendable {
             }
         }
 
-        if let winner = contextualWinner(context.candidates), isSafeCategory(winner.category) {
+        // Ambient folder/cluster context is a rescue mechanism for ambiguous
+        // files, not permission to override already-strong local evidence. It is
+        // also incompatible with opaque physical bundle types (archives,
+        // installers, disk images, packages, links), whose bytes are not being
+        // semantically inspected here. User/learned/model decisions remain
+        // eligible because they are explicit, bounded evidence rather than mere
+        // co-location.
+        let contextualCandidates = context.candidates.filter { candidate in
+            switch candidate.source {
+            case .userCorrection, .learnedRule, .modelJudge:
+                return true
+            case .sibling, .similarityCluster:
+                guard !hasOpaquePhysicalKind(categories) else { return false }
+                return !hasStrongLocalSemanticEvidence(categories: categories, reasons: reasons)
+            }
+        }
+
+        if let winner = contextualWinner(contextualCandidates), isSafeCategory(winner.category) {
             if isCourseCategory(winner.category) {
                 categories.removeAll { isCourseCategory($0) && $0 != winner.category }
             } else if isImageSubject(winner.category) {
@@ -197,6 +214,27 @@ public struct SemanticResolver: Sendable {
         return first
     }
 
+    private func hasOpaquePhysicalKind(_ categories: [String]) -> Bool {
+        !Set(categories).isDisjoint(with: Self.opaquePhysicalCategories)
+    }
+
+    private func hasStrongLocalSemanticEvidence(categories: [String], reasons: [String]) -> Bool {
+        for category in categories {
+            if isCourseCategory(category) {
+                let token = String(category.dropFirst("School/".count))
+                if reasons.contains("text:\(token)") { return true }
+            }
+            if category == "Projects/Code", reasons.contains("project:code") { return true }
+            if isScreenshotSubtype(category), reasons.contains(where: { $0.hasPrefix("screenshot:") }) {
+                return true
+            }
+            if isImageSubject(category), reasons.contains(where: { $0.hasPrefix("vision:") }) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func courseCategories(in categories: [String]) -> [String] {
         categories.filter(isCourseCategory)
     }
@@ -253,6 +291,10 @@ public struct SemanticResolver: Sendable {
 
     private static let genericCategories: Set<String> = [
         "Image", "Audio", "Video", "Documents/PDF", "Documents/Text", "Documents/Office",
+        "Archives", "DiskImages", "Applications", "Packages", "Links"
+    ]
+
+    private static let opaquePhysicalCategories: Set<String> = [
         "Archives", "DiskImages", "Applications", "Packages", "Links"
     ]
 
