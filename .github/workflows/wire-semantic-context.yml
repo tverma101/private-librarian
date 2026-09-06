@@ -25,6 +25,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Sources/LibrarianCore/Organization/SmartOrganization.swift Sources/LibrarianCore/Indexing/Indexer.swift
-          git commit -m "Use semantic context in indexing and Finder planning"
+          git add Sources/LibrarianCore/Organization/SmartOrganization.swift Sources/LibrarianCore/Indexing/Indexer.swift Sources/LibrarianCore/LocalModels/SpecialistModelBridge.swift scripts/specialist.py
+          git commit -m "Make specialist routing content and context aware"
           git push origin HEAD:A3
