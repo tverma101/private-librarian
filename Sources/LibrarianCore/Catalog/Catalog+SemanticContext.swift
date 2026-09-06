@@ -12,7 +12,7 @@ public extension Catalog {
         let targetScope = scopedRootPredicate(column: "path", roots: roots)
         var targetClauses = ["id=?", "status!='unscoped'"]
         if !targetScope.sql.isEmpty { targetClauses.append(targetScope.sql) }
-        var targetBinds: [SQLiteValue] = [.text(fileID)]
+        var targetBinds: [SQLValue] = [.text(fileID)]
         targetBinds.append(contentsOf: targetScope.binds)
         let target = try query("""
             SELECT path FROM files
@@ -66,7 +66,7 @@ public extension Catalog {
             "s.relation='semantic'",
         ]
         if !peerScope.sql.isEmpty { clusterClauses.append(peerScope.sql) }
-        var clusterBinds: [SQLiteValue] = [.text(fileID)]
+        var clusterBinds: [SQLValue] = [.text(fileID)]
         clusterBinds.append(contentsOf: peerScope.binds)
         clusterBinds.append(.int(Int64(max(0, min(256, clusterPeerLimit)))))
         let clusterRows = try query("""
@@ -103,7 +103,7 @@ public extension Catalog {
             "o.action=?",
         ]
         if !peerScope.sql.isEmpty { correctionClauses.append(peerScope.sql) }
-        var correctionBinds: [SQLiteValue] = [
+        var correctionBinds: [SQLValue] = [
             .text(fileID),
             .text(ReviewCorrectionAction.addCategory.rawValue),
         ]
