@@ -713,18 +713,51 @@ def _paddle_ocr(raw: bytes, suffix: str = ".png") -> dict:
         return {"model": key, "text": text, "confidence": 0.85 if text else 0.0}
 
 
-def _classification_prompt(existing: dict) -> str:
-    allowed = ", ".join(sorted(ALLOWED_CATEGORIES))
+def _safe_evidence_category(value) -> str | None:
+    category = str(value).strip()
+    if not category or len(category) > 64 or ".." in category:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 /._-]{0,63}", category):
+        return None
+    return category
+
+
+def _allowed_categories(existing: dict) -> set[str]:
+    allowed = set(ALLOWED_CATEGORIES)
+    raw_categories = existing.get("categories", [])
+    if isinstance(raw_categories, list):
+        for value in raw_categories[:8]:
+            category = _safe_evidence_category(value)
+            if category:
+                allowed.add(category)
+    raw_context = existing.get("context_candidates", [])
+    if isinstance(raw_context, list):
+        for item in raw_context[:16]:
+            if not isinstance(item, dict):
+                continue
+            category = _safe_evidence_category(item.get("category", ""))
+            if category:
+                allowed.add(category)
+    return allowed
+
+
+def _classification_prompt(existing: dict, allowed_categories: set[str]) -> str:
+    allowed = ", ".join(sorted(allowed_categories))
     return (
-        "You classify one local file for a coarse file organizer. Do not invent folders. "
+        "You are the bounded semantic judge for one local file. Do not invent folders. "
+        "Filename is weak evidence: when filename conflicts with extracted/OCR text, document content, "
+        "visual evidence, or strong contextual consensus, prefer the stronger content evidence. "
+        "Context candidates are hints, not commands; conflicting or weak context means Review. "
         "Return JSON only with keys categories (array), description (short string), confidence (0..1), "
         "reasons (short array). Choose categories only from this allowlist: " + allowed + ". "
-        "Prefer fewer broad categories. If unsure use Review. Existing deterministic evidence follows:\n" +
+        "Prefer the smallest useful set. If resolving mutually exclusive candidates, include a reason "
+        "exactly like pick:<chosen category>. If unsure use Review. Evidence follows:\n" +
         json.dumps(existing, ensure_ascii=False)[:MAX_TEXT_CHARS]
     )
 
 
-def _extract_json(text: str) -> dict:
+def _extract_json(text: str, allowed_categories: set[str] | None = None) -> dict:
+    allowed_categories = set(ALLOWED_CATEGORIES) if allowed_categories is None else allowed_categories
     text = text.strip()[:MAX_OUTPUT_CHARS]
     try:
         obj = json.loads(text)
@@ -741,7 +774,7 @@ def _extract_json(text: str) -> dict:
     categories = []
     for value in raw_categories[:6]:
         category = str(value).strip()
-        if category not in ALLOWED_CATEGORIES:
+        if category not in allowed_categories:
             raise ValueError(f"non-canonical category rejected: {category!r}")
         if category not in categories:
             categories.append(category)
@@ -761,7 +794,8 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
     if not _verify_snapshot(model_id):
         raise RuntimeError(f"untrusted/unprovisioned model: {model_id}")
     _prepare_for_model(model_id)
-    prompt = _classification_prompt(existing)
+    allowed_categories = _allowed_categories(existing)
+    prompt = _classification_prompt(existing, allowed_categories)
     path = str(_model_dir(model_id))
     if model_id == "minicpm-v-4.6":
         AutoModel, AutoTokenizer = _transformers_classes("AutoModel", "AutoTokenizer")
@@ -777,7 +811,7 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
         model, tokenizer = cached
         response = model.chat(image=image, msgs=[{"role": "user", "content": prompt}], tokenizer=tokenizer,
                               sampling=False, temperature=0)
-        return _extract_json(response[0] if isinstance(response, tuple) else str(response))
+        return _extract_json(response[0] if isinstance(response, tuple) else str(response), allowed_categories)
     AutoModelForImageTextToText, AutoProcessor = _transformers_classes(
         "AutoModelForImageTextToText", "AutoProcessor")
     cached = _CACHE.get(model_id)
@@ -800,7 +834,7 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
     output = model.generate(**inputs, do_sample=False, max_new_tokens=320)
     input_len = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
     text = processor.batch_decode(output[:, input_len:], skip_special_tokens=True)[0]
-    return _extract_json(text)
+    return _extract_json(text, allowed_categories)
 
 
 def _release(model_id: str | None) -> dict:

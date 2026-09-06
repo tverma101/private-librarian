@@ -867,7 +867,8 @@ public final class Indexer: @unchecked Sendable {
                 deterministicCategories: current.categories,
                 deterministicConfidence: current.confidence,
                 textSample: textContent,
-                visionLabels: visionLabels.map(\.0))
+                visionLabels: visionLabels.map(\.0),
+                contextCandidates: semanticContext.candidates)
             for model in route where current.confidence < 0.72 {
                 let result: SpecialistClassification?
                 switch model.capability {

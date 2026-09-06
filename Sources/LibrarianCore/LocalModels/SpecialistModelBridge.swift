@@ -24,15 +24,18 @@ public struct SpecialistEvidence: Sendable, Equatable {
     public let deterministicConfidence: Double
     public let textSample: String?
     public let visionLabels: [String]
+    public let contextCandidates: [SemanticContextCandidate]
 
     public init(kind: String, filename: String, deterministicCategories: [String],
-                deterministicConfidence: Double, textSample: String?, visionLabels: [String]) {
+                deterministicConfidence: Double, textSample: String?, visionLabels: [String],
+                contextCandidates: [SemanticContextCandidate] = []) {
         self.kind = kind
         self.filename = String(filename.prefix(256))
         self.deterministicCategories = Array(deterministicCategories.prefix(8))
         self.deterministicConfidence = max(0, min(1, deterministicConfidence))
         self.textSample = textSample.map { String($0.prefix(8_000)) }
         self.visionLabels = Array(visionLabels.prefix(8)).map { String($0.prefix(96)) }
+        self.contextCandidates = Array(contextCandidates.prefix(16))
     }
 
     var jsonObject: [String: Any] {
@@ -42,6 +45,14 @@ public struct SpecialistEvidence: Sendable, Equatable {
             "categories": deterministicCategories,
             "confidence": deterministicConfidence,
             "vision_labels": visionLabels,
+            "context_candidates": contextCandidates.map { candidate in
+                [
+                    "category": candidate.category,
+                    "confidence": candidate.confidence,
+                    "support_count": candidate.supportCount,
+                    "source": candidate.source.rawValue,
+                ] as [String: Any]
+            },
         ]
         if let textSample { object["text_sample"] = textSample }
         return object
