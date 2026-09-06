@@ -117,6 +117,46 @@ public extension Catalog {
             context: try semanticResolutionContext(forFileID: fileID))
     }
 
+    /// Organization-time semantic pass. It adds only high-confidence inferred
+    /// memberships to the in-memory planning view; the catalog classification
+    /// is not rewritten and Finder remains untouched. Inferred categories must
+    /// already exist in the catalog taxonomy, so context cannot explode the
+    /// folder tree or materialize a model-invented destination.
+    func semanticOrganizationMemberships(limit: Int = 384) throws -> [(categoryPath: String, fileID: String)] {
+        var memberships = try categoryMemberships()
+        let existing = Set(memberships.map(\.categoryPath))
+        var seen = Set(memberships.map { "\($0.categoryPath)\u{0}\($0.fileID)" })
+        let boundedLimit = max(1, min(2_048, limit))
+
+        // Context is useful primarily for generic/ambiguous files. Keep this a
+        // bounded pass rather than walking every library item during every UI
+        // refresh. Explicit Review items are included regardless of raw score.
+        let candidateIDs = try query("""
+            SELECT c.file_id
+            FROM classifications c
+            JOIN files f ON f.id=c.file_id
+            WHERE f.status='indexed'
+              AND (c.confidence < 0.80 OR c.categories_json LIKE '%\"Review\"%')
+            ORDER BY c.confidence ASC, c.file_id
+            LIMIT ?
+            """, binds: [.int(Int64(boundedLimit))]) { $0.text(0) ?? "" }
+
+        for fileID in candidateIDs where !fileID.isEmpty {
+            guard let resolved = try semanticallyResolvedClassification(fileID: fileID),
+                  resolved.confidence >= 0.80,
+                  !resolved.categories.contains("Review") else { continue }
+            for category in resolved.categories where Self.isUsefulSemanticCategory(category) {
+                // Taxonomy firewall: only categories already proven to exist in
+                // this library can become contextual planning memberships.
+                guard existing.contains(category) else { continue }
+                let key = "\(category)\u{0}\(fileID)"
+                guard seen.insert(key).inserted else { continue }
+                memberships.append((categoryPath: category, fileID: fileID))
+            }
+        }
+        return memberships
+    }
+
     private static func semanticContextCategories(fromJSON json: String) -> [String] {
         guard let data = json.data(using: .utf8),
               let categories = try? JSONDecoder().decode([String].self, from: data) else { return [] }
