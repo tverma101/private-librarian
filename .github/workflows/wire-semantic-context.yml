@@ -2,64 +2,29 @@ name: Wire semantic context
 
 on:
   push:
-    branches: [A3]
+    branches:
+      - A3
     paths:
-      - .github/workflows/wire-semantic-context.yml
-
-permissions:
-  contents: write
+      - ".github/workflows/wire-semantic-context.yml"
+  workflow_dispatch:
 
 jobs:
   wire:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           ref: A3
           fetch-depth: 0
-      - name: Wire contextual semantic resolution
+      - name: Patch integration points
+        run: python3 scripts/wire_semantic_context.py
+      - name: Commit wiring
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          smart_path = Path("Sources/LibrarianCore/Organization/SmartOrganization.swift")
-          smart = smart_path.read_text()
-          old_smart = '''        let activeMemberships = try categoryMemberships(roots: roots).filter { activeIDs.contains($0.fileID) }'''
-          new_smart = '''        let activeMemberships = try semanticOrganizationMemberships(
-            limit: max(384, min(2_048, activeIDs.count)), roots: roots
-        ).filter { activeIDs.contains($0.fileID) }'''
-          if old_smart not in smart:
-              raise SystemExit("SmartOrganization integration point not found")
-          smart_path.write_text(smart.replace(old_smart, new_smart, 1))
-
-          indexer_path = Path("Sources/LibrarianCore/Indexing/Indexer.swift")
-          indexer = indexer_path.read_text()
-          old_indexer = '''        // 3b. Classify (deterministic v1 + vision labels) under MEDIUM slot.
-        let classification = scheduler.perform(as: .medium) { [self] () -> Classification in
-            classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent,
-                                visionLabels: visionLabels, screenshot: screenshotAssessment)
-        }'''
-          new_indexer = '''        // 3b. Classify cheap evidence first, then add bounded context from already
-        // indexed siblings/corrections. Semantic-cluster context is also consumed
-        // at organization time after the current similarity graph is refreshed.
-        let semanticContext = (try? catalog.semanticResolutionContext(forFileID: id)) ?? .empty
-        let classification = scheduler.perform(as: .medium) { [self] () -> Classification in
-            classifier.classify(fileID: id, identity: ident, evidence: ev, textContent: textContent,
-                                visionLabels: visionLabels, screenshot: screenshotAssessment,
-                                semanticContext: semanticContext)
-        }'''
-          if old_indexer not in indexer:
-              raise SystemExit("Indexer integration point not found")
-          indexer_path.write_text(indexer.replace(old_indexer, new_indexer, 1))
-          PY
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Sources/LibrarianCore/Organization/SmartOrganization.swift Sources/LibrarianCore/Indexing/Indexer.swift
-          if git diff --cached --quiet; then
-            echo "No wiring changes needed"
-            exit 0
-          fi
           git commit -m "Use semantic context in indexing and Finder planning"
           git push origin HEAD:A3
