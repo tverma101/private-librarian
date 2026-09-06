@@ -99,6 +99,7 @@ final class PrivateLibrarianAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @MainActor
     private func removeRestoredLibraryWindows() {
         let restoredLibraryWindows = NSApp.windows.filter(Self.isLibraryWindow)
         for window in restoredLibraryWindows {
@@ -108,10 +109,12 @@ final class PrivateLibrarianAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.invalidateRestorableState()
     }
 
+    @MainActor
     fileprivate static func isLibraryWindow(_ window: NSWindow) -> Bool {
         window.identifier?.rawValue == "advanced-library" || window.title == "Library"
     }
 
+    @MainActor
     fileprivate static func disableRestoration(for window: NSWindow) {
         window.isRestorable = false
         window.restorationClass = nil
