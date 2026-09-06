@@ -1,0 +1,47 @@
+name: A3 Actor Predicate Patch
+
+on:
+  push:
+    branches: [A3]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Keep AppKit predicates in main-actor closures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Sources/LibrarianApp/Library/AppEntryPoint.swift')
+          text = path.read_text()
+          replacements = {
+              'app.windows.filter(Self.isLibraryWindow)': 'app.windows.filter { Self.isLibraryWindow($0) }',
+              'NSApp.windows.filter(Self.isLibraryWindow)': 'NSApp.windows.filter { Self.isLibraryWindow($0) }',
+          }
+          for old, new in replacements.items():
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one occurrence of {old!r}, found {count}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          git diff --check
+          git diff -- Sources/LibrarianApp/Library/AppEntryPoint.swift
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Sources/LibrarianApp/Library/AppEntryPoint.swift
+          git commit -m 'Keep AppKit window predicates main-actor isolated'
+          git push origin HEAD:A3
