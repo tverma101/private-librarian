@@ -58,6 +58,42 @@ final class SemanticResolverTests: XCTestCase {
         XCTAssertTrue(resolved.reasonCodes.contains("semantic:sibling-consensus"))
     }
 
+    func testOpaqueArchiveCannotBecomeCodeProjectFromFolderConsensus() {
+        let base = Classification(
+            fileID: "file_archive",
+            categories: ["Archives"],
+            description: "archive",
+            confidence: 0.55,
+            reasonCodes: ["kind:archive"])
+        let context = SemanticResolutionContext(candidates: [
+            SemanticContextCandidate(category: "Projects/Code", confidence: 0.99,
+                                     supportCount: 8, source: .sibling)
+        ])
+
+        let resolved = SemanticResolver().resolve(base: base, context: context)
+        XCTAssertEqual(resolved.categories, ["Archives"])
+        XCTAssertFalse(resolved.reasonCodes.contains("semantic:sibling-consensus"))
+        XCTAssertEqual(resolved.confidence, 0.55, accuracy: 0.0001)
+    }
+
+    func testAmbientContextCannotOverrideStrongExtractedCourseEvidence() {
+        let base = Classification(
+            fileID: "file_mat",
+            categories: ["Documents/Text", "School/MAT-171"],
+            description: "text",
+            confidence: 0.82,
+            reasonCodes: ["kind:text", "text:MAT-171"])
+        let context = SemanticResolutionContext(candidates: [
+            SemanticContextCandidate(category: "School/CSC-151", confidence: 1.0,
+                                     supportCount: 8, source: .sibling)
+        ])
+
+        let resolved = SemanticResolver().resolve(base: base, context: context)
+        XCTAssertTrue(resolved.categories.contains("School/MAT-171"))
+        XCTAssertFalse(resolved.categories.contains("School/CSC-151"))
+        XCTAssertFalse(resolved.reasonCodes.contains("semantic:sibling-consensus"))
+    }
+
     func testSemanticClusterRequiresCorroboration() {
         let base = Classification(
             fileID: "file_clustered",
