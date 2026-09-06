@@ -214,6 +214,19 @@ public struct LocalModelRouter: Sendable {
             // were removed rather than relying on swap/offload to hide a RAM violation.
             append(LocalModelStack.lfm)
         }
+
+        // LFM2.5-VL-3B is multimodal and can process text without an image. In
+        // Quality mode, reuse that already-supported transient checkpoint as the
+        // bounded semantic judge for generic documents instead of adding another
+        // resident model. Fast/Balanced remain unchanged, and content must have
+        // been extracted locally before this route can fire.
+        let documentKind = context.kind == .pdf || context.kind == .text || context.kind == .office
+        if profile == .quality,
+           documentKind,
+           context.hasUsefulText,
+           context.confidence < SemanticResolver.specialistEscalationThreshold {
+            append(LocalModelStack.lfm)
+        }
         return route
     }
 }

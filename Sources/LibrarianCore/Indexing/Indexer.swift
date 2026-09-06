@@ -876,10 +876,23 @@ public final class Indexer: @unchecked Sendable {
                     result = scheduler.perform(as: .heavy) {
                         specialistBridge.classifyText(model: model, evidence: specialistEvidence)
                     }
-                case .visionFallback, .visionHeavyFallback:
+                case .visionFallback:
                     guard let bytes = imageBytes, !bytes.isEmpty else { continue }
                     result = scheduler.perform(as: .heavy) {
                         specialistBridge.classifyImage(bytes, model: model, evidence: specialistEvidence)
+                    }
+                case .visionHeavyFallback:
+                    if ident.kind == .image {
+                        guard let bytes = imageBytes, !bytes.isEmpty else { continue }
+                        result = scheduler.perform(as: .heavy) {
+                            specialistBridge.classifyImage(bytes, model: model, evidence: specialistEvidence)
+                        }
+                    } else if usefulText {
+                        result = scheduler.perform(as: .heavy) {
+                            specialistBridge.classifyText(model: model, evidence: specialistEvidence)
+                        }
+                    } else {
+                        continue
                     }
                 case .imageSemantic, .visualSimilarity, .documentOCR:
                     continue

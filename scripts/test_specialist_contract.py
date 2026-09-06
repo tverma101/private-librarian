@@ -300,6 +300,31 @@ class SpecialistContractTests(unittest.TestCase):
             self.assertEqual(calls[0], "PIL")
             self.assertEqual(calls.count("PIL"), 2)
 
+    def test_text_semantic_dispatch_is_lfm_only_and_model_free_in_contract_test(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            module = load_worker(Path(directory))
+            expected = {
+                "categories": ["Review"],
+                "description": "fixture",
+                "confidence": 0.4,
+                "reasons": ["fixture"],
+            }
+            with patch.object(module, "_text_classify", return_value=expected) as classify:
+                result = module._handle({
+                    "op": "classify_text",
+                    "model": "lfm2.5-vl-3b",
+                    "evidence": {"text_sample": "ambiguous document"},
+                })
+            self.assertEqual(result, expected)
+            classify.assert_called_once_with(
+                "lfm2.5-vl-3b", {"text_sample": "ambiguous document"})
+            with self.assertRaisesRegex(ValueError, "configured text semantic judge"):
+                module._handle({
+                    "op": "classify_text",
+                    "model": "minicpm-v-4.6",
+                    "evidence": {},
+                })
+
     def test_full_verification_detects_mutation_after_status_probe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -837,6 +837,43 @@ def _vlm_classify(model_id: str, image, existing: dict) -> dict:
     return _extract_json(text, allowed_categories)
 
 
+def _text_classify(model_id: str, existing: dict) -> dict:
+    if model_id != "lfm2.5-vl-3b":
+        raise ValueError("model is not the configured text semantic judge")
+    if not _verify_snapshot(model_id):
+        raise RuntimeError(f"untrusted/unprovisioned model: {model_id}")
+    _prepare_for_model(model_id)
+    allowed_categories = _allowed_categories(existing)
+    prompt = _classification_prompt(existing, allowed_categories)
+    path = str(_model_dir(model_id))
+    AutoModelForImageTextToText, AutoProcessor = _transformers_classes(
+        "AutoModelForImageTextToText", "AutoProcessor")
+    cached = _CACHE.get(model_id)
+    if cached is None:
+        processor = AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=True)
+        model = AutoModelForImageTextToText.from_pretrained(
+            path, local_files_only=True, trust_remote_code=True,
+            **_large_model_load_kwargs(model_id))
+        model.eval()
+        cached = (model, processor)
+        _CACHE[model_id] = cached
+    model, processor = cached
+    conversation = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    inputs = processor.apply_chat_template(
+        conversation, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt")
+    device = getattr(model, "device", None)
+    if device is not None:
+        if hasattr(inputs, "to"):
+            inputs = inputs.to(device)
+        elif isinstance(inputs, dict):
+            inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    output = model.generate(**inputs, do_sample=False, max_new_tokens=320)
+    input_len = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
+    text = processor.batch_decode(output[:, input_len:], skip_special_tokens=True)[0]
+    return _extract_json(text, allowed_categories)
+
+
 def _release(model_id: str | None) -> dict:
     if model_id:
         _CACHE.pop(model_id, None)
@@ -928,6 +965,12 @@ def _handle(request: dict) -> dict:
         _, image = _decode_image(str(request.get("data_b64", "")))
         evidence = request.get("evidence") if isinstance(request.get("evidence"), dict) else {}
         return _vlm_classify(model_id, image, evidence)
+    if op == "classify_text":
+        model_id = str(request.get("model", "lfm2.5-vl-3b"))
+        if model_id != "lfm2.5-vl-3b":
+            raise ValueError("model is not the configured text semantic judge")
+        evidence = request.get("evidence") if isinstance(request.get("evidence"), dict) else {}
+        return _text_classify(model_id, evidence)
     raise ValueError(f"unknown operation {op!r}")
 
 

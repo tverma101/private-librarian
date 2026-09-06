@@ -96,6 +96,42 @@ final class LocalModelRouterTests: XCTestCase {
         XCTAssertEqual(ambiguous.filter { $0.cost == .heavy }.map(\.id), [LocalModelStack.lfm.id])
     }
 
+    func testQualityReusesLFMAsTextJudgeOnlyForAmbiguousDocuments() {
+        let available: Set<String> = [LocalModelStack.lfm.id]
+        let quality = LocalModelRouter(profile: .quality)
+        let vague = quality.route(
+            context: LocalModelRouteContext(kind: .pdf, confidence: 0.69,
+                                            hasUsefulText: true,
+                                            nativeOCRSucceeded: true,
+                                            isDocumentLikeImage: false),
+            availableModelIDs: available)
+        XCTAssertEqual(vague.map(\.id), [LocalModelStack.lfm.id])
+
+        let clear = quality.route(
+            context: LocalModelRouteContext(kind: .pdf, confidence: 0.80,
+                                            hasUsefulText: true,
+                                            nativeOCRSucceeded: true,
+                                            isDocumentLikeImage: false),
+            availableModelIDs: available)
+        XCTAssertTrue(clear.isEmpty)
+
+        let noText = quality.route(
+            context: LocalModelRouteContext(kind: .office, confidence: 0.20,
+                                            hasUsefulText: false,
+                                            nativeOCRSucceeded: false,
+                                            isDocumentLikeImage: false),
+            availableModelIDs: available)
+        XCTAssertTrue(noText.isEmpty)
+
+        let balanced = LocalModelRouter(profile: .balanced).route(
+            context: LocalModelRouteContext(kind: .text, confidence: 0.20,
+                                            hasUsefulText: true,
+                                            nativeOCRSucceeded: true,
+                                            isDocumentLikeImage: false),
+            availableModelIDs: available)
+        XCTAssertTrue(balanced.isEmpty)
+    }
+
     func testRegistryExcludesModelsThatCannotRespectMacMemoryCeiling() {
         let ids = Set(LocalModelStack.all.map(\.id))
         XCTAssertFalse(ids.contains("ling-3.0-tiny"))

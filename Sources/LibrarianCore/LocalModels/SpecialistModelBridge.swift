@@ -346,10 +346,13 @@ public final class SpecialistModelBridge: @unchecked Sendable {
     public func classifyText(model: LocalModelDescriptor,
                              evidence: SpecialistEvidence,
                              timeout: TimeInterval = 120) -> SpecialistClassification? {
-        guard model.capability == .textReasoning, Self.isProvisioned(model), let worker else { return nil }
+        let supportedTextJudge = model.capability == .textReasoning
+            || (model.id == LocalModelStack.lfm.id && model.capability == .visionHeavyFallback)
+        guard supportedTextJudge, Self.isProvisioned(model), let worker else { return nil }
         defer { _ = worker.call(["op": "release", "model": model.id], timeout: 8) }
         return Self.parseClassification(
-            worker.call(["op": "classify_text", "evidence": evidence.jsonObject], timeout: timeout),
+            worker.call(["op": "classify_text", "model": model.id,
+                         "evidence": evidence.jsonObject], timeout: timeout),
             modelID: model.id)
     }
 
