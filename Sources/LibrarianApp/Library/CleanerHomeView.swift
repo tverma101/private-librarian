@@ -9,6 +9,7 @@ import LibrarianCore
 struct CleanerHomeView: View {
     var body: some View {
         WorkspaceHomeView()
+            .frame(minWidth: 1040, minHeight: 680)
     }
 }
 
