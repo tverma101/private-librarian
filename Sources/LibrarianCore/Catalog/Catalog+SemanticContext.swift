@@ -122,8 +122,9 @@ public extension Catalog {
     /// is not rewritten and Finder remains untouched. Inferred categories must
     /// already exist in the catalog taxonomy, so context cannot explode the
     /// folder tree or materialize a model-invented destination.
-    func semanticOrganizationMemberships(limit: Int = 384) throws -> [(categoryPath: String, fileID: String)] {
-        var memberships = try categoryMemberships()
+    func semanticOrganizationMemberships(limit: Int = 384,
+                                         roots: [String]? = nil) throws -> [(categoryPath: String, fileID: String)] {
+        var memberships = try categoryMemberships(roots: roots)
         let existing = Set(memberships.map(\.categoryPath))
         var seen = Set(memberships.map { "\($0.categoryPath)\u{0}\($0.fileID)" })
         let boundedLimit = max(1, min(2_048, limit))
@@ -131,15 +132,19 @@ public extension Catalog {
         // Context is useful primarily for generic/ambiguous files. Keep this a
         // bounded pass rather than walking every library item during every UI
         // refresh. Explicit Review items are included regardless of raw score.
+        let scope = scopedRootPredicate(column: "f.path", roots: roots)
+        var clauses = ["f.status='indexed'", "(c.confidence < 0.80 OR c.categories_json LIKE '%\"Review\"%')"]
+        if !scope.sql.isEmpty { clauses.append(scope.sql) }
+        var binds = scope.binds
+        binds.append(.int(Int64(boundedLimit)))
         let candidateIDs = try query("""
             SELECT c.file_id
             FROM classifications c
             JOIN files f ON f.id=c.file_id
-            WHERE f.status='indexed'
-              AND (c.confidence < 0.80 OR c.categories_json LIKE '%\"Review\"%')
+            WHERE \(clauses.joined(separator: " AND "))
             ORDER BY c.confidence ASC, c.file_id
             LIMIT ?
-            """, binds: [.int(Int64(boundedLimit))]) { $0.text(0) ?? "" }
+            """, binds: binds) { $0.text(0) ?? "" }
 
         for fileID in candidateIDs where !fileID.isEmpty {
             guard let resolved = try semanticallyResolvedClassification(fileID: fileID),
@@ -147,7 +152,7 @@ public extension Catalog {
                   !resolved.categories.contains("Review") else { continue }
             for category in resolved.categories where Self.isUsefulSemanticCategory(category) {
                 // Taxonomy firewall: only categories already proven to exist in
-                // this library can become contextual planning memberships.
+                // this scoped library can become contextual planning memberships.
                 guard existing.contains(category) else { continue }
                 let key = "\(category)\u{0}\(fileID)"
                 guard seen.insert(key).inserted else { continue }
