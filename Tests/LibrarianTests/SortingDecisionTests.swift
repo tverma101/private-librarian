@@ -75,11 +75,14 @@ final class SortingDecisionTests: XCTestCase {
         evidence.sizeClass = "small"
         evidence.filenameTokens = ["mat", "171", "review"]
 
+        // Both mutually-exclusive courses are present in extracted content.
+        // Unlike filename-vs-content disagreement, there is no stronger local
+        // source that can settle this automatically, so it must stay Review.
         let result = RuleBasedClassifier().classify(
             fileID: "file_conflict",
             identity: identity,
             evidence: evidence,
-            textContent: "CSC-151 assignment about Java classes and methods")
+            textContent: "MAT-171 review notes combined with CSC-151 assignment about Java classes and methods")
 
         XCTAssertTrue(result.categories.contains("School/MAT-171"), "got \(result.categories)")
         XCTAssertTrue(result.categories.contains("School/CSC-151"), "got \(result.categories)")
