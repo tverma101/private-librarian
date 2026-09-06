@@ -290,7 +290,7 @@ struct WorkspaceHomeView: View {
     ) -> some View {
         HStack(spacing: 8) {
             Image(systemName: icon)
-                .foregroundStyle(warning ? .orange : selected ? .tint : .secondary)
+                .foregroundStyle(warning ? Color.orange : selected ? Color.accentColor : Color.secondary)
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).lineLimit(1)
@@ -446,7 +446,7 @@ struct WorkspaceHomeView: View {
             HStack(spacing: 11) {
                 Image(systemName: icon(for: group))
                     .font(.title3)
-                    .foregroundStyle(group.canApplyToFinder ? .tint : .secondary)
+                    .foregroundStyle(group.canApplyToFinder ? Color.accentColor : Color.secondary)
                     .frame(width: 28)
 
                 VStack(alignment: .leading, spacing: 3) {
@@ -496,7 +496,7 @@ struct WorkspaceHomeView: View {
                     HStack(alignment: .top, spacing: 12) {
                         Image(systemName: icon(for: group))
                             .font(.title2)
-                            .foregroundStyle(group.canApplyToFinder ? .tint : .secondary)
+                            .foregroundStyle(group.canApplyToFinder ? Color.accentColor : Color.secondary)
                             .frame(width: 36, height: 36)
                             .background(.quaternary, in: RoundedRectangle(cornerRadius: 9))
                         VStack(alignment: .leading, spacing: 3) {
