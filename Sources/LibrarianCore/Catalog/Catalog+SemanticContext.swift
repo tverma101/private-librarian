@@ -71,9 +71,34 @@ public extension Catalog {
             }
         }
 
+        // LlamaFS/AI-sorter-style correction memory: an explicit user category
+        // on a semantic peer is much stronger than an ordinary peer label. The
+        // semantic-cluster confidence bounds how far that correction may travel;
+        // near-duplicate links are still excluded from destination inference.
+        let correctedPeerRows = try query("""
+            SELECT o.category, s.confidence
+            FROM similarity_cluster_members mine
+            JOIN similarity_clusters s ON s.id=mine.cluster_id
+            JOIN similarity_cluster_members peer ON peer.cluster_id=mine.cluster_id
+            JOIN category_overrides o ON o.file_id=peer.file_id
+            WHERE mine.file_id=? AND peer.file_id<>mine.file_id
+              AND s.relation='semantic' AND o.action=?
+            ORDER BY s.confidence DESC, o.updated DESC
+            LIMIT 24
+            """, binds: [.text(fileID), .text(ReviewCorrectionAction.addCategory.rawValue)]) { row in
+                (row.text(0) ?? "", row.real(1))
+            }
+        for (category, clusterConfidence) in correctedPeerRows {
+            guard Self.isUsefulSemanticCategory(category) else { continue }
+            candidates.append(SemanticContextCandidate(
+                category: category,
+                confidence: min(0.97, max(0, clusterConfidence)),
+                source: .userCorrection))
+        }
+
         // A direct user correction on this file is authoritative semantic
-        // evidence. Cross-file learning remains handled by promoted learned
-        // rules; this method never generalizes one correction by itself.
+        // evidence. Cross-file deterministic learning remains handled by
+        // promoted learned rules.
         let corrected = try query("""
             SELECT category, action
             FROM category_overrides
