@@ -1,6 +1,22 @@
 import SwiftUI
 import LibrarianCore
 
+/// Shared recovery choices used by both the main and advanced Library surfaces.
+/// Recovery changes only the encrypted catalog; source files are never touched.
+enum CatalogRecoveryAction: String, Identifiable {
+    case startFresh
+    case resetKey
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .startFresh: return "Start with an empty catalog?"
+        case .resetKey: return "Create a new encrypted catalog?"
+        }
+    }
+}
+
 /// Compatibility entry point for the primary scene.
 ///
 /// The original implementation grew into a long vertical stack of independent
