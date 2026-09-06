@@ -145,8 +145,13 @@ public struct SemanticResolver: Sendable {
         for candidate in candidates.prefix(64) where isSafeCategory(candidate.category) && candidate.category != "Review" {
             let weight: Double
             switch candidate.source {
-            case .sibling: weight = 0.72
-            case .similarityCluster: weight = 0.84
+            // Folder population is useful only as a repeated pattern. A single
+            // sibling can never decide, but three independently classified
+            // siblings can provide enough evidence to rescue a vague filename.
+            case .sibling: weight = 0.86
+            // Semantic clusters have already passed embedding thresholds, so
+            // two agreeing peers are stronger than plain folder proximity.
+            case .similarityCluster: weight = 0.92
             case .learnedRule: weight = 0.90
             case .modelJudge: weight = 0.97
             case .userCorrection: weight = 1.0
@@ -172,13 +177,14 @@ public struct SemanticResolver: Sendable {
         }
 
         guard let first = ranked.first else { return nil }
-        let sourceAllowsSingle: Bool
-        switch first.source {
-        case .userCorrection, .modelJudge, .learnedRule: sourceAllowsSingle = true
-        case .sibling, .similarityCluster: sourceAllowsSingle = false
-        }
         let support = byCategory[first.category]?.support ?? 0
-        guard first.score >= 0.78, sourceAllowsSingle || support >= 2 else { return nil }
+        let minimumSupport: Int
+        switch first.source {
+        case .sibling: minimumSupport = 3
+        case .similarityCluster: minimumSupport = 2
+        case .userCorrection, .modelJudge, .learnedRule: minimumSupport = 1
+        }
+        guard first.score >= 0.78, support >= minimumSupport else { return nil }
 
         // Conflicting context with a nearly tied runner-up is ambiguity, not
         // permission to pick whichever dictionary entry happened to win.
