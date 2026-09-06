@@ -22,11 +22,15 @@ final class OrganizationQualityAcceptanceTests: XCTestCase {
         try write("MAT-171 Homework 4.txt", "MAT-171 homework 4: polynomial and rational functions")
         try write("MAT-171 Exam Review.txt", "MAT-171 exam review: functions, zeros, graphs, inequalities")
 
-        // Hostile ambiguity: filename says MAT-171 while the actual content says
-        // CSC-151. A sorter that merely picks the highest/global label is unsafe.
-        // The real pipeline must retain it for Review and exclude it from every
-        // Finder move until a human or specialist resolves the contradiction.
+        // Filename is weak evidence. When the actual extracted content names one
+        // different course unambiguously, the content-first resolver should pick
+        // that course rather than leaving a stale filename conflict in Review.
         try write("MAT-171 mystery notes.txt", "CSC-151 assignment: Java classes, methods, Scanner, arrays")
+
+        // A genuine content conflict is different: both mutually exclusive
+        // courses occur in the file body, so no filename/content precedence can
+        // settle it. It must remain Review-only until a human/specialist decides.
+        try write("mixed course packet.txt", "MAT-171 review notes combined with CSC-151 Java assignment notes")
 
         // Generic PDFs should still fall back to the broad PDF destination.
         try write("Apartment Lease.pdf", "%PDF-1.4\nlease document alpha\n%%EOF")
@@ -47,7 +51,7 @@ final class OrganizationQualityAcceptanceTests: XCTestCase {
         let catalog = try TestSupport.makeCatalog()
         let indexer = Indexer(broker: SourceBroker(), catalog: catalog, scheduler: Scheduler())
         let indexed = try indexer.indexRoot(root)
-        XCTAssertEqual(indexed, 10, "the acceptance corpus itself must be fully indexed")
+        XCTAssertEqual(indexed, 11, "the acceptance corpus itself must be fully indexed")
 
         let groups = try catalog.smartOrganizationGroups(limit: 18, roots: [root.path])
         XCTAssertTrue(groups.allSatisfy(\.canApplyToFinder),
@@ -68,7 +72,8 @@ final class OrganizationQualityAcceptanceTests: XCTestCase {
         }
 
         let mathIDs = try ids(["MAT-171 Homework 4.txt", "MAT-171 Exam Review.txt"])
-        let conflictID = try XCTUnwrap(idByName["MAT-171 mystery notes.txt"])
+        let contentWinsID = try XCTUnwrap(idByName["MAT-171 mystery notes.txt"])
+        let trueConflictID = try XCTUnwrap(idByName["mixed course packet.txt"])
         let pdfIDs = try ids(["Apartment Lease.pdf", "Insurance Statement.pdf"])
         let codeIDs = try ids(["main.swift", "Utilities.swift", "CanvasAssignment.swift"])
         let archiveIDs = try ids(["old-export.zip", "project-backup.zip"])
@@ -88,12 +93,14 @@ final class OrganizationQualityAcceptanceTests: XCTestCase {
         }
         XCTAssertTrue(destinationCountByFile.values.allSatisfy { $0 == 1 },
                       "a file appeared in competing Finder destinations: \(destinationCountByFile)")
-        XCTAssertNil(destinationCountByFile[conflictID],
-                     "unresolved contradictory evidence must never produce a Finder move")
+        XCTAssertNil(destinationCountByFile[trueConflictID],
+                     "unresolved contradictory content must never produce a Finder move")
 
         let reviewIDs = Set(try catalog.reviewItems(limit: 100, roots: [root.path]).map(\.fileID))
-        XCTAssertTrue(reviewIDs.contains(conflictID),
-                      "contradictory course evidence must be visible in Review rather than silently sorted")
+        XCTAssertFalse(reviewIDs.contains(contentWinsID),
+                       "one clear extracted-content course should resolve a contradictory filename")
+        XCTAssertTrue(reviewIDs.contains(trueConflictID),
+                      "mutually contradictory content evidence must stay visible in Review")
 
         XCTAssertFalse(destinations.contains { $0.title == "Assignments" && !$0.fileIDs.isDisjoint(with: mathIDs) },
                        "course files must not simultaneously be offered as an Assignments move")
