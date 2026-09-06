@@ -27,11 +27,14 @@ The product-quality gate can be run directly:
 ```bash
 swift test --filter OrganizationQualityAcceptanceTests
 swift test --filter SortingDecisionTests
+swift test --filter SemanticContextIntegrationTests
 ```
 
 `OrganizationQualityAcceptanceTests` creates a hostile temporary Downloads-style folder, runs the real indexer and encrypted catalog, then asks the production organization planner for Finder destinations. It asserts useful destinations, one primary destination per file, code-vocabulary false-positive resistance, and that contradictory course evidence goes to Review instead of receiving a Finder move.
 
 `SortingDecisionTests` covers specialist adjudication, unresolved-conflict behavior, per-file destination preference, the generic-image escalation boundary, and the rule that similarity/duplicate relationships cannot become Finder plans.
+
+`SemanticContextIntegrationTests` exercises the real catalog-to-Finder planning path for contextual resolution. A vaguely named PDF can inherit a course only after corroborated same-folder evidence, while a root-scoped organization request must not borrow semantic-cluster votes from another selected library. The resolver requires repeated support for ambient context (three ordinary siblings or two semantic-cluster peers) rather than treating one nearby file as authority.
 
 ## Measured metric harness
 
@@ -57,6 +60,8 @@ The product deliberately separates evidence from a physical organization decisio
 6. `OrganizationApplier` independently rejects relationship groups even if a future UI regression tries to pass one to the Finder boundary.
 
 Balanced/Quality routing is cheap-first. Generic images whose deterministic baseline confidence is exactly `0.55` are considered unresolved and can reach the bounded VLM fallback. Images with stronger cheap evidence do not run the VLM merely because one is installed.
+
+Generic document type alone is likewise not treated as a semantic destination. In Quality mode, an ambiguous PDF/text/Office file with locally extracted text may reuse the already-supported transient LFM2.5-VL-3B checkpoint as a bounded text judge. Fast and Balanced do not add that heavy route, and model output remains constrained to categories already admitted by the deterministic/context evidence boundary.
 
 ## Release-style package checks
 
