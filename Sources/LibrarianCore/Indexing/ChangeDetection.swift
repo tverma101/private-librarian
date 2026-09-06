@@ -5,12 +5,12 @@ import Foundation
 public enum ChangeDetection {
 
     public static let extractorVersion = "extractors-1.0.0"
-    /// v4 fixes the screenshot detector (camera aspect ratios and device-model
-    /// metadata no longer classify camera photos as screenshots), unifies the
-    /// singular/plural screenshot category, and repairs hierarchical category
-    /// creation. Existing catalogs must reclassify once so stale screenshot
-    /// memberships disappear.
-    public static let classifierVersion = "rule-based-v4-screenshot-recalibration"
+    /// v5 inserts content-first semantic resolution after deterministic
+    /// classification. Generic type-only answers remain ambiguous for the
+    /// bounded specialist judge, and explicit extracted/OCR content can defeat
+    /// misleading filename evidence. Existing catalogs must reclassify once so
+    /// stale filename-led memberships disappear.
+    public static let classifierVersion = "rule-based-v5-semantic-resolution"
 
     /// Decide whether a file needs (re)indexing given its stored record.
     /// `requiredExtractorVersion` is the complete processing-pipeline identity
