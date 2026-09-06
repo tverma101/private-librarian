@@ -1,9 +1,9 @@
 import Foundation
 
 /// Deterministic, tool-less classifier. Produces the contract-shaped
-/// Classification from extracted evidence + extracted text. No LLM in v1 —
-/// this is the "cheap deterministic evidence → small classifier" stage, with
-/// the same strict output schema an LLM would be held to later.
+/// Classification from extracted evidence + extracted text. The semantic
+/// resolver is the second cheap stage: content can defeat misleading names and
+/// bounded sibling/cluster/user context can refine ambiguous destinations.
 public struct RuleBasedClassifier: Sendable {
 
     private static let sourceCodeExtensions: Set<String> = [
@@ -23,7 +23,8 @@ public struct RuleBasedClassifier: Sendable {
     public init() {}
 
     /// Multi-label classification (plan §26): kind / domain / course / purpose
-    /// style labels derived only from evidence, bounded text, and optional Vision labels.
+    /// style labels derived only from evidence, bounded text, optional Vision
+    /// labels, and optional inert semantic context.
     ///
     /// Automatic categories intentionally use a bounded taxonomy. Raw Vision
     /// labels stay as evidence/reason codes instead of becoming one-off virtual
@@ -31,11 +32,12 @@ public struct RuleBasedClassifier: Sendable {
     /// library instead of creating thousands of singleton categories.
     public func classify(fileID: String, identity: FileIdentity, evidence: EvidenceExtractor.Evidence,
                          textContent: String?, visionLabels: [(String, Float)] = [],
-                         screenshot: ScreenshotAssessment? = nil) -> Classification {
+                         screenshot: ScreenshotAssessment? = nil,
+                         semanticContext: SemanticResolutionContext = .empty) -> Classification {
         var cats: [String] = []
         var reasons: [String] = []
 
-        // Kind-level labels.
+        // Kind-level labels are physical facts, not semantic destinations.
         switch identity.kind {
         case .image: cats.append("Image"); reasons.append("kind:image")
         case .audio: cats.append("Audio"); reasons.append("kind:audio")
@@ -62,7 +64,9 @@ public struct RuleBasedClassifier: Sendable {
         var confidence = 0.55 // base for kind-only classification
         let isCodeProject = Self.looksLikeCodeProject(identity: identity)
 
-        // Content-aware labels from bounded text (deterministic keyword rules).
+        // Content-aware labels from bounded extracted text/OCR. These are
+        // intentionally stronger than the filename; SemanticResolver settles a
+        // contradictory filename course in favor of an explicit content course.
         if let text = textContent?.lowercased() {
             let courseHits = Self.courseTokens(in: text)
             for course in courseHits {
@@ -94,7 +98,8 @@ public struct RuleBasedClassifier: Sendable {
             }
         }
 
-        // Course codes in the filename are stronger than generic filename tokens.
+        // Course codes in a filename remain useful evidence, but never final
+        // authority: SemanticResolver can reject them when content contradicts.
         let filename = (identity.path as NSString).lastPathComponent
         for course in Self.courseTokens(in: filename.lowercased()) {
             cats.append("School/\(course)")
@@ -126,8 +131,6 @@ public struct RuleBasedClassifier: Sendable {
 
         // A screenshot-looking filename is only a weak image hint. Text files
         // named things like screenshot-notes.md must not enter screenshot views.
-        // Uses the plural form so filename hints and the screenshot assessment
-        // land in ONE category instead of splitting counts across two spellings.
         let tokens = Set(evidence.filenameTokens)
         if identity.kind == .image, tokens.contains("screenshot") {
             cats.append("Screenshots")
@@ -148,9 +151,8 @@ public struct RuleBasedClassifier: Sendable {
         cats = cats.filter { seen.insert($0).inserted }
 
         // Conflicting high-value evidence must not become a confident wrong
-        // Finder move. Course-vs-course conflicts stay in Review. Conflicting
-        // image-subject signals are lowered to the exact unresolved baseline so
-        // Balanced/Quality can ask the bounded VLM fallback to adjudicate them.
+        // Finder move. SemanticResolver gets one chance to settle content-vs-
+        // filename and corroborated context before a specialist is requested.
         let courseCategories = cats.filter(Self.isCourseCategory)
         if Set(courseCategories).count > 1 {
             if !cats.contains("Review") { cats.append("Review") }
@@ -169,14 +171,14 @@ public struct RuleBasedClassifier: Sendable {
             reasons.append("categories-capped")
         }
 
-        confidence = min(confidence, 0.99)
-        return Classification(
+        let base = Classification(
             fileID: fileID,
             categories: cats,
             description: Self.describe(identity: identity, evidence: evidence),
-            confidence: confidence,
+            confidence: min(confidence, 0.99),
             reasonCodes: Array(reasons.prefix(ClassifierContract.maxReasonCodes))
         )
+        return SemanticResolver().resolve(base: base, context: semanticContext)
     }
 
     static func courseTokens(in lowercasedText: String) -> [String] {
