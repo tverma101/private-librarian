@@ -19,12 +19,14 @@ jobs:
           ref: A3
           fetch-depth: 0
       - name: Patch integration points
-        run: python3 scripts/wire_semantic_context.py
+        run: |
+          python3 scripts/wire_semantic_context.py
+          python3 scripts/fix_semantic_scope.py
       - name: Commit wiring
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Sources/LibrarianCore/Organization/SmartOrganization.swift Sources/LibrarianCore/Indexing/Indexer.swift Sources/LibrarianCore/LocalModels/SpecialistModelBridge.swift scripts/specialist.py
-          git commit -m "Make specialist routing content and context aware"
+          git add Sources/LibrarianCore/Organization/SmartOrganization.swift Sources/LibrarianCore/Indexing/Indexer.swift Sources/LibrarianCore/LocalModels/SpecialistModelBridge.swift Sources/LibrarianCore/Catalog/Catalog+SemanticContext.swift scripts/specialist.py
+          git commit -m "Fix semantic context root scoping"
           git push origin HEAD:A3
