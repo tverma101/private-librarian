@@ -1,5 +1,5 @@
 // swift-tools-version:5.9
-// Private Local Librarian — hardened, offline, read-only file librarian.
+// Private Local Librarian — hardened, local-first analysis with explicit reviewed Finder Apply/Undo.
 import PackageDescription
 
 let sqlcipherCSettings: [CSetting] = [
