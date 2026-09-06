@@ -5,12 +5,13 @@ import Foundation
 public enum ChangeDetection {
 
     public static let extractorVersion = "extractors-1.0.0"
-    /// v5 inserts content-first semantic resolution after deterministic
-    /// classification. Generic type-only answers remain ambiguous for the
-    /// bounded specialist judge, and explicit extracted/OCR content can defeat
-    /// misleading filename evidence. Existing catalogs must reclassify once so
-    /// stale filename-led memberships disappear.
-    public static let classifierVersion = "rule-based-v5-semantic-resolution"
+    /// v6 keeps the v5 content-first resolver but constrains ambient sibling/
+    /// cluster context to ambiguous, compatible files. Opaque archives and
+    /// installer-like bundles cannot inherit unrelated semantic destinations
+    /// from neighboring files, and strong local semantic evidence cannot be
+    /// overridden by folder population. Existing catalogs must reclassify once
+    /// so any v5 contextual contamination is removed.
+    public static let classifierVersion = "rule-based-v6-context-compatibility"
 
     /// Decide whether a file needs (re)indexing given its stored record.
     /// `requiredExtractorVersion` is the complete processing-pipeline identity
