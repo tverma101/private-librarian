@@ -7,9 +7,18 @@ public extension Catalog {
     /// and semantic clusters provide the evidence instead.
     func semanticResolutionContext(forFileID fileID: String,
                                    siblingLimit: Int = 32,
-                                   clusterPeerLimit: Int = 48) throws -> SemanticResolutionContext {
-        let target = try query("SELECT path FROM files WHERE id=? AND status!='unscoped' LIMIT 1",
-                               binds: [.text(fileID)]) { $0.text(0) ?? "" }.first
+                                   clusterPeerLimit: Int = 48,
+                                   roots: [String]? = nil) throws -> SemanticResolutionContext {
+        let targetScope = scopedRootPredicate(column: "path", roots: roots)
+        var targetClauses = ["id=?", "status!='unscoped'"]
+        if !targetScope.sql.isEmpty { targetClauses.append(targetScope.sql) }
+        var targetBinds: [SQLiteValue] = [.text(fileID)]
+        targetBinds.append(contentsOf: targetScope.binds)
+        let target = try query("""
+            SELECT path FROM files
+            WHERE \(targetClauses.joined(separator: " AND "))
+            LIMIT 1
+            """, binds: targetBinds) { $0.text(0) ?? "" }.first
         guard let target, !target.isEmpty else { return .empty }
 
         var candidates: [SemanticContextCandidate] = []
@@ -19,7 +28,8 @@ public extension Catalog {
 
         // SQLite has no portable dirname() here. Prefix-bound the query, then
         // enforce direct-parent equality in Swift so nested descendants cannot
-        // impersonate siblings.
+        // impersonate siblings. Because the target itself is root-scoped, a
+        // direct sibling necessarily remains inside that selected root.
         let siblingRows = try query("""
             SELECT f.path, c.categories_json, c.confidence
             FROM files f
@@ -47,18 +57,29 @@ public extension Catalog {
 
         // Only semantic similarity may teach destination context. Near-duplicate
         // families remain relationship-only and can never vote a file into a
-        // Finder category.
+        // Finder category. When a caller scopes Smart Groups to selected roots,
+        // semantic peers are constrained to those same roots as well.
+        let peerScope = scopedRootPredicate(column: "peerFile.path", roots: roots)
+        var clusterClauses = [
+            "mine.file_id=?",
+            "peer.file_id<>mine.file_id",
+            "s.relation='semantic'",
+        ]
+        if !peerScope.sql.isEmpty { clusterClauses.append(peerScope.sql) }
+        var clusterBinds: [SQLiteValue] = [.text(fileID)]
+        clusterBinds.append(contentsOf: peerScope.binds)
+        clusterBinds.append(.int(Int64(max(0, min(256, clusterPeerLimit)))))
         let clusterRows = try query("""
             SELECT c.categories_json, c.confidence, s.confidence
             FROM similarity_cluster_members mine
             JOIN similarity_clusters s ON s.id=mine.cluster_id
             JOIN similarity_cluster_members peer ON peer.cluster_id=mine.cluster_id
+            JOIN files peerFile ON peerFile.id=peer.file_id
             JOIN classifications c ON c.file_id=peer.file_id
-            WHERE mine.file_id=? AND peer.file_id<>mine.file_id
-              AND s.relation='semantic'
+            WHERE \(clusterClauses.joined(separator: " AND "))
             ORDER BY s.confidence DESC, c.confidence DESC
             LIMIT ?
-            """, binds: [.text(fileID), .int(Int64(max(0, min(256, clusterPeerLimit))))]) { row in
+            """, binds: clusterBinds) { row in
                 (row.text(0) ?? "[]", row.real(1), row.real(2))
             }
         for row in clusterRows {
@@ -75,17 +96,29 @@ public extension Catalog {
         // on a semantic peer is much stronger than an ordinary peer label. The
         // semantic-cluster confidence bounds how far that correction may travel;
         // near-duplicate links are still excluded from destination inference.
+        var correctionClauses = [
+            "mine.file_id=?",
+            "peer.file_id<>mine.file_id",
+            "s.relation='semantic'",
+            "o.action=?",
+        ]
+        if !peerScope.sql.isEmpty { correctionClauses.append(peerScope.sql) }
+        var correctionBinds: [SQLiteValue] = [
+            .text(fileID),
+            .text(ReviewCorrectionAction.addCategory.rawValue),
+        ]
+        correctionBinds.append(contentsOf: peerScope.binds)
         let correctedPeerRows = try query("""
             SELECT o.category, s.confidence
             FROM similarity_cluster_members mine
             JOIN similarity_clusters s ON s.id=mine.cluster_id
             JOIN similarity_cluster_members peer ON peer.cluster_id=mine.cluster_id
+            JOIN files peerFile ON peerFile.id=peer.file_id
             JOIN category_overrides o ON o.file_id=peer.file_id
-            WHERE mine.file_id=? AND peer.file_id<>mine.file_id
-              AND s.relation='semantic' AND o.action=?
+            WHERE \(correctionClauses.joined(separator: " AND "))
             ORDER BY s.confidence DESC, o.updated DESC
             LIMIT 24
-            """, binds: [.text(fileID), .text(ReviewCorrectionAction.addCategory.rawValue)]) { row in
+            """, binds: correctionBinds) { row in
                 (row.text(0) ?? "", row.real(1))
             }
         for (category, clusterConfidence) in correctedPeerRows {
@@ -118,7 +151,8 @@ public extension Catalog {
 
     /// Refine an already validated classification using catalog context. This
     /// helper is side-effect free; callers still choose when to persist or plan.
-    func semanticallyResolvedClassification(fileID: String) throws -> Classification? {
+    func semanticallyResolvedClassification(fileID: String,
+                                            roots: [String]? = nil) throws -> Classification? {
         let rows = try query("""
             SELECT categories_json, description, confidence, reason_codes_json
             FROM classifications
@@ -139,7 +173,7 @@ public extension Catalog {
                                   reasonCodes: reasons)
         return SemanticResolver().resolve(
             base: base,
-            context: try semanticResolutionContext(forFileID: fileID))
+            context: try semanticResolutionContext(forFileID: fileID, roots: roots))
     }
 
     /// Organization-time semantic pass. It adds only high-confidence inferred
@@ -172,7 +206,7 @@ public extension Catalog {
             """, binds: binds) { $0.text(0) ?? "" }
 
         for fileID in candidateIDs where !fileID.isEmpty {
-            guard let resolved = try semanticallyResolvedClassification(fileID: fileID),
+            guard let resolved = try semanticallyResolvedClassification(fileID: fileID, roots: roots),
                   resolved.confidence >= 0.80,
                   !resolved.categories.contains("Review") else { continue }
             for category in resolved.categories where Self.isUsefulSemanticCategory(category) {
